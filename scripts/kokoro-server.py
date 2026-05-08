@@ -126,6 +126,40 @@ def _audio_to_wav_bytes(samples: np.ndarray, sample_rate: int) -> bytes:
     return buf.getvalue()
 
 
+_SENT_SPLIT_RE = __import__('re').compile(r'(?<=[.!?…])\s+|(?<=\n)')
+
+
+def _split_for_synth(text: str, max_chars: int = 500) -> list[str]:
+    """Split text into chunks safe for kokoro.create().
+
+    Upstream kokoro-onnx has a multi-batch concat bug: when input phonemes
+    span multiple internal segments, the concat axis can mismatch
+    (some segments produce shape (0,) for an unsupported phoneme cluster
+    and others produce (N,)). The reliable workaround is to feed
+    sentence-sized chunks one at a time and concatenate audio ourselves.
+    """
+    text = (text or '').strip()
+    if not text:
+        return []
+    # Split by sentence-ending punctuation + newlines.
+    parts = [p.strip() for p in _SENT_SPLIT_RE.split(text) if p and p.strip()]
+    if not parts:
+        return [text]
+    # Re-glue tiny adjacent fragments up to max_chars per chunk.
+    chunks: list[str] = []
+    cur = ''
+    for p in parts:
+        if cur and len(cur) + 1 + len(p) <= max_chars:
+            cur = cur + ' ' + p
+        else:
+            if cur:
+                chunks.append(cur)
+            cur = p[:max_chars]  # hard-truncate any one absurdly long sentence
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
 def _synthesize(text: str, voice: str, speed: float) -> tuple[bytes, int]:
     """Run the model. Returns (wav_bytes, sample_rate).
 
@@ -133,12 +167,31 @@ def _synthesize(text: str, voice: str, speed: float) -> tuple[bytes, int]:
     is not internally thread-safe across overlapping `create()` calls
     on the same session. Calliope serialises its TTS calls anyway
     (one read-back at a time), so contention here is negligible.
+
+    Long input is sentence-chunked (see _split_for_synth) to dodge an
+    upstream multi-batch concat crash.
     """
     k = _ensure_loaded()
+    chunks = _split_for_synth(text)
+    if not chunks:
+        raise ValueError("empty text after split")
+    sr = 24000
+    pieces: list[np.ndarray] = []
     with _kokoro_lock:
-        audio, sr = k.create(text, voice=voice, speed=speed, lang=LANG)
-    audio_np = np.asarray(audio, dtype=np.float32)
-    return _audio_to_wav_bytes(audio_np, int(sr)), int(sr)
+        for chunk in chunks:
+            audio, sr = k.create(chunk, voice=voice, speed=speed, lang=LANG)
+            arr = np.asarray(audio, dtype=np.float32)
+            if arr.ndim > 1:
+                arr = np.squeeze(arr)
+            if arr.ndim > 1:
+                arr = arr.mean(axis=0)
+            if arr.size == 0:
+                continue
+            pieces.append(arr)
+    if not pieces:
+        raise RuntimeError("kokoro returned no audio for any chunk")
+    full = np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
+    return _audio_to_wav_bytes(full, int(sr)), int(sr)
 
 
 # ─── HTTP handler ─────────────────────────────────────────
