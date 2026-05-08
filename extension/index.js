@@ -66,6 +66,10 @@ const DEFAULTS = {
     broadcastState: true,        // POST /state on chat/char/persona change + 30s heartbeat
     sseEnabled: true,            // Phase 2: subscribe to /events for direct-inject from phone
     voiceCommandsEnabled: true,  // POL-1: server-emitted dictation-command SSE dispatcher
+    // ─── TTS read-back (Calliope Kokoro backend) ───────────────────────────
+    ttsAutoReadAi: false,        // auto-fire TTS on every new AI message
+    ttsReadStreamingPartials: false, // stream partial TTS — needs server streaming (deferred)
+    ttsVoice: 'af_heart',        // Kokoro default voice id
 };
 
 /**
@@ -1017,13 +1021,18 @@ function handleDictationCommand(data) {
         case 'stop':
         case 'cancel': {
             const stopBtn = document.getElementById('mes_stop');
+            const ttsActive = !!(currentTtsAudio && currentTtsBtn);
+            let stopped = false;
+            if (ttsActive) {
+                stopTts();
+                stopped = true;
+            }
             if (stopBtn && stopBtn.offsetParent !== null) {
                 stopBtn.click();
-                toast('success', 'Stopped');
-            } else {
-                // No-op — nothing in flight.
-                toast('info', 'Nothing to stop');
+                stopped = true;
             }
+            if (stopped) toast('success', 'Stopped');
+            else toast('info', 'Nothing to stop');
             break;
         }
         case 'append': {
@@ -1760,6 +1769,332 @@ function closeCheatsheet() {
     if (existing) try { existing.remove(); } catch {}
 }
 
+// ─── TTS read-back (Kokoro backend) ────────────────────────────────────────
+// Per-message 🔊 button + auto-read mode. Server contract:
+//   POST /tts          body {text, voice?}  -> audio/wav blob
+//   GET  /tts/voices                        -> {voices: [{id, label, sample_url?}]}
+// Both subject to require_auth. Sibling backend agent loads kokoro-server on
+// demand. If endpoints aren't there yet, click handlers fall back to a one-
+// shot toast and don't error noisily.
+
+const TTS_BTN_CLASS = 'dictation-bridge-tts-btn';
+const TTS_BTN_FLAG = 'data-dbb-tts';     // marker: this .mes already got the button
+const TTS_AUTO_READ_LAST_KEY = 'dbb_auto_read_last_mesid';
+
+let currentTtsAudio = null;     // single global Audio so a new click stops the prior one
+let currentTtsBlobUrl = null;
+let currentTtsBtn = null;
+let ttsBackendAvailable = null; // null = unknown; true/false after first call
+let ttsBackendNotifiedMissing = false;
+let ttsAutoReadInitDone = false; // gate: don't auto-read on chat-load first messages
+let ttsLastReadMesid = -1;
+let ttsObserver = null;
+
+function ttsSetButtonState(btn, state) {
+    if (!btn) return;
+    // Clean prior FA/marker classes.
+    btn.classList.remove(
+        'fa-volume-high', 'fa-volume-xmark', 'fa-spinner', 'fa-spin', 'fa-stop',
+        'dbb-tts-loading', 'dbb-tts-playing',
+    );
+    btn.removeAttribute('disabled');
+    let title = 'Read aloud (Calliope TTS)';
+    if (state === 'loading') {
+        btn.classList.add('fa-spinner', 'fa-spin', 'dbb-tts-loading');
+        title = 'Calliope TTS — loading…';
+    } else if (state === 'playing') {
+        btn.classList.add('fa-stop', 'dbb-tts-playing');
+        title = 'Stop TTS playback';
+    } else {
+        btn.classList.add('fa-volume-high');
+    }
+    btn.setAttribute('title', title);
+    btn.dataset.dbbTtsState = state;
+}
+
+function stopTts() {
+    try { currentTtsAudio?.pause(); } catch {}
+    if (currentTtsBlobUrl) {
+        try { URL.revokeObjectURL(currentTtsBlobUrl); } catch {}
+        currentTtsBlobUrl = null;
+    }
+    if (currentTtsBtn) {
+        ttsSetButtonState(currentTtsBtn, 'idle');
+        currentTtsBtn = null;
+    }
+    currentTtsAudio = null;
+}
+
+/**
+ * Pull the canonical text for a message from the chat array (DOM dragnet
+ * picks up reasoning blocks + extras). Falls back to .mes_text textContent
+ * if the chat array slot isn't reachable.
+ */
+function extractMessageText(mesEl) {
+    if (!mesEl) return '';
+    const mesid = parseInt(mesEl.getAttribute('mesid') || '-1', 10);
+    if (Array.isArray(chat) && mesid >= 0 && chat[mesid]) {
+        const raw = String(chat[mesid].mes || '').trim();
+        if (raw) return stripMarkdownForTts(raw);
+    }
+    const t = mesEl.querySelector('.mes_text');
+    return stripMarkdownForTts(String(t?.textContent || '').trim());
+}
+
+/** Light markdown stripping — Kokoro doesn't render markup; raw symbols become noise. */
+function stripMarkdownForTts(s) {
+    if (!s) return '';
+    return s
+        .replace(/```[\s\S]*?```/g, ' ')             // fenced code
+        .replace(/`([^`]+)`/g, '$1')                  // inline code
+        .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')        // images
+        .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')      // links -> text
+        .replace(/[*_]{1,3}([^*_]+)[*_]{1,3}/g, '$1') // bold/italics/underline
+        .replace(/^>\s?/gm, '')                       // blockquote arrows
+        .replace(/^#{1,6}\s+/gm, '')                  // headers
+        .replace(/<[^>]+>/g, ' ')                     // HTML tags (ST may inject)
+        .replace(/\s+\n/g, '\n')
+        .replace(/[ \t]{2,}/g, ' ')
+        .trim();
+}
+
+function isAiMessageEl(mesEl) {
+    if (!mesEl) return false;
+    const isUser = mesEl.getAttribute('is_user');
+    const isSystem = mesEl.getAttribute('is_system');
+    if (isUser === 'true') return false;
+    if (isSystem === 'true') return false;
+    return true;
+}
+
+async function fetchTts(text, voice) {
+    const cfg = settings();
+    const url = `${cfg.serverUrl.replace(/\/+$/, '')}/tts`;
+    const body = { text };
+    if (voice) body.voice = voice;
+    const res = await fetch(url, {
+        method: 'POST',
+        mode: 'cors',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+        const err = new Error(`tts_http_${res.status}`);
+        err.status = res.status;
+        throw err;
+    }
+    return await res.blob();
+}
+
+function notifyTtsMissing(reason) {
+    ttsBackendAvailable = false;
+    if (ttsBackendNotifiedMissing) return;
+    ttsBackendNotifiedMissing = true;
+    if (window.toastr) {
+        window.toastr.warning(
+            'TTS backend not yet available — install Kokoro on the dictation server.',
+            'Dictation Bridge',
+            { timeOut: 4000 },
+        );
+    }
+    LOG('tts unavailable:', reason);
+}
+
+async function readMessageAloud(mesEl, btn) {
+    // Toggle: clicking the same playing button stops it.
+    if (currentTtsBtn === btn && currentTtsAudio && !currentTtsAudio.paused) {
+        stopTts();
+        return;
+    }
+    // Switching to a new message: stop the prior playback first.
+    if (currentTtsBtn && currentTtsBtn !== btn) stopTts();
+
+    const text = extractMessageText(mesEl);
+    if (!text) {
+        toast('warning', 'No text to read');
+        return;
+    }
+
+    ttsSetButtonState(btn, 'loading');
+    currentTtsBtn = btn;
+
+    let blob;
+    try {
+        blob = await fetchTts(text, settings().ttsVoice || 'af_heart');
+        ttsBackendAvailable = true;
+    } catch (e) {
+        const status = e?.status || 0;
+        // 404/501/503 = endpoint or backend not loaded; treat as missing-backend.
+        if (status === 404 || status === 501 || status === 503 || status === 0) {
+            notifyTtsMissing(e?.message || `status_${status}`);
+        } else {
+            WARN('tts fetch failed', e?.message || e);
+            toast('error', `TTS failed: ${e?.message || 'unknown'}`);
+        }
+        ttsSetButtonState(btn, 'idle');
+        if (currentTtsBtn === btn) currentTtsBtn = null;
+        return;
+    }
+
+    try {
+        currentTtsBlobUrl = URL.createObjectURL(blob);
+        const audio = new Audio(currentTtsBlobUrl);
+        currentTtsAudio = audio;
+        audio.addEventListener('ended', () => {
+            if (currentTtsAudio === audio) stopTts();
+        });
+        audio.addEventListener('error', () => {
+            WARN('tts audio playback error');
+            if (currentTtsAudio === audio) stopTts();
+        });
+        await audio.play();
+        ttsSetButtonState(btn, 'playing');
+    } catch (e) {
+        WARN('tts playback failed', e?.message || e);
+        toast('error', 'TTS playback failed');
+        stopTts();
+    }
+}
+
+/** Inject 🔊 button on a single AI message bubble. Idempotent. */
+function injectTtsButtonOn(mesEl) {
+    if (!mesEl || !isAiMessageEl(mesEl)) return;
+    if (mesEl.hasAttribute(TTS_BTN_FLAG)) return;
+    const buttons = mesEl.querySelector('.mes_buttons');
+    if (!buttons) return;
+    mesEl.setAttribute(TTS_BTN_FLAG, '1');
+
+    const btn = document.createElement('div');
+    btn.className = `mes_button ${TTS_BTN_CLASS} fa-solid fa-volume-high interactable`;
+    btn.setAttribute('title', 'Read aloud (Calliope TTS)');
+    btn.setAttribute('tabindex', '0');
+    btn.dataset.dbbTtsState = 'idle';
+    btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        readMessageAloud(mesEl, btn).catch(err => WARN('readMessageAloud', err?.message || err));
+    });
+    btn.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            readMessageAloud(mesEl, btn).catch(err => WARN('readMessageAloud', err?.message || err));
+        }
+    });
+
+    // Insert as a top-level button on the .mes_buttons row, before the
+    // ellipsis "extras" hint so it sits with the always-visible icons.
+    const hint = buttons.querySelector('.extraMesButtonsHint');
+    if (hint) buttons.insertBefore(btn, hint);
+    else buttons.appendChild(btn);
+}
+
+/** Sweep all AI messages currently in the DOM. Called on chat-load + as backstop. */
+function sweepInjectTtsButtons() {
+    const list = document.querySelectorAll('#chat .mes');
+    list.forEach(injectTtsButtonOn);
+}
+
+function ensureTtsObserver() {
+    if (ttsObserver) return;
+    const chatRoot = document.getElementById('chat');
+    if (!chatRoot) {
+        setTimeout(ensureTtsObserver, 500);
+        return;
+    }
+    try {
+        ttsObserver = new MutationObserver((records) => {
+            for (const rec of records) {
+                rec.addedNodes && rec.addedNodes.forEach(node => {
+                    if (!(node instanceof HTMLElement)) return;
+                    if (node.classList?.contains('mes')) injectTtsButtonOn(node);
+                    // If a swipe re-renders, .mes_buttons may be replaced inside an existing .mes.
+                    const inner = node.querySelector?.('.mes');
+                    if (inner) injectTtsButtonOn(inner);
+                });
+            }
+        });
+        ttsObserver.observe(chatRoot, { childList: true, subtree: true });
+    } catch (e) {
+        WARN('tts observer setup failed', e?.message || e);
+    }
+}
+
+/**
+ * Auto-read hook for new AI messages. Wired into MESSAGE_RECEIVED /
+ * CHARACTER_MESSAGE_RENDERED. Gated so chat-load doesn't blast audio.
+ */
+function maybeAutoReadAi(mesid) {
+    const cfg = settings();
+    if (!cfg.ttsAutoReadAi) return;
+    if (!ttsAutoReadInitDone) return;             // chat just loaded — skip
+    const id = parseInt(mesid, 10);
+    if (!Number.isFinite(id) || id < 0) return;
+    if (id <= ttsLastReadMesid) return;            // already handled / replay
+    ttsLastReadMesid = id;
+    const m = chat?.[id];
+    if (!m || m.is_user || m.is_system) return;
+    const mesEl = document.querySelector(`#chat .mes[mesid="${id}"]`);
+    if (!mesEl) return;
+    const btn = mesEl.querySelector(`.${TTS_BTN_CLASS}`);
+    if (!btn) {
+        // Inject first, then read.
+        injectTtsButtonOn(mesEl);
+    }
+    const fresh = mesEl.querySelector(`.${TTS_BTN_CLASS}`);
+    if (fresh) readMessageAloud(mesEl, fresh).catch(err => WARN('autoRead', err?.message || err));
+}
+
+/** Read the most recent AI message ("computer: read last"). */
+function readLastAiMessage() {
+    const list = document.querySelectorAll('#chat .mes');
+    for (let i = list.length - 1; i >= 0; i--) {
+        const el = list[i];
+        if (!isAiMessageEl(el)) continue;
+        let btn = el.querySelector(`.${TTS_BTN_CLASS}`);
+        if (!btn) {
+            injectTtsButtonOn(el);
+            btn = el.querySelector(`.${TTS_BTN_CLASS}`);
+        }
+        if (btn) {
+            readMessageAloud(el, btn).catch(err => WARN('readLast', err?.message || err));
+            return true;
+        }
+    }
+    toast('warning', 'No AI message to read');
+    return false;
+}
+
+/** Toggle auto-read mode + persist + flash a confirmation toast. */
+function toggleAutoReadAi() {
+    const s = settings();
+    s.ttsAutoReadAi = !s.ttsAutoReadAi;
+    saveSettings();
+    // Reflect in settings panel checkbox + quick-launch button.
+    const chk = document.getElementById('dictation_bridge_tts_auto_read');
+    if (chk) chk.checked = s.ttsAutoReadAi;
+    try { paintQuickLaunchAutoReadBtn(); } catch {}
+    toast(s.ttsAutoReadAi ? 'success' : 'info',
+        s.ttsAutoReadAi ? 'Auto-read AI messages: ON' : 'Auto-read AI messages: OFF');
+}
+
+async function fetchTtsVoices() {
+    const cfg = settings();
+    const url = `${cfg.serverUrl.replace(/\/+$/, '')}/tts/voices`;
+    const res = await fetch(url, {
+        method: 'GET',
+        mode: 'cors',
+        cache: 'no-store',
+        headers: { ...authHeaders() },
+    });
+    if (!res.ok) {
+        const err = new Error(`voices_http_${res.status}`);
+        err.status = res.status;
+        throw err;
+    }
+    const data = await res.json();
+    return Array.isArray(data?.voices) ? data.voices : [];
+}
+
 // ─── Settings UI ───────────────────────────────────────────────────────────
 
 function buildSettingsPanel() {
@@ -2005,6 +2340,53 @@ export async function init() {
 
     // Phase 2: subscribe to server-sent events for direct inject from phone.
     if (settings().sseEnabled) connectSSE();
+
+    // ─── TTS read-back hooks ───────────────────────────────────────────────
+    // Inject 🔊 button on existing messages now (and on every chat-load),
+    // plus on each new message via ST events. MutationObserver is the
+    // backstop for ST DOM rebuilds (theme reload, swipe re-render).
+    ensureTtsObserver();
+    sweepInjectTtsButtons();
+    if (event_types.CHAT_CHANGED) eventSource.on(event_types.CHAT_CHANGED, () => {
+        // New chat: reset auto-read gate + sweep existing messages.
+        ttsAutoReadInitDone = false;
+        ttsLastReadMesid = -1;
+        stopTts();
+        setTimeout(() => {
+            sweepInjectTtsButtons();
+            // Mark init complete a tick after the chat is fully painted so
+            // any first_message events fired during load don't auto-blast.
+            setTimeout(() => { ttsAutoReadInitDone = true; }, 600);
+        }, 100);
+    });
+    if (event_types.CHAT_LOADED) eventSource.on(event_types.CHAT_LOADED, () => {
+        sweepInjectTtsButtons();
+        setTimeout(() => { ttsAutoReadInitDone = true; }, 600);
+    });
+    if (event_types.APP_READY) eventSource.on(event_types.APP_READY, () => {
+        sweepInjectTtsButtons();
+        setTimeout(() => { ttsAutoReadInitDone = true; }, 1000);
+    });
+    if (event_types.CHARACTER_MESSAGE_RENDERED) {
+        eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, (mesid) => {
+            // Always inject; only auto-read if the gate is open.
+            const id = parseInt(mesid, 10);
+            const el = document.querySelector(`#chat .mes[mesid="${id}"]`);
+            if (el) injectTtsButtonOn(el);
+            maybeAutoReadAi(mesid);
+        });
+    }
+    if (event_types.MESSAGE_RECEIVED) {
+        eventSource.on(event_types.MESSAGE_RECEIVED, (mesid) => {
+            const id = parseInt(mesid, 10);
+            const el = document.querySelector(`#chat .mes[mesid="${id}"]`);
+            if (el) injectTtsButtonOn(el);
+        });
+    }
+    // First-load fallback: if there's no chat yet, the gate stays closed
+    // until APP_READY/CHAT_LOADED fires. If those don't show up (race), open
+    // it after 3s so manual auto-read works on a hot session.
+    setTimeout(() => { if (!ttsAutoReadInitDone) ttsAutoReadInitDone = true; }, 3000);
 
     LOG('initialized');
 }

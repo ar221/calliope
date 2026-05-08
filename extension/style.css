@@ -126,6 +126,35 @@
     line-height: 1.35;
 }
 
+/* TTS read-back per-message button. Sits in .mes_buttons, inherits .mes_button
+   spacing/sizing, but recolours so the speaker icon stands apart from the
+   monochrome action set. Apollo amber (idle) → ember (playing). */
+.dictation-bridge-tts-btn {
+    cursor: pointer;
+    transition: color 120ms ease, transform 120ms ease, opacity 120ms ease;
+}
+
+.dictation-bridge-tts-btn.dbb-tts-loading {
+    color: var(--ap-amber, #FFB648);
+    opacity: 0.85;
+}
+
+.dictation-bridge-tts-btn.dbb-tts-playing {
+    color: var(--ap-ember, #FF5A4E);
+    animation: dbb-tts-playing-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes dbb-tts-playing-pulse {
+    0%, 100% { transform: scale(1); }
+    50%      { transform: scale(1.08); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .dictation-bridge-tts-btn.dbb-tts-playing {
+        animation: none;
+    }
+}
+
 /* POL-3: low-confidence "did you mean?" banner */
 #dictation_bridge_lowconf_banner .dbb-lc-chip:hover,
 #dictation_bridge_lowconf_banner .dbb-lc-chip:focus {
