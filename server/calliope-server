@@ -1136,8 +1136,7 @@ def ensure_ssl_cert():
 
 # ─── Auth: bearer token + loopback bypass + CORS allowlist ─
 _DEFAULT_CORS_ORIGINS = (
-    "https://localhost,https://127.0.0.1,https://[::1],"
-    "http://localhost,http://127.0.0.1,http://[::1]"
+    "https://localhost,https://127.0.0.1,https://[::1]"
 )
 _CORS_RAW = os.environ.get("DICTATION_CORS_ORIGINS", _DEFAULT_CORS_ORIGINS).strip()
 CORS_ALLOW_WILDCARD = (_CORS_RAW == "*")
@@ -5121,7 +5120,13 @@ let selectedPersona = 'none';
 let selectedCharacter = 'none';
 let useRules = false;
 let proseFormat = false;
-let chatSource = 'manual';     // 'manual', 'auto', or 'individual:<name>' or 'group:<name>'
+let chatSource = (function () {
+  // Persist user's last choice; default to 'auto' so phone picks up
+  // the active ST chat without a per-session toggle.
+  try { return localStorage.getItem('dictation.chatSource') || 'auto'; }
+  catch { return 'auto'; }
+})();
+let _lastSeenAiMessage = null;  // tracks /state lastAiMessage to detect changes for auto re-fetch
 let chatContextText = '';      // assembled context string from chat history
 let recentChats = [];
 
@@ -5490,6 +5495,7 @@ async function loadRecentChats() {
 function setChatSource(source) {
   if (source.includes(':') || source === 'manual' || source === 'auto') {
     chatSource = source;
+    try { localStorage.setItem('dictation.chatSource', source); } catch {}
   }
 
   document.getElementById('srcManual').classList.toggle('active', source === 'manual');
@@ -6775,6 +6781,12 @@ async function applyStateIfFresh(snap, { force = false } = {}) {
     const ci = document.getElementById('contextInput');
     if (ci && !ci.value.trim()) ci.value = snap.lastAiMessage;
   }
+  // Auto/individual/group: refresh chat context preview when ST emits a new message.
+  if (snap.lastAiMessage && snap.lastAiMessage !== _lastSeenAiMessage &&
+      (chatSource === 'auto' || chatSource.includes(':'))) {
+    _lastSeenAiMessage = snap.lastAiMessage;
+    try { loadChatContext(); } catch {}
+  }
   // Mode — prefer remembered per-char mode, else snap.mode
   const preferredMode = snap.rememberedMode || snap.mode;
   if (preferredMode && preferredMode !== currentMode && getMode(preferredMode)) {
@@ -7010,6 +7022,9 @@ function init() {
   loadRecentChats();
   setupEmbedMessaging();
   checkCertHealth();
+  // Apply persisted chatSource so the right chip lights up + auto re-loads
+  // chat preview when starting in 'auto' mode.
+  try { setChatSource(chatSource); } catch {}
   // Phase 2: restore auto-send preference.
   const autoToggle = document.getElementById('autoSendToggle');
   if (autoToggle) autoToggle.checked = autoSendToST;
