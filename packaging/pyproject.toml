@@ -47,8 +47,8 @@ all = ["pyyaml>=6.0", "wordfreq>=3.0"]
 calliope-server = "calliope_dictation.server:main"
 
 [project.urls]
-Homepage = "https://github.com/ayaz-rashid/calliope"
-Issues = "https://github.com/ayaz-rashid/calliope/issues"
+Homepage = "https://github.com/ar221/calliope"
+Issues = "https://github.com/ar221/calliope/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["calliope_dictation"]

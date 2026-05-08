@@ -1136,7 +1136,8 @@ def ensure_ssl_cert():
 
 # ─── Auth: bearer token + loopback bypass + CORS allowlist ─
 _DEFAULT_CORS_ORIGINS = (
-    "https://localhost,https://127.0.0.1,https://[::1]"
+    "https://localhost,https://127.0.0.1,https://[::1],"
+    "http://localhost,http://127.0.0.1,http://[::1]"
 )
 _CORS_RAW = os.environ.get("DICTATION_CORS_ORIGINS", _DEFAULT_CORS_ORIGINS).strip()
 CORS_ALLOW_WILDCARD = (_CORS_RAW == "*")
