@@ -1963,19 +1963,39 @@ async function readMessageAloud(mesEl, btn) {
     try {
         currentTtsBlobUrl = URL.createObjectURL(blob);
         const audio = new Audio(currentTtsBlobUrl);
+        audio.preload = 'auto';
         currentTtsAudio = audio;
         audio.addEventListener('ended', () => {
             if (currentTtsAudio === audio) stopTts();
         });
         audio.addEventListener('error', () => {
-            WARN('tts audio playback error');
+            const me = audio.error;
+            const code = me?.code;
+            const msg = me?.message;
+            WARN('tts audio element error', { code, msg });
+            toast('error', `TTS playback error code=${code} ${msg || ''}`);
             if (currentTtsAudio === audio) stopTts();
         });
-        await audio.play();
-        ttsSetButtonState(btn, 'playing');
+        try {
+            await audio.play();
+            ttsSetButtonState(btn, 'playing');
+        } catch (playErr) {
+            // Autoplay-policy or NotAllowedError: gesture chain broken
+            // by the awaited fetch. Surface the specific reason so users
+            // can grant permission instead of guessing.
+            const name = playErr?.name || 'Error';
+            const msg = playErr?.message || String(playErr);
+            WARN('tts play() rejected', name, msg);
+            if (name === 'NotAllowedError') {
+                toast('error', 'Browser blocked autoplay. Click the 🔊 button again to play (gesture chain expires during fetch).');
+            } else {
+                toast('error', `TTS play failed: ${name} — ${msg}`);
+            }
+            stopTts();
+        }
     } catch (e) {
-        WARN('tts playback failed', e?.message || e);
-        toast('error', 'TTS playback failed');
+        WARN('tts playback setup failed', e?.message || e);
+        toast('error', `TTS playback setup: ${e?.message || 'unknown'}`);
         stopTts();
     }
 }
