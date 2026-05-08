@@ -273,11 +273,18 @@ function currentTtsProfileName() {
     return characters?.[this_chid]?.name || '';
 }
 
+function currentPersonaTtsProfileName() {
+    return String(name1 || user_avatar || currentContext().personaId || 'Persona')
+        .replace(/\.png$/i, '')
+        .trim();
+}
+
 function messageSpeakerName(mesEl) {
     if (!mesEl) return '';
     const mesid = parseInt(mesEl.getAttribute('mesid') || '-1', 10);
     if (Array.isArray(chat) && mesid >= 0 && chat[mesid]) {
         const m = chat[mesid];
+        if (m.is_user) return currentPersonaTtsProfileName();
         if (typeof m.name === 'string' && m.name.trim()) return m.name.trim();
         if (typeof m.original_avatar === 'string') {
             const ch = (characters || []).find(c => c?.avatar === m.original_avatar);
@@ -298,6 +305,15 @@ function resolveTtsVoiceForMessage(mesEl) {
 
 function rememberTtsVoiceForCurrentProfile(voice) {
     const name = currentTtsProfileName();
+    if (!name || !voice) return '';
+    const s = settings();
+    if (!s.ttsVoiceProfiles || typeof s.ttsVoiceProfiles !== 'object') s.ttsVoiceProfiles = {};
+    s.ttsVoiceProfiles[normalizeVoiceProfileKey(name)] = voice;
+    return name;
+}
+
+function rememberTtsVoiceForPersona(voice) {
+    const name = currentPersonaTtsProfileName();
     if (!name || !voice) return '';
     const s = settings();
     if (!s.ttsVoiceProfiles || typeof s.ttsVoiceProfiles !== 'object') s.ttsVoiceProfiles = {};
@@ -2092,11 +2108,9 @@ function stripMarkdownForTts(s) {
         .trim();
 }
 
-function isAiMessageEl(mesEl) {
+function isTtsMessageEl(mesEl) {
     if (!mesEl) return false;
-    const isUser = mesEl.getAttribute('is_user');
     const isSystem = mesEl.getAttribute('is_system');
-    if (isUser === 'true') return false;
     if (isSystem === 'true') return false;
     return true;
 }
@@ -2140,7 +2154,7 @@ function buildAudiobookPayload() {
             if (!m || m.is_system) continue;
             const text = stripMarkdownForTts(String(m.mes || ''));
             if (!text) continue;
-            const name = String(m.name || '').trim();
+            const name = m.is_user ? currentPersonaTtsProfileName() : String(m.name || '').trim();
             const voice = voiceMap[normalizeVoiceProfileKey(name)] || '';
             messages.push({ name, text, is_user: !!m.is_user, voice });
         }
@@ -2296,9 +2310,9 @@ async function readMessageAloud(mesEl, btn) {
     }
 }
 
-/** Inject 🔊 button on a single AI message bubble. Idempotent. */
+/** Inject 🔊 button on a single message bubble. Idempotent. */
 function injectTtsButtonOn(mesEl) {
-    if (!mesEl || !isAiMessageEl(mesEl)) return;
+    if (!mesEl || !isTtsMessageEl(mesEl)) return;
     if (mesEl.hasAttribute(TTS_BTN_FLAG)) return;
     const buttons = mesEl.querySelector('.mes_buttons');
     if (!buttons) return;
@@ -2327,7 +2341,7 @@ function injectTtsButtonOn(mesEl) {
     else buttons.appendChild(btn);
 }
 
-/** Sweep all AI messages currently in the DOM. Called on chat-load + as backstop. */
+/** Sweep all readable messages currently in the DOM. Called on chat-load + as backstop. */
 function sweepInjectTtsButtons() {
     const list = document.querySelectorAll('#chat .mes');
     list.forEach(injectTtsButtonOn);
@@ -2388,7 +2402,8 @@ function readLastAiMessage() {
     const list = document.querySelectorAll('#chat .mes');
     for (let i = list.length - 1; i >= 0; i--) {
         const el = list[i];
-        if (!isAiMessageEl(el)) continue;
+        if (!isTtsMessageEl(el)) continue;
+        if (el.getAttribute('is_user') === 'true') continue;
         let btn = el.querySelector(`.${TTS_BTN_CLASS}`);
         if (!btn) {
             injectTtsButtonOn(el);
@@ -2674,6 +2689,7 @@ function buildSettingsPanel() {
 
                         <div style="display:flex;gap:6px;align-items:center;margin:4px 0 0 0">
                             <button id="dictation_bridge_tts_test" type="button" class="menu_button" style="padding:3px 10px;font-size:12px;border:1px solid rgba(201, 178, 139, 0.45);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Test voice</button>
+                            <button id="dictation_bridge_tts_save_persona" type="button" class="menu_button" style="padding:3px 10px;font-size:12px;border:1px solid rgba(201, 178, 139, 0.45);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Save for persona</button>
                             <small class="notes" style="margin:0 0 0 4px">Plays a short sample with the selected voice.</small>
                         </div>
 
@@ -2781,6 +2797,7 @@ function buildSettingsPanel() {
     const ttsStreamEl = host.querySelector('#dictation_bridge_tts_stream_partials');
     const ttsVoiceEl = host.querySelector('#dictation_bridge_tts_voice');
     const ttsTestEl = host.querySelector('#dictation_bridge_tts_test');
+    const ttsSavePersonaEl = host.querySelector('#dictation_bridge_tts_save_persona');
     const audiobookExportEl = host.querySelector('#dictation_bridge_audiobook_export');
     const ttsProfileHintEl = host.querySelector('#dictation_bridge_tts_profile_hint');
 
@@ -2890,6 +2907,15 @@ function buildSettingsPanel() {
                 ttsTestEl.textContent = prev;
                 ttsTestEl.removeAttribute('disabled');
             }
+        });
+    }
+
+    if (ttsSavePersonaEl && ttsVoiceEl) {
+        ttsSavePersonaEl.addEventListener('click', () => {
+            const profileName = rememberTtsVoiceForPersona(ttsVoiceEl.value || settings().ttsVoice || 'af_heart');
+            saveSettings();
+            paintTtsProfileHint();
+            if (profileName) toast('success', `Saved TTS voice for persona ${profileName}`);
         });
     }
 
