@@ -65,6 +65,7 @@ const DEFAULTS = {
     pushContext: true,           // send last AI message to server on ready
     broadcastState: true,        // POST /state on chat/char/persona change + 30s heartbeat
     sseEnabled: true,            // Phase 2: subscribe to /events for direct-inject from phone
+    voiceCommandsEnabled: true,  // POL-1: server-emitted dictation-command SSE dispatcher
 };
 
 /**
@@ -423,6 +424,229 @@ function handleDictationStateEvent(data) {
     }
 }
 
+// ─── POL-1: undo stack + voice command dispatcher ─────────────────────────
+// Per Agent 4 §5.4: undo stack lives in the extension, not the server.
+// Each writeToTextarea() snapshot pushes {prevValue, ts} (capped at 8).
+// Voice command "scratch that" / "undo" pops and restores. Voice command
+// "clear" wipes textarea AFTER pushing prior state to the stack so a
+// follow-up "undo" recovers it.
+const UNDO_STACK_CAP = 8;
+const undoStack = [];
+
+function pushUndoSnapshot(reason) {
+    const ta = document.getElementById('send_textarea');
+    if (!ta) return;
+    const prev = ta.value || '';
+    // Skip duplicate snapshots — repeated identical state pollutes the stack.
+    const top = undoStack[undoStack.length - 1];
+    if (top && top.prevValue === prev) return;
+    undoStack.push({ prevValue: prev, ts: Date.now(), reason: reason || '' });
+    while (undoStack.length > UNDO_STACK_CAP) undoStack.shift();
+}
+
+function popUndoSnapshot() {
+    return undoStack.pop() || null;
+}
+
+/** Toast helper. Reuses ST's globally jQuery-loaded toastr. 1.2s default. */
+function toast(level, msg, opts = {}) {
+    if (!window.toastr) return;
+    const fn = window.toastr[level] || window.toastr.success;
+    try { fn(msg, 'Dictation Bridge', { timeOut: 1200, ...opts }); }
+    catch {}
+}
+
+/**
+ * POL-1: voice-command dispatcher. Server emits SSE 'dictation-command'
+ * with shape {requestId, intent, args, source_text, residual}. We map
+ * intents to ST DOM ops. All commands fire a 1.2s toastr success with the
+ * action label so the user sees voice → action feedback.
+ */
+function appendToTextarea(extra) {
+    const ta = document.getElementById('send_textarea');
+    if (!ta) return;
+    pushUndoSnapshot('append');
+    const sep = ta.value && !/\s$/.test(ta.value) ? '' : '';
+    ta.value = (ta.value || '') + sep + extra;
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    try { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
+}
+
+function replaceTextarea(value) {
+    const ta = document.getElementById('send_textarea');
+    if (!ta) return;
+    pushUndoSnapshot('replace');
+    ta.value = value || '';
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    try { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
+}
+
+function clickIfVisible(selector, scope) {
+    const root = scope || document;
+    const el = root.querySelector(selector);
+    if (!el) return false;
+    // crude visibility check (offsetParent is null when display:none)
+    if (el.offsetParent === null && el !== document.body) return false;
+    el.click();
+    return true;
+}
+
+function lastMessageEl() {
+    const list = document.querySelectorAll('#chat .mes');
+    return list.length ? list[list.length - 1] : null;
+}
+
+function handleDictationCommand(data) {
+    if (!settings().voiceCommandsEnabled) return;
+    const intent = String(data.intent || '').toLowerCase().trim();
+    const args = (data.args && typeof data.args === 'object') ? data.args : {};
+    const residual = typeof data.residual === 'string' ? data.residual : '';
+    if (!intent) return;
+
+    switch (intent) {
+        case 'send': {
+            const ok = clickIfVisible('#send_but');
+            if (ok) toast('success', 'Sent');
+            else toast('warning', 'Send button not found');
+            break;
+        }
+        case 'swipe': {
+            const direction = String(args.direction || 'right').toLowerCase();
+            const last = lastMessageEl();
+            if (!last) { toast('warning', 'No message to swipe'); break; }
+            const sel = direction === 'left' ? '.mes_swipe_left' : '.mes_swipe_right';
+            const ok = clickIfVisible(sel, last);
+            if (ok) toast('success', `Swiped ${direction}`);
+            else toast('warning', `Swipe ${direction} unavailable`);
+            break;
+        }
+        case 'regenerate': {
+            const ok = clickIfVisible('#option_regenerate');
+            if (ok) toast('success', 'Regenerated');
+            else toast('warning', 'Regenerate option not found');
+            break;
+        }
+        case 'clear': {
+            const ta = document.getElementById('send_textarea');
+            if (!ta) { toast('warning', 'Textarea not found'); break; }
+            pushUndoSnapshot('clear');
+            ta.value = '';
+            ta.dispatchEvent(new Event('input', { bubbles: true }));
+            // 3s undo affordance per spec — toastr "info" with longer hold + clickable.
+            if (window.toastr) {
+                try {
+                    window.toastr.info(
+                        'Cleared. Tap to undo.',
+                        'Dictation Bridge',
+                        {
+                            timeOut: 3000,
+                            extendedTimeOut: 1000,
+                            closeButton: true,
+                            tapToDismiss: true,
+                            onclick: () => {
+                                const snap = popUndoSnapshot();
+                                if (snap && document.getElementById('send_textarea')) {
+                                    const t = document.getElementById('send_textarea');
+                                    t.value = snap.prevValue;
+                                    t.dispatchEvent(new Event('input', { bubbles: true }));
+                                    toast('success', 'Restored');
+                                }
+                            },
+                        },
+                    );
+                } catch { toast('success', 'Cleared'); }
+            }
+            break;
+        }
+        case 'delete that':
+        case 'delete_that':
+        case 'delete last':
+        case 'delete_last': {
+            // Prefer the last AI message delete button; fall back to popping
+            // the most recent dictation snapshot when there's no AI message
+            // visible (per task spec).
+            const last = lastMessageEl();
+            const btn = last?.querySelector('.mes_button.mes_delete') || last?.querySelector('[data-i18n="Delete this message"]') || last?.querySelector('.mes_button_delete');
+            if (btn) {
+                btn.click();
+                toast('success', 'Deleted last');
+            } else {
+                const snap = popUndoSnapshot();
+                if (snap) {
+                    const ta = document.getElementById('send_textarea');
+                    if (ta) {
+                        ta.value = snap.prevValue;
+                        ta.dispatchEvent(new Event('input', { bubbles: true }));
+                    }
+                    toast('success', 'Deleted last dictation');
+                } else {
+                    toast('warning', 'Nothing to delete');
+                }
+            }
+            break;
+        }
+        case 'scratch that':
+        case 'scratch_that':
+        case 'undo': {
+            const snap = popUndoSnapshot();
+            if (!snap) { toast('warning', 'Nothing to undo'); break; }
+            const ta = document.getElementById('send_textarea');
+            if (ta) {
+                ta.value = snap.prevValue;
+                ta.dispatchEvent(new Event('input', { bubbles: true }));
+                try { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
+            }
+            toast('success', 'Reverted last dictation');
+            break;
+        }
+        case 'new paragraph':
+        case 'new_paragraph': {
+            appendToTextarea('\n\n');
+            toast('success', 'New paragraph');
+            break;
+        }
+        case 'scene break':
+        case 'scene_break': {
+            appendToTextarea('\n\n***\n\n');
+            toast('success', 'Scene break');
+            break;
+        }
+        case 'stop':
+        case 'cancel': {
+            const stopBtn = document.getElementById('mes_stop');
+            if (stopBtn && stopBtn.offsetParent !== null) {
+                stopBtn.click();
+                toast('success', 'Stopped');
+            } else {
+                // No-op — nothing in flight.
+                toast('info', 'Nothing to stop');
+            }
+            break;
+        }
+        case 'append': {
+            if (residual) {
+                appendToTextarea((residual.startsWith(' ') ? '' : ' ') + residual);
+                toast('success', 'Appended');
+            } else {
+                toast('warning', 'Append: no text');
+            }
+            break;
+        }
+        case 'replace': {
+            if (residual) {
+                replaceTextarea(residual);
+                toast('success', 'Replaced');
+            } else {
+                toast('warning', 'Replace: no text');
+            }
+            break;
+        }
+        default:
+            WARN(`unknown voice command intent: ${intent}`);
+            break;
+    }
+}
+
 // ─── Phase 2: SSE direct-inject from phone ─────────────────────────────────
 // The phone POSTs to /send-to-st, which fans out to all ST tabs subscribed
 // to /events. Reconnect is best-effort with exponential backoff.
@@ -546,6 +770,22 @@ function connectSSE() {
         }
     });
 
+    // POL-1: server-emitted voice command dispatch. Server runs the
+    // 'computer:' / 'OOC:' regex pre-pass; on a hit it emits a
+    // dictation-command SSE event. When voiceCommandsEnabled is false,
+    // ignore the event entirely so a single ST instance can opt out
+    // (useful when two ST tabs would otherwise both fire the action).
+    sseSource.addEventListener('dictation-command', (e) => {
+        sseStatus.lastEventAt = Date.now();
+        if (!settings().voiceCommandsEnabled) return;
+        try {
+            const data = JSON.parse(e.data);
+            handleDictationCommand(data);
+        } catch (err) {
+            WARN('SSE dictation-command: bad JSON', err?.message || err);
+        }
+    });
+
     // MVP-16: pipeline state-machine bar above #send_textarea.
     sseSource.addEventListener('dictation-state', (e) => {
         sseStatus.lastEventAt = Date.now();
@@ -563,7 +803,7 @@ function connectSSE() {
         let data;
         try { data = JSON.parse(e.data); }
         catch { WARN('SSE dictation-result: bad JSON'); return; }
-        const text = String(data.text || '').trim();
+        let text = String(data.text || '').trim();
         if (!text) { WARN('SSE dictation-result: empty text'); endStreamingSession(); return; }
         // MVP-16: remember the mode for "Done · <mode>" labelling on the
         // state bar's terminal frame.
@@ -571,6 +811,15 @@ function connectSSE() {
         const cfg = settings();
         // Per-event auto_send overrides setting when explicitly true; otherwise setting applies.
         const doAutoSend = data.auto_send === true ? true : !!cfg.autoSend;
+
+        // POL-1: server strips the 'OOC:' prefix and signals via mode_override.
+        // Prepend the OOC tag back so the chat displays the convention ST
+        // readers expect (OOC chunks are routed differently downstream).
+        const modeOverride = String(data.mode_override || data.modeOverride || '').toLowerCase();
+        if (modeOverride === 'ooc' || modeOverride === 'grammar_clean'
+                && data.is_ooc === true) {
+            if (!/^\s*ooc\b/i.test(text)) text = `OOC: ${text}`;
+        }
 
         // MVP-13: if we streamed deltas for this request, replace the streamed
         // span with the canonical text. The session captured the original
@@ -582,6 +831,7 @@ function connectSSE() {
             const base = streamingSession.base;
             endStreamingSession();
             if (ta) {
+                pushUndoSnapshot('dictation-result-stream');
                 const sep = (sessAppendMode === 'append' && base) ? '\n\n' : '';
                 ta.value = (sessAppendMode === 'append' ? base + sep : '') + text;
                 ta.dispatchEvent(new Event('input', { bubbles: true }));
@@ -810,6 +1060,8 @@ function postToServer(payload) {
 function writeToTextarea(text, { autoSend = false, appendMode = 'replace' } = {}) {
     const ta = document.getElementById('send_textarea');
     if (!ta) { WARN('send_textarea not found'); return; }
+    // POL-1: snapshot pre-write state so 'scratch that' / 'undo' can restore.
+    pushUndoSnapshot('writeToTextarea');
     const next = appendMode === 'append' && ta.value
         ? (ta.value.replace(/\s+$/, '') + '\n\n' + text)
         : text;
@@ -1061,7 +1313,7 @@ function openCheatsheet() {
             <div class="dictation-bridge-frame-wrap" style="background:#1C150C;border:2px solid #FFB648;border-radius:2px;width:min(90vw, 600px);max-height:80vh;overflow:auto;padding:18px;color:#C9B28B;font-family:inherit">
                 <div class="dictation-bridge-close" style="color:#FFB648">&times;</div>
                 <h3 style="margin:0 0 6px 0;color:#FFB648;font-size:16px;letter-spacing:0.04em">Voice commands</h3>
-                <div style="margin:0 0 12px 0;font-size:11px;color:#98876F;font-style:italic">Coming in Phase 5 — voice grammar is not yet implemented. This list is the surface the dictation pipeline will recognise once the command dispatcher ships.</div>
+                <div style="margin:0 0 12px 0;font-size:11px;color:#98876F;font-style:italic">Voice grammar is live (Phase 5 / POL-1). The dictation pipeline strips these prefixes and dispatches the action; toggle off in settings to ignore command events on this ST instance.</div>
                 <div style="margin:8px 0">${rows}</div>
                 <div style="margin-top:14px;font-size:12px;color:#98876F;border-top:1px solid rgba(255, 182, 72, 0.18);padding-top:10px">
                     <div style="margin-bottom:4px"><strong style="color:#C9B28B">Held mic</strong> — dictate while held, release to send.</div>
@@ -1150,6 +1402,12 @@ function buildSettingsPanel() {
                         <span>Receive dictation from phone via SSE (direct inject)</span>
                     </label>
 
+                    <label class="checkbox_label">
+                        <input id="dictation_bridge_voice_commands" type="checkbox" />
+                        <span>Voice commands (computer:, OOC:, "scratch that", "send" …)</span>
+                    </label>
+                    <small class="notes" style="margin-top:0">Server emits voice-command events; toggle off to ignore them in this extension instance.</small>
+
                     <div class="dictation-bridge-sse-status" style="display:flex;align-items:center;gap:8px;margin:4px 0 6px;font-size:12px;color:var(--SmartThemeBodyColor, #aaa)">
                         <span id="dictation_bridge_sse_dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#7a7a9a"></span>
                         <span id="dictation_bridge_sse_label">SSE: disconnected</span>
@@ -1177,6 +1435,7 @@ function buildSettingsPanel() {
     const mirrorEl = host.querySelector('#dictation_bridge_live_mirror');
     const broadcastEl = host.querySelector('#dictation_bridge_broadcast_state');
     const sseEl = host.querySelector('#dictation_bridge_sse_enabled');
+    const voiceCmdEl = host.querySelector('#dictation_bridge_voice_commands');
 
     // MVP-11: on touch devices the iframe path fails because ST's parent page
     // does not delegate microphone via Permissions-Policy. Drop the option from
@@ -1204,6 +1463,7 @@ function buildSettingsPanel() {
     mirrorEl.checked = !!s.liveMirror;
     broadcastEl.checked = !!s.broadcastState;
     sseEl.checked = !!s.sseEnabled;
+    if (voiceCmdEl) voiceCmdEl.checked = !!s.voiceCommandsEnabled;
     updateSseStatusIndicator(); // paint initial dot color
 
     urlEl.addEventListener('change', () => {
@@ -1239,6 +1499,12 @@ function buildSettingsPanel() {
         if (s.sseEnabled) connectSSE();
         else disconnectSSE();
     });
+    if (voiceCmdEl) {
+        voiceCmdEl.addEventListener('change', () => {
+            s.voiceCommandsEnabled = !!voiceCmdEl.checked;
+            saveSettings();
+        });
+    }
 
     // MVP-23: privacy badge → audit-log peek modal.
     const privacyBadge = host.querySelector('#dictation_bridge_privacy_badge');
