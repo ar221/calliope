@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""learn-vocab — POL-2 adaptive lexicon learner for Calliope.
+
+Mines per-character vocabulary from SillyTavern chat history (JSONL files
+under data/default-user/chats/<character>/) and merges high-frequency,
+out-of-stoplist tokens into Calliope's vocab.yaml. The whisper prompt
+biaser (server build_whisper_prompt) already consumes the
+`characters: [...]` scope — no server-side change is needed.
+
+Defaults:
+  --chats-dir   /mnt/hdd/AI/SillyTavern/data/default-user/chats
+  --vocab-yaml  ~/.local/share/dictation-server/vocab.yaml
+  --min-freq    3
+  --cap         80   (per character; whisper prompt budget is ~200 tokens)
+
+Behaviour:
+  - Dry-run by default. --apply writes vocab.yaml atomically.
+  - De-dup against existing vocab.yaml (case-insensitive on `correct`).
+  - Existing entry scoped to a DIFFERENT character: skip silently unless
+    --apply --merge-characters, in which case current character (lowered)
+    is appended to its `characters:` list.
+  - Casing: keeps the longest-form representative (Kael'thas > kael).
+
+Optional follow-ups (NOT implemented):
+  - --cluster-aliases: edit-distance clustering for ERP-slang variants
+    ("cumming"/"coming"/"cumin") with canonical pick + aliases population.
+    Defer to v2.
+  - Nightly systemd timer (learn-vocab-nightly.timer) — out of scope here;
+    a wrapper unit in calliope/systemd/ would call this with --apply.
+
+Deps:
+  - stdlib only (mandatory)
+  - PyYAML (optional; falls back to JSON if absent — vocab.yaml is YAML
+    in practice, so PyYAML is strongly recommended for --apply)
+  - wordfreq (optional; falls back to inline ~1000-word stoplist with
+    a logged warning that vocab quality is degraded)
+
+Exit codes:
+  0  success (dry-run or --apply)
+  1  --apply failure (vocab.yaml unwritable, parse error, etc.)
+  2  argument / discovery error (e.g. character not found)
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import json
+import os
+import pathlib
+import re
+import sys
+import tempfile
+from typing import Iterable
+
+# ─── Optional deps ───────────────────────────────────────────────────
+
+try:
+    import yaml  # PyYAML
+    _HAS_YAML = True
+except ImportError:
+    yaml = None  # type: ignore[assignment]
+    _HAS_YAML = False
+
+try:
+    from wordfreq import top_n_list  # noqa: F401
+    _HAS_WORDFREQ = True
+except ImportError:
+    _HAS_WORDFREQ = False
+
+
+# ─── Constants ───────────────────────────────────────────────────────
+
+DEFAULT_CHATS_DIR = pathlib.Path(
+    "/mnt/hdd/AI/SillyTavern/data/default-user/chats"
+)
+DEFAULT_VOCAB_YAML = pathlib.Path(
+    "~/.local/share/dictation-server/vocab.yaml"
+).expanduser()
+
+# Same shape as server build_whisper_prompt token regex (recon line 107).
+TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z'\-]+")
+
+# Inline fallback stoplist (~1000 most-common English words) used when
+# `wordfreq` is unavailable. Sourced from public-domain English word
+# frequency lists (Norvig's count_1w, BNC top-1000). This is the FLOOR
+# of stoplist coverage; real builds should `pip install wordfreq` for
+# the full 5,000-word list.
+_FALLBACK_STOPLIST = """
+the be to of and a in that have i it for not on with he as you do at this but
+his by from they we say her she or an will my one all would there their what
+so up out if about who get which go me when make can like time no just him
+know take people into year your good some could them see other than then now
+look only come its over think also back after use two how our work first well
+way even new want because any these give day most us is was are been being
+am were has had does did doing done having gets gotten making making got go
+goes went gone going coming taking taken thinking thought looking seeing said
+saying called calling tried trying needed needing wanted wanting felt feeling
+felt knew known turned turning showed showing helped helping started starting
+played playing ran running moved moving lived living believed believing held
+holding brought bringing happened happening wrote writing provided providing
+sat sitting stood standing lost losing paid paying meant meaning kept keeping
+let letting began beginning seemed seeming talked talking remembered
+remembering walked walking won winning offered offering loved loving allowed
+allowing remained remaining included including continued continuing set
+setting learned learning changed changing led leading understood understanding
+watched watching followed following stopped stopping created creating spoke
+speaking read reading spent spending grew growing opened opening waited
+waiting served serving died dying sent sending built building stayed staying
+fell falling cut cutting reached reaching killed killing remained remaining
+suggested suggesting expected expecting raised raising passed passing sold
+selling required requiring reported reporting decided deciding pulled pulling
+returned returning explained explaining hoped hoping developed developing
+carried carrying broke breaking received receiving agreed agreeing supported
+supporting hit hitting produced producing eaten eating covered covering
+catched caught catching drew drawing chose choosing answered answering wore
+wearing related relating sounded sounding picked picking established
+establishing learnt acted acting failed failing reached reaching supposed
+supposing pressed pressing forced forcing affected affecting laid laying
+nothing something anything everything someone everyone anyone people child
+children man woman men women boy girl baby family friend home house room
+door window car road street city town country world place name life day
+night week month year hour minute second morning evening today tomorrow
+yesterday week weekend body head face eye eyes ear ears nose mouth lip lips
+hand hands arm arms leg legs foot feet hair skin heart blood breath voice
+word words thing things way ways idea ideas thought thoughts question answer
+problem reason story plan question fact part end side back front top bottom
+left right inside outside near far up down here there everywhere thing things
+work job money business company office school class team group family kind
+type sort kinds lot lots much many few little less more most enough big small
+large great long short high low old young new good bad better best worse
+worst happy sad angry tired busy free easy hard rich poor full empty open
+close closed warm cold hot cool dry wet light dark loud quiet pretty ugly
+real true false right wrong same different last next other another every
+each both either neither none any some all such whole half quarter dozen
+hundred thousand million first second third fourth fifth never always often
+sometimes usually rarely seldom early late soon already still yet again
+together alone really quite very pretty too enough almost actually probably
+maybe perhaps certainly absolutely definitely clearly obviously simply just
+only mainly mostly hardly nearly likely surely truly fully exactly directly
+suddenly slowly quickly carefully easily badly well finally eventually
+recently currently typically generally specifically basically essentially
+literally honestly seriously personally apparently obviously hopefully
+sincerely lovely gentle gentle softly quietly loudly happily sadly angrily
+calmly nervously eagerly slowly walked talked smiled laughed cried sighed
+nodded shook turned moved walked stepped pulled pushed grabbed reached
+touched held kissed hugged whispered shouted murmured replied asked answered
+told mentioned added explained agreed admitted confessed
+""".lower().split()
+
+
+# ─── Stoplist construction ───────────────────────────────────────────
+
+
+def build_stoplist(quiet: bool = False) -> set[str]:
+    """Return the lowercased stoplist. Prefer wordfreq top-5000."""
+    if _HAS_WORDFREQ:
+        return set(top_n_list("en", 5000))
+    if not quiet:
+        sys.stderr.write(
+            "[learn-vocab] WARNING: wordfreq not installed; using small "
+            "fallback stoplist (~1000 words). Vocab quality is degraded. "
+            "Install with: pip install wordfreq\n"
+        )
+    return set(_FALLBACK_STOPLIST)
+
+
+# ─── Mining ──────────────────────────────────────────────────────────
+
+
+def iter_chat_messages(char_dir: pathlib.Path) -> Iterable[str]:
+    """Yield message text strings from all *.jsonl files under char_dir.
+
+    ST JSONL chat files have a metadata header line with no `mes` key,
+    plus per-message lines. Robust to malformed lines and missing fields.
+    """
+    for chat in sorted(char_dir.glob("*.jsonl")):
+        try:
+            text = chat.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            mes = obj.get("mes")
+            if isinstance(mes, str) and mes:
+                yield mes
+
+
+def mine_character(
+    char_dir: pathlib.Path,
+    stoplist: set[str],
+    min_freq: int,
+    cap: int,
+) -> tuple[list[tuple[str, int]], int, int]:
+    """Mine one character directory.
+
+    Returns (proposals, chat_count, message_count). Proposals are
+    (representative_token, count) tuples sorted by frequency desc.
+    Only tokens with count >= min_freq AND not in stoplist are returned;
+    output is capped at `cap` entries.
+    """
+    counts: collections.Counter[str] = collections.Counter()
+    casing: dict[str, str] = {}
+    chat_count = sum(1 for _ in char_dir.glob("*.jsonl"))
+    msg_count = 0
+    for mes in iter_chat_messages(char_dir):
+        msg_count += 1
+        for tok in TOKEN_RE.findall(mes):
+            lo = tok.lower()
+            if lo in stoplist:
+                continue
+            counts[lo] += 1
+            # Keep longest-form representative (Kael'thas > kael).
+            if len(tok) > len(casing.get(lo, "")):
+                casing[lo] = tok
+    proposals: list[tuple[str, int]] = []
+    for word, n in counts.most_common():
+        if n < min_freq:
+            break  # most_common is sorted; we can stop
+        proposals.append((casing[word], n))
+        if len(proposals) >= cap:
+            break
+    return proposals, chat_count, msg_count
+
+
+# ─── Vocab.yaml I/O ──────────────────────────────────────────────────
+
+
+def load_vocab(path: pathlib.Path) -> list[dict]:
+    """Load existing vocab.yaml. Returns [] if missing/empty."""
+    if not path.exists():
+        return []
+    raw = path.read_text(encoding="utf-8")
+    if not raw.strip():
+        return []
+    if _HAS_YAML:
+        data = yaml.safe_load(raw)
+    else:
+        # Fallback: try JSON. vocab.yaml's empty form is `[]` which is
+        # valid JSON. For any other shape without PyYAML we bail loudly.
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(
+                f"Cannot parse {path} without PyYAML (json fallback failed: "
+                f"{e}). Install with: pip install PyYAML"
+            ) from e
+    if data is None:
+        return []
+    if not isinstance(data, list):
+        raise RuntimeError(f"{path} root must be a list, got {type(data).__name__}")
+    return data
+
+
+def write_vocab_atomic(path: pathlib.Path, entries: list[dict]) -> None:
+    """Write vocab.yaml atomically via tempfile+os.replace.
+
+    Preserves shape: top-level list of {correct, aliases, characters?}
+    dicts. Uses default_flow_style=False, sort_keys=False.
+    """
+    if not _HAS_YAML:
+        raise RuntimeError(
+            "Cannot write vocab.yaml without PyYAML. "
+            "Install with: pip install PyYAML"
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".vocab.", suffix=".yaml.tmp", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml.safe_dump(
+                entries,
+                f,
+                default_flow_style=False,
+                sort_keys=False,
+                allow_unicode=True,
+            )
+        os.replace(tmp_name, path)
+    except Exception:
+        # Cleanup tempfile on failure.
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+# ─── Dedup / merge logic ─────────────────────────────────────────────
+
+
+def find_existing(vocab: list[dict], correct: str) -> int | None:
+    """Return index of existing entry with case-insensitive match on
+    `correct`, or None. Server normalization keeps `correct` as-is but
+    we match case-insensitively to avoid duplicate-with-different-case
+    entries from creeping in."""
+    target = correct.lower()
+    for i, e in enumerate(vocab):
+        if not isinstance(e, dict):
+            continue
+        existing = (e.get("correct") or "").strip()
+        if existing.lower() == target:
+            return i
+    return None
+
+
+def entry_chars(entry: dict) -> list[str]:
+    """Return lowercased characters list (matching server normalization)."""
+    raw = entry.get("characters") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    return [str(c).strip().lower() for c in raw if str(c).strip()]
+
+
+# ─── Per-character processing ────────────────────────────────────────
+
+
+def process_character(
+    character: str,
+    chats_dir: pathlib.Path,
+    vocab: list[dict],
+    stoplist: set[str],
+    min_freq: int,
+    cap: int,
+    apply: bool,
+    merge_characters: bool,
+) -> dict:
+    """Process one character. Mutates `vocab` in place when apply=True.
+
+    Returns a result dict: {
+        character, chats, messages,
+        added: [{correct, count}], skipped: [{word, reason}],
+        merged: [{word, target_chars}],
+    }
+    """
+    char_dir = chats_dir / character
+    result = {
+        "character": character,
+        "chats": 0,
+        "messages": 0,
+        "added": [],
+        "skipped": [],
+        "merged": [],
+    }
+    if not char_dir.is_dir():
+        result["skipped"].append({"word": "<all>", "reason": f"chat dir not found: {char_dir}"})
+        return result
+
+    proposals, chat_count, msg_count = mine_character(
+        char_dir, stoplist, min_freq=min_freq, cap=cap
+    )
+    result["chats"] = chat_count
+    result["messages"] = msg_count
+
+    char_lo = character.strip().lower()
+
+    for word, count in proposals:
+        idx = find_existing(vocab, word)
+        if idx is None:
+            # New entry. Add (or stage for dry-run).
+            new_entry = {
+                "correct": word,
+                "aliases": [],
+                "characters": [char_lo],
+            }
+            if apply:
+                vocab.append(new_entry)
+            result["added"].append({"correct": word, "count": count})
+            continue
+        # Already in vocab.
+        existing = vocab[idx]
+        chars = entry_chars(existing)
+        if not chars:
+            # Global entry — skip (no scope to extend).
+            result["skipped"].append({
+                "word": word,
+                "reason": "already in vocab (global scope)",
+            })
+            continue
+        if char_lo in chars:
+            result["skipped"].append({
+                "word": word,
+                "reason": f"already scoped to {character}",
+            })
+            continue
+        # Different-character scope.
+        if merge_characters and apply:
+            chars.append(char_lo)
+            existing["characters"] = chars
+            result["merged"].append({
+                "word": word,
+                "target_chars": chars,
+            })
+        else:
+            result["skipped"].append({
+                "word": word,
+                "reason": f"already in vocab, scoped to {', '.join(chars)}",
+            })
+
+    return result
+
+
+# ─── CLI / output ────────────────────────────────────────────────────
+
+
+def discover_characters(chats_dir: pathlib.Path) -> list[str]:
+    if not chats_dir.is_dir():
+        return []
+    return sorted(p.name for p in chats_dir.iterdir() if p.is_dir())
+
+
+def print_result(result: dict, quiet: bool) -> None:
+    """Pretty per-character output (skipped when --quiet)."""
+    if quiet:
+        return
+    name = result["character"]
+    chats = result["chats"]
+    msgs = result["messages"]
+    print(f"{name} — {chats} chats, {msgs:,} messages")
+    for add in result["added"]:
+        print(f"  + {add['correct']:<20s} ({add['count']} occurrences)")
+    for skip in result["skipped"]:
+        print(f"  [skip] {skip['word']} ({skip['reason']})")
+    for merge in result["merged"]:
+        chars = ", ".join(merge["target_chars"])
+        print(f"  [merge] {merge['word']} → characters now: {chars}")
+    a = len(result["added"])
+    s = len(result["skipped"])
+    m = len(result["merged"])
+    print(f"  {a} added, {s} skipped, {m} character-merge")
+    print()
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="learn-vocab",
+        description="POL-2 adaptive lexicon learner — mine SillyTavern "
+        "chat history into Calliope's vocab.yaml.",
+    )
+    p.add_argument("--character", default=None,
+                   help="Mine one character (default: all).")
+    p.add_argument("--min-freq", type=int, default=3,
+                   help="Minimum occurrence count for a token to be a "
+                   "candidate (default: 3).")
+    p.add_argument("--cap", type=int, default=80,
+                   help="Max entries added per character (default: 80).")
+    p.add_argument("--vocab-yaml", type=pathlib.Path,
+                   default=DEFAULT_VOCAB_YAML,
+                   help=f"Path to vocab.yaml (default: {DEFAULT_VOCAB_YAML}).")
+    p.add_argument("--chats-dir", type=pathlib.Path,
+                   default=DEFAULT_CHATS_DIR,
+                   help=f"Chats root (default: {DEFAULT_CHATS_DIR}).")
+    p.add_argument("--apply", action="store_true",
+                   help="Persist changes to vocab.yaml. Default: dry-run.")
+    p.add_argument("--merge-characters", action="store_true",
+                   help="With --apply, extend an existing entry's "
+                   "characters[] list when a candidate is already scoped "
+                   "to a different character.")
+    p.add_argument("--json", action="store_true",
+                   help="Emit machine-readable JSON results to stdout.")
+    p.add_argument("--quiet", action="store_true",
+                   help="Suppress per-character header output.")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_argparser().parse_args(argv)
+
+    if args.merge_characters and not args.apply:
+        sys.stderr.write(
+            "[learn-vocab] WARNING: --merge-characters has no effect "
+            "without --apply (dry-run reports merges but does not write).\n"
+        )
+
+    chats_dir = args.chats_dir
+    if not chats_dir.is_dir():
+        sys.stderr.write(f"[learn-vocab] chats dir not found: {chats_dir}\n")
+        return 2
+
+    if args.character:
+        characters = [args.character]
+        if not (chats_dir / args.character).is_dir():
+            sys.stderr.write(
+                f"[learn-vocab] character not found: "
+                f"{chats_dir / args.character}\n"
+            )
+            return 2
+    else:
+        characters = discover_characters(chats_dir)
+        if not characters:
+            sys.stderr.write(
+                f"[learn-vocab] no character subdirs in {chats_dir}\n"
+            )
+            return 2
+
+    stoplist = build_stoplist(quiet=args.quiet)
+
+    # Load existing vocab. In dry-run we work on a copy so we don't
+    # accidentally see staged additions when the next character's loop
+    # hits the same word.
+    try:
+        vocab = load_vocab(args.vocab_yaml)
+    except Exception as e:
+        sys.stderr.write(f"[learn-vocab] cannot load {args.vocab_yaml}: {e}\n")
+        return 1
+
+    results: list[dict] = []
+    for ch in characters:
+        result = process_character(
+            character=ch,
+            chats_dir=chats_dir,
+            vocab=vocab,
+            stoplist=stoplist,
+            min_freq=args.min_freq,
+            cap=args.cap,
+            apply=args.apply,
+            merge_characters=args.merge_characters,
+        )
+        results.append(result)
+        if not args.json:
+            print_result(result, quiet=args.quiet)
+
+    # Persist.
+    if args.apply:
+        try:
+            write_vocab_atomic(args.vocab_yaml, vocab)
+        except Exception as e:
+            sys.stderr.write(f"[learn-vocab] write failed: {e}\n")
+            return 1
+
+    if args.json:
+        json.dump(
+            {
+                "applied": args.apply,
+                "vocab_yaml": str(args.vocab_yaml),
+                "results": results,
+            },
+            sys.stdout,
+            indent=2,
+        )
+        sys.stdout.write("\n")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

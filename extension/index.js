@@ -65,6 +65,7 @@ const DEFAULTS = {
     pushContext: true,           // send last AI message to server on ready
     broadcastState: true,        // POST /state on chat/char/persona change + 30s heartbeat
     sseEnabled: true,            // Phase 2: subscribe to /events for direct-inject from phone
+    voiceCommandsEnabled: true,  // POL-1: server-emitted dictation-command SSE dispatcher
 };
 
 /**
@@ -152,6 +153,42 @@ function currentContext() {
     return { chatId, personaId, characterId, lastAi, groupName: s?.name || '' };
 }
 
+/**
+ * POL-6: resolve full member name list for the current group.
+ * ST stores group.members as an array of avatar filenames; map each back
+ * to a human-readable character name via the global `characters[]` array.
+ */
+function resolveGroupMembers(group) {
+    if (!group || !Array.isArray(group.members)) return [];
+    const out = [];
+    for (const avatarFile of group.members) {
+        const ch = (characters || []).find(c => c?.avatar === avatarFile);
+        if (ch?.name) out.push(ch.name);
+        else if (typeof avatarFile === 'string') out.push(avatarFile.replace(/\.png$/i, ''));
+    }
+    return out;
+}
+
+/**
+ * POL-6: scan the chat tail (most recent first) for the last AI message
+ * (not user, not system) and return the speaking character name. Group
+ * chats stamp `name` onto each message; fall back to `original_avatar`
+ * lookup if needed.
+ */
+function resolveLastSpeaker() {
+    if (!Array.isArray(chat)) return '';
+    for (let i = chat.length - 1; i >= 0; i--) {
+        const m = chat[i];
+        if (!m || m.is_user || m.is_system) continue;
+        if (typeof m.name === 'string' && m.name.trim()) return m.name;
+        if (typeof m.original_avatar === 'string') {
+            const ch = (characters || []).find(c => c?.avatar === m.original_avatar);
+            if (ch?.name) return ch.name;
+        }
+    }
+    return '';
+}
+
 /** Build the /state payload the server expects. */
 function buildStatePayload() {
     const ctx = currentContext();
@@ -161,14 +198,29 @@ function buildStatePayload() {
     const characterName = selected_group
         ? (s?.name || '')
         : (characters?.[this_chid]?.name || '');
+
+    // POL-6: when the active chat is a group, expose the member roster +
+    // the last AI speaker so the server (and phone UI) can render the
+    // addressee picker. groupId is the ST UUID; groupMembers are full
+    // human-readable character names.
+    const isGroup = !!selected_group;
+    const groupId = isGroup ? String(selected_group) : '';
+    const groupMembers = isGroup ? resolveGroupMembers(s) : [];
+    const lastSpeaker = isGroup ? resolveLastSpeaker() : '';
+
     return {
         chatId: ctx.chatId,
-        chatType: selected_group ? 'group' : 'solo',
+        chatType: isGroup ? 'group' : 'solo',
         characterId: ctx.characterId,
         characterName,
         personaId: ctx.personaId,
         lastAiMessage: ctx.lastAi,
         sourceDevice: 'st-desktop',
+        // POL-6 additions — server treats them as optional.
+        groupId,
+        groupName: s?.name || '',
+        groupMembers,
+        lastSpeaker,
     };
 }
 
@@ -423,6 +475,581 @@ function handleDictationStateEvent(data) {
     }
 }
 
+// ─── POL-6: group-chat addressee picker (extension side) ──────────────────
+// When chatType === 'group', render a chip row in the settings panel:
+// member chips with the last-speaker highlighted, plus an "All members"
+// joint-context chip. Click = persist the choice to the server's
+// /state/mode-memory, keyed by `<groupId>:<characterName>` so the next
+// dictation request can resolve the addressee server-side. The phone UI
+// renders an equivalent picker via the /state contract.
+
+let activeAddressee = null; // { groupId, characterName | '*all' }
+
+async function persistAddresseeChoice(groupId, characterName) {
+    if (!groupId) return;
+    const cfg = settings();
+    const url = `${cfg.serverUrl.replace(/\/+$/, '')}/state/mode-memory`;
+    const key = `${groupId}:${characterName || ''}`;
+    try {
+        await fetch(url, {
+            method: 'POST',
+            mode: 'cors',
+            cache: 'no-store',
+            headers: { 'Content-Type': 'application/json', ...authHeaders() },
+            body: JSON.stringify({
+                key,
+                groupId,
+                addressee: characterName || '',
+                jointContext: characterName === '*all',
+                ts: Date.now(),
+            }),
+        });
+    } catch (e) {
+        WARN('persistAddresseeChoice failed', e?.message || e);
+    }
+}
+
+function renderAddresseePicker() {
+    const host = document.getElementById('dictation_bridge_addressee');
+    if (!host) return;
+
+    if (!selected_group) {
+        host.style.display = 'none';
+        host.innerHTML = '';
+        return;
+    }
+
+    const group = groups?.find(g => g.id == selected_group) || null;
+    const members = resolveGroupMembers(group);
+    const lastSpeaker = resolveLastSpeaker();
+    const groupId = String(selected_group);
+
+    // Default selection: persisted choice if it matches, else last speaker,
+    // else nothing.
+    const cur = activeAddressee && activeAddressee.groupId === groupId
+        ? activeAddressee.characterName
+        : (lastSpeaker || '');
+
+    if (members.length === 0) {
+        host.style.display = 'block';
+        host.innerHTML = `<div style="font-size:12px;color:#98876F;padding:6px 0">Group has no resolved members yet.</div>`;
+        return;
+    }
+
+    const chipBase = 'padding:3px 10px;border-radius:2px;cursor:pointer;font-size:12px;font-family:inherit;background:transparent';
+    const chips = members.map(name => {
+        const isLast = lastSpeaker && name === lastSpeaker;
+        const isSelected = name === cur;
+        const border = isSelected
+            ? '1px solid #FFB648'
+            : (isLast ? '1px solid rgba(255, 182, 72, 0.55)' : '1px solid rgba(201, 178, 139, 0.35)');
+        const color = isSelected ? '#FFB648' : (isLast ? '#FFB648' : '#C9B28B');
+        const tag = isLast ? `<span style="margin-left:6px;font-size:10px;color:#FFB648;opacity:0.8">last</span>` : '';
+        return `<button type="button" class="dbb-addr-chip" data-name="${escapeHtml(name)}" style="${chipBase};border:${border};color:${color}">${escapeHtml(name)}${tag}</button>`;
+    }).join('');
+
+    const allSelected = cur === '*all';
+    const allBorder = allSelected ? '1px solid #FFB648' : '1px dashed rgba(201, 178, 139, 0.35)';
+    const allColor = allSelected ? '#FFB648' : '#98876F';
+    const allChip = `<button type="button" class="dbb-addr-chip" data-name="*all" style="${chipBase};border:${allBorder};color:${allColor}">All members (joint)</button>`;
+
+    host.style.display = 'block';
+    host.innerHTML = `
+        <div style="font-size:12px;color:#98876F;margin:6px 0 4px 0;display:flex;justify-content:space-between;align-items:center">
+            <span>Talking to <strong style="color:#C9B28B">${escapeHtml(group?.name || 'group')}</strong></span>
+            ${lastSpeaker ? `<span style="font-size:11px;color:#98876F">last spoke: <strong style="color:#C9B28B">${escapeHtml(lastSpeaker)}</strong></span>` : ''}
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px">${chips}${allChip}</div>
+    `;
+
+    host.querySelectorAll('.dbb-addr-chip').forEach(chip => {
+        chip.addEventListener('click', () => {
+            const name = chip.getAttribute('data-name') || '';
+            activeAddressee = { groupId, characterName: name };
+            persistAddresseeChoice(groupId, name);
+            renderAddresseePicker(); // repaint with the new selection.
+        });
+    });
+}
+
+// ─── POL-3: low-confidence "did you mean?" banner ─────────────────────────
+// Server adds `low_confidence_spans: [{text, start, end, confidence,
+// alternatives?: string[]}]` to the /transcribe response and the
+// dictation-result SSE event. We render a slim banner above the textarea:
+//
+//   Low confidence: [wear] [shore] [lithium]   ✕
+//
+// Each chip is a button: click → small popover with top-3 alternatives +
+// "Keep original". Selecting an alternative replaces the word in the
+// textarea (best-effort whole-word replacement, preserving cursor).
+//
+// This is the v1 banner-style implementation. The full overlay version
+// (positioned wavy underline aligned with textarea content) is deferred
+// to Phase 5 v2 — see roadmap POL-3 for the rationale.
+const LOWCONF_BANNER_ID = 'dictation_bridge_lowconf_banner';
+const LOWCONF_POPOVER_ID = 'dictation_bridge_lowconf_popover';
+const LOWCONF_BANNER_HIDE_MS = 10_000; // auto-dismiss after 10s
+
+let lowConfBannerTimer = null;
+let lowConfBannerInputBound = false;
+
+function clearLowConfBanner() {
+    if (lowConfBannerTimer) { clearTimeout(lowConfBannerTimer); lowConfBannerTimer = null; }
+    const el = document.getElementById(LOWCONF_BANNER_ID);
+    if (el) try { el.remove(); } catch {}
+    closeLowConfPopover();
+}
+
+function closeLowConfPopover() {
+    const pop = document.getElementById(LOWCONF_POPOVER_ID);
+    if (pop) try { pop.remove(); } catch {}
+}
+
+/** Replace first whole-word occurrence of `word` in #send_textarea with `replacement`. */
+function replaceWordInTextarea(word, replacement) {
+    const ta = document.getElementById('send_textarea');
+    if (!ta || !word) return false;
+    const value = ta.value || '';
+    // Word-boundary match, case-insensitive, first occurrence only.
+    const re = new RegExp(`\\b${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+    const m = value.match(re);
+    if (!m || m.index == null) return false;
+    pushUndoSnapshot('lowconf-replace');
+    const start = m.index;
+    const end = start + m[0].length;
+    // setRangeText is the cleanest path that preserves cursor placement.
+    try {
+        ta.focus();
+        ta.setSelectionRange(start, end);
+        if (typeof ta.setRangeText === 'function') {
+            ta.setRangeText(replacement, start, end, 'end');
+        } else {
+            ta.value = value.slice(0, start) + replacement + value.slice(end);
+            ta.setSelectionRange(start + replacement.length, start + replacement.length);
+        }
+    } catch {
+        ta.value = value.slice(0, start) + replacement + value.slice(end);
+    }
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    return true;
+}
+
+async function fetchWordAlternatives(word, contextText) {
+    const cfg = settings();
+    const url = `${cfg.serverUrl.replace(/\/+$/, '')}/word-alternatives`;
+    try {
+        const res = await fetch(url, {
+            method: 'POST',
+            mode: 'cors',
+            cache: 'no-store',
+            headers: { 'Content-Type': 'application/json', ...authHeaders() },
+            body: JSON.stringify({ word, context: contextText || '' }),
+        });
+        if (!res.ok) return [];
+        const data = await res.json();
+        if (Array.isArray(data?.alternatives)) return data.alternatives.slice(0, 3);
+        return [];
+    } catch (e) {
+        WARN('word-alternatives fetch failed', e?.message || e);
+        return [];
+    }
+}
+
+function buildLowConfPopover(word, alternatives, anchorRect) {
+    closeLowConfPopover();
+    const pop = document.createElement('div');
+    pop.id = LOWCONF_POPOVER_ID;
+    pop.style.cssText = [
+        'position:fixed',
+        `left:${Math.max(8, Math.round(anchorRect.left))}px`,
+        `top:${Math.max(8, Math.round(anchorRect.bottom + 6))}px`,
+        'z-index:10002',
+        'background:#1C150C',
+        'border:1px solid #FFB648',
+        'border-radius:2px',
+        'padding:8px',
+        'min-width:180px',
+        'max-width:280px',
+        'box-shadow:0 6px 18px rgba(0,0,0,0.45)',
+        'font-size:12px',
+        'color:#C9B28B',
+    ].join(';');
+    const altRows = (alternatives || []).map(a => `
+        <div class="dbb-lc-alt" data-alt="${escapeHtml(a)}" style="padding:4px 6px;cursor:pointer;border-radius:2px">${escapeHtml(a)}</div>
+    `).join('');
+    pop.innerHTML = `
+        <div style="font-size:11px;color:#98876F;margin-bottom:4px">Replace &ldquo;${escapeHtml(word)}&rdquo; with:</div>
+        <div class="dbb-lc-list">
+            ${altRows || '<div style="opacity:0.65;padding:4px 6px">No alternatives available</div>'}
+            <div class="dbb-lc-keep" style="padding:4px 6px;cursor:pointer;border-top:1px solid rgba(255, 182, 72, 0.18);margin-top:4px;color:#98876F">Keep original</div>
+        </div>
+    `;
+    document.body.appendChild(pop);
+
+    // Hover affordance.
+    pop.querySelectorAll('.dbb-lc-alt, .dbb-lc-keep').forEach(el => {
+        el.addEventListener('mouseenter', () => { el.style.background = 'rgba(255, 182, 72, 0.12)'; });
+        el.addEventListener('mouseleave', () => { el.style.background = 'transparent'; });
+    });
+
+    pop.querySelectorAll('.dbb-lc-alt').forEach(el => {
+        el.addEventListener('click', () => {
+            const alt = el.getAttribute('data-alt') || '';
+            if (alt && replaceWordInTextarea(word, alt)) {
+                toast('success', `Replaced &ldquo;${word}&rdquo; → &ldquo;${alt}&rdquo;`);
+            }
+            closeLowConfPopover();
+            // Remove the chip whose word we resolved.
+            const chip = document.querySelector(`#${LOWCONF_BANNER_ID} [data-word="${CSS.escape(word.toLowerCase())}"]`);
+            if (chip) try { chip.remove(); } catch {}
+            const banner = document.getElementById(LOWCONF_BANNER_ID);
+            if (banner && !banner.querySelector('.dbb-lc-chip')) clearLowConfBanner();
+        });
+    });
+    pop.querySelector('.dbb-lc-keep')?.addEventListener('click', () => {
+        const chip = document.querySelector(`#${LOWCONF_BANNER_ID} [data-word="${CSS.escape(word.toLowerCase())}"]`);
+        if (chip) try { chip.remove(); } catch {}
+        closeLowConfPopover();
+        const banner = document.getElementById(LOWCONF_BANNER_ID);
+        if (banner && !banner.querySelector('.dbb-lc-chip')) clearLowConfBanner();
+    });
+
+    // Clicks outside dismiss.
+    setTimeout(() => {
+        document.addEventListener('click', onDocClickClosePopover, { once: true, capture: true });
+    }, 0);
+}
+
+function onDocClickClosePopover(e) {
+    const pop = document.getElementById(LOWCONF_POPOVER_ID);
+    if (!pop) return;
+    if (pop.contains(e.target)) {
+        // Re-arm if the click was inside the popover (keep open).
+        document.addEventListener('click', onDocClickClosePopover, { once: true, capture: true });
+        return;
+    }
+    closeLowConfPopover();
+}
+
+/**
+ * POL-3 entry point: render the low-confidence banner from a list of
+ * spans (shape: {text, alternatives?, confidence?}). De-dups by word,
+ * skips empty alternatives, no-ops if list is empty.
+ */
+function renderLowConfBanner(spans) {
+    clearLowConfBanner();
+    if (!Array.isArray(spans) || spans.length === 0) return;
+
+    // De-dup by lowercased word; preserve first occurrence's alternatives.
+    const seen = new Map();
+    for (const s of spans) {
+        const word = String(s?.text || '').trim();
+        if (!word) continue;
+        const key = word.toLowerCase();
+        if (seen.has(key)) continue;
+        const alts = Array.isArray(s.alternatives) ? s.alternatives.filter(Boolean).slice(0, 3) : [];
+        seen.set(key, { word, alts });
+    }
+    if (seen.size === 0) return;
+
+    const ta = document.getElementById('send_textarea');
+    if (!ta || !ta.parentElement) return;
+
+    const banner = document.createElement('div');
+    banner.id = LOWCONF_BANNER_ID;
+    banner.setAttribute('role', 'status');
+    banner.style.cssText = [
+        'display:flex',
+        'flex-wrap:wrap',
+        'align-items:center',
+        'gap:6px',
+        'box-sizing:border-box',
+        'width:100%',
+        'padding:6px 10px',
+        'margin:0 0 4px 0',
+        'background:#1C150C',
+        'border:1px solid rgba(255, 182, 72, 0.35)',
+        'border-radius:2px',
+        'color:#C9B28B',
+        'font-size:12px',
+    ].join(';');
+
+    const labelHtml = `<span style="color:#FFB648;font-weight:600">Low confidence:</span>`;
+    const chips = [...seen.values()].map(({ word, alts }) => `
+        <button type="button"
+                class="dbb-lc-chip"
+                data-word="${escapeHtml(word.toLowerCase())}"
+                data-alts="${escapeHtml(JSON.stringify(alts))}"
+                title="Click to choose alternative"
+                style="padding:2px 8px;border:1px solid rgba(255, 182, 72, 0.55);background:transparent;color:#FFB648;border-radius:2px;cursor:pointer;font-size:12px;font-family:inherit;text-decoration:underline wavy var(--ap-amber, #FFB648);text-decoration-thickness:1px">${escapeHtml(word)}</button>
+    `).join('');
+    const dismissHtml = `<button type="button" id="dbb_lc_dismiss" title="Dismiss (Esc)" style="margin-left:auto;background:transparent;border:0;color:#98876F;cursor:pointer;font-size:14px;padding:0 4px">&times;</button>`;
+
+    banner.innerHTML = `${labelHtml}${chips}${dismissHtml}`;
+    ta.parentElement.insertBefore(banner, ta);
+
+    // Wire chip clicks.
+    banner.querySelectorAll('.dbb-lc-chip').forEach(chip => {
+        chip.addEventListener('click', async (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            const word = chip.textContent.trim();
+            let alts = [];
+            try { alts = JSON.parse(chip.getAttribute('data-alts') || '[]'); } catch {}
+            // If server didn't ship alternatives, fetch fresh — uses bearer auth.
+            if (!alts || alts.length === 0) {
+                const ctxText = (document.getElementById('send_textarea')?.value || '').slice(0, 400);
+                alts = await fetchWordAlternatives(word, ctxText);
+            }
+            const rect = chip.getBoundingClientRect();
+            buildLowConfPopover(word, alts, rect);
+        });
+    });
+
+    banner.querySelector('#dbb_lc_dismiss')?.addEventListener('click', clearLowConfBanner);
+
+    // Auto-dismiss after 10s, on textarea input, or Esc.
+    lowConfBannerTimer = setTimeout(clearLowConfBanner, LOWCONF_BANNER_HIDE_MS);
+    if (!lowConfBannerInputBound) {
+        ta.addEventListener('input', onTextareaInputDismissBanner, { passive: true });
+        document.addEventListener('keydown', onEscDismissBanner);
+        lowConfBannerInputBound = true;
+    }
+}
+
+function onTextareaInputDismissBanner() {
+    if (document.getElementById(LOWCONF_BANNER_ID)) clearLowConfBanner();
+}
+
+function onEscDismissBanner(e) {
+    if (e.key === 'Escape' && document.getElementById(LOWCONF_BANNER_ID)) {
+        clearLowConfBanner();
+    }
+}
+
+// ─── POL-1: undo stack + voice command dispatcher ─────────────────────────
+// Per Agent 4 §5.4: undo stack lives in the extension, not the server.
+// Each writeToTextarea() snapshot pushes {prevValue, ts} (capped at 8).
+// Voice command "scratch that" / "undo" pops and restores. Voice command
+// "clear" wipes textarea AFTER pushing prior state to the stack so a
+// follow-up "undo" recovers it.
+const UNDO_STACK_CAP = 8;
+const undoStack = [];
+
+function pushUndoSnapshot(reason) {
+    const ta = document.getElementById('send_textarea');
+    if (!ta) return;
+    const prev = ta.value || '';
+    // Skip duplicate snapshots — repeated identical state pollutes the stack.
+    const top = undoStack[undoStack.length - 1];
+    if (top && top.prevValue === prev) return;
+    undoStack.push({ prevValue: prev, ts: Date.now(), reason: reason || '' });
+    while (undoStack.length > UNDO_STACK_CAP) undoStack.shift();
+}
+
+function popUndoSnapshot() {
+    return undoStack.pop() || null;
+}
+
+/** Toast helper. Reuses ST's globally jQuery-loaded toastr. 1.2s default. */
+function toast(level, msg, opts = {}) {
+    if (!window.toastr) return;
+    const fn = window.toastr[level] || window.toastr.success;
+    try { fn(msg, 'Dictation Bridge', { timeOut: 1200, ...opts }); }
+    catch {}
+}
+
+/**
+ * POL-1: voice-command dispatcher. Server emits SSE 'dictation-command'
+ * with shape {requestId, intent, args, source_text, residual}. We map
+ * intents to ST DOM ops. All commands fire a 1.2s toastr success with the
+ * action label so the user sees voice → action feedback.
+ */
+function appendToTextarea(extra) {
+    const ta = document.getElementById('send_textarea');
+    if (!ta) return;
+    pushUndoSnapshot('append');
+    const sep = ta.value && !/\s$/.test(ta.value) ? '' : '';
+    ta.value = (ta.value || '') + sep + extra;
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    try { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
+}
+
+function replaceTextarea(value) {
+    const ta = document.getElementById('send_textarea');
+    if (!ta) return;
+    pushUndoSnapshot('replace');
+    ta.value = value || '';
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    try { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
+}
+
+function clickIfVisible(selector, scope) {
+    const root = scope || document;
+    const el = root.querySelector(selector);
+    if (!el) return false;
+    // crude visibility check (offsetParent is null when display:none)
+    if (el.offsetParent === null && el !== document.body) return false;
+    el.click();
+    return true;
+}
+
+function lastMessageEl() {
+    const list = document.querySelectorAll('#chat .mes');
+    return list.length ? list[list.length - 1] : null;
+}
+
+function handleDictationCommand(data) {
+    if (!settings().voiceCommandsEnabled) return;
+    const intent = String(data.intent || '').toLowerCase().trim();
+    const args = (data.args && typeof data.args === 'object') ? data.args : {};
+    const residual = typeof data.residual === 'string' ? data.residual : '';
+    if (!intent) return;
+
+    switch (intent) {
+        case 'send': {
+            const ok = clickIfVisible('#send_but');
+            if (ok) toast('success', 'Sent');
+            else toast('warning', 'Send button not found');
+            break;
+        }
+        case 'swipe': {
+            const direction = String(args.direction || 'right').toLowerCase();
+            const last = lastMessageEl();
+            if (!last) { toast('warning', 'No message to swipe'); break; }
+            const sel = direction === 'left' ? '.mes_swipe_left' : '.mes_swipe_right';
+            const ok = clickIfVisible(sel, last);
+            if (ok) toast('success', `Swiped ${direction}`);
+            else toast('warning', `Swipe ${direction} unavailable`);
+            break;
+        }
+        case 'regenerate': {
+            const ok = clickIfVisible('#option_regenerate');
+            if (ok) toast('success', 'Regenerated');
+            else toast('warning', 'Regenerate option not found');
+            break;
+        }
+        case 'clear': {
+            const ta = document.getElementById('send_textarea');
+            if (!ta) { toast('warning', 'Textarea not found'); break; }
+            pushUndoSnapshot('clear');
+            ta.value = '';
+            ta.dispatchEvent(new Event('input', { bubbles: true }));
+            // 3s undo affordance per spec — toastr "info" with longer hold + clickable.
+            if (window.toastr) {
+                try {
+                    window.toastr.info(
+                        'Cleared. Tap to undo.',
+                        'Dictation Bridge',
+                        {
+                            timeOut: 3000,
+                            extendedTimeOut: 1000,
+                            closeButton: true,
+                            tapToDismiss: true,
+                            onclick: () => {
+                                const snap = popUndoSnapshot();
+                                if (snap && document.getElementById('send_textarea')) {
+                                    const t = document.getElementById('send_textarea');
+                                    t.value = snap.prevValue;
+                                    t.dispatchEvent(new Event('input', { bubbles: true }));
+                                    toast('success', 'Restored');
+                                }
+                            },
+                        },
+                    );
+                } catch { toast('success', 'Cleared'); }
+            }
+            break;
+        }
+        case 'delete that':
+        case 'delete_that':
+        case 'delete last':
+        case 'delete_last': {
+            // Prefer the last AI message delete button; fall back to popping
+            // the most recent dictation snapshot when there's no AI message
+            // visible (per task spec).
+            const last = lastMessageEl();
+            const btn = last?.querySelector('.mes_button.mes_delete') || last?.querySelector('[data-i18n="Delete this message"]') || last?.querySelector('.mes_button_delete');
+            if (btn) {
+                btn.click();
+                toast('success', 'Deleted last');
+            } else {
+                const snap = popUndoSnapshot();
+                if (snap) {
+                    const ta = document.getElementById('send_textarea');
+                    if (ta) {
+                        ta.value = snap.prevValue;
+                        ta.dispatchEvent(new Event('input', { bubbles: true }));
+                    }
+                    toast('success', 'Deleted last dictation');
+                } else {
+                    toast('warning', 'Nothing to delete');
+                }
+            }
+            break;
+        }
+        case 'scratch that':
+        case 'scratch_that':
+        case 'undo': {
+            const snap = popUndoSnapshot();
+            if (!snap) { toast('warning', 'Nothing to undo'); break; }
+            const ta = document.getElementById('send_textarea');
+            if (ta) {
+                ta.value = snap.prevValue;
+                ta.dispatchEvent(new Event('input', { bubbles: true }));
+                try { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
+            }
+            toast('success', 'Reverted last dictation');
+            break;
+        }
+        case 'new paragraph':
+        case 'new_paragraph': {
+            appendToTextarea('\n\n');
+            toast('success', 'New paragraph');
+            break;
+        }
+        case 'scene break':
+        case 'scene_break': {
+            appendToTextarea('\n\n***\n\n');
+            toast('success', 'Scene break');
+            break;
+        }
+        case 'stop':
+        case 'cancel': {
+            const stopBtn = document.getElementById('mes_stop');
+            if (stopBtn && stopBtn.offsetParent !== null) {
+                stopBtn.click();
+                toast('success', 'Stopped');
+            } else {
+                // No-op — nothing in flight.
+                toast('info', 'Nothing to stop');
+            }
+            break;
+        }
+        case 'append': {
+            if (residual) {
+                appendToTextarea((residual.startsWith(' ') ? '' : ' ') + residual);
+                toast('success', 'Appended');
+            } else {
+                toast('warning', 'Append: no text');
+            }
+            break;
+        }
+        case 'replace': {
+            if (residual) {
+                replaceTextarea(residual);
+                toast('success', 'Replaced');
+            } else {
+                toast('warning', 'Replace: no text');
+            }
+            break;
+        }
+        default:
+            WARN(`unknown voice command intent: ${intent}`);
+            break;
+    }
+}
+
 // ─── Phase 2: SSE direct-inject from phone ─────────────────────────────────
 // The phone POSTs to /send-to-st, which fans out to all ST tabs subscribed
 // to /events. Reconnect is best-effort with exponential backoff.
@@ -546,6 +1173,22 @@ function connectSSE() {
         }
     });
 
+    // POL-1: server-emitted voice command dispatch. Server runs the
+    // 'computer:' / 'OOC:' regex pre-pass; on a hit it emits a
+    // dictation-command SSE event. When voiceCommandsEnabled is false,
+    // ignore the event entirely so a single ST instance can opt out
+    // (useful when two ST tabs would otherwise both fire the action).
+    sseSource.addEventListener('dictation-command', (e) => {
+        sseStatus.lastEventAt = Date.now();
+        if (!settings().voiceCommandsEnabled) return;
+        try {
+            const data = JSON.parse(e.data);
+            handleDictationCommand(data);
+        } catch (err) {
+            WARN('SSE dictation-command: bad JSON', err?.message || err);
+        }
+    });
+
     // MVP-16: pipeline state-machine bar above #send_textarea.
     sseSource.addEventListener('dictation-state', (e) => {
         sseStatus.lastEventAt = Date.now();
@@ -563,7 +1206,7 @@ function connectSSE() {
         let data;
         try { data = JSON.parse(e.data); }
         catch { WARN('SSE dictation-result: bad JSON'); return; }
-        const text = String(data.text || '').trim();
+        let text = String(data.text || '').trim();
         if (!text) { WARN('SSE dictation-result: empty text'); endStreamingSession(); return; }
         // MVP-16: remember the mode for "Done · <mode>" labelling on the
         // state bar's terminal frame.
@@ -571,6 +1214,15 @@ function connectSSE() {
         const cfg = settings();
         // Per-event auto_send overrides setting when explicitly true; otherwise setting applies.
         const doAutoSend = data.auto_send === true ? true : !!cfg.autoSend;
+
+        // POL-1: server strips the 'OOC:' prefix and signals via mode_override.
+        // Prepend the OOC tag back so the chat displays the convention ST
+        // readers expect (OOC chunks are routed differently downstream).
+        const modeOverride = String(data.mode_override || data.modeOverride || '').toLowerCase();
+        if (modeOverride === 'ooc' || modeOverride === 'grammar_clean'
+                && data.is_ooc === true) {
+            if (!/^\s*ooc\b/i.test(text)) text = `OOC: ${text}`;
+        }
 
         // MVP-13: if we streamed deltas for this request, replace the streamed
         // span with the canonical text. The session captured the original
@@ -582,6 +1234,7 @@ function connectSSE() {
             const base = streamingSession.base;
             endStreamingSession();
             if (ta) {
+                pushUndoSnapshot('dictation-result-stream');
                 const sep = (sessAppendMode === 'append' && base) ? '\n\n' : '';
                 ta.value = (sessAppendMode === 'append' ? base + sep : '') + text;
                 ta.dispatchEvent(new Event('input', { bubbles: true }));
@@ -600,6 +1253,18 @@ function connectSSE() {
             window.toastr.warning(`RP formatting skipped${reason}. Raw transcript used.`, 'Dictation Bridge');
         } else if (window.toastr) {
             window.toastr.success('Received from phone', 'Dictation Bridge', { timeOut: 1500 });
+        }
+
+        // POL-3: render low-confidence "did you mean?" banner if the server
+        // tagged any spans below the confidence threshold. Banner auto-hides
+        // on textarea input, Esc, or after 10s.
+        if (Array.isArray(data.low_confidence_spans) && data.low_confidence_spans.length) {
+            try { renderLowConfBanner(data.low_confidence_spans); }
+            catch (err) { WARN('lowconf banner render failed', err?.message || err); }
+        } else if (Array.isArray(data.lowConfidenceSpans) && data.lowConfidenceSpans.length) {
+            // Tolerate camelCase server payload as well.
+            try { renderLowConfBanner(data.lowConfidenceSpans); }
+            catch (err) { WARN('lowconf banner render failed', err?.message || err); }
         }
     });
 
@@ -652,6 +1317,11 @@ function buildEmbedUrl() {
     if (ctx.chatId) qp.set('chat', String(ctx.chatId));
     if (ctx.personaId) qp.set('persona', String(ctx.personaId));
     if (ctx.characterId) qp.set('character', String(ctx.characterId));
+    // Pass bearer token via query so the embedded UI can stash it in
+    // sessionStorage and attach to its own fetch + EventSource calls.
+    // Server-side / is auth-exempt; child API calls remain gated.
+    const token = (cfg.serverToken || '').trim();
+    if (token) qp.set('token', token);
     return `${base}/?${qp.toString()}`;
 }
 
@@ -810,6 +1480,8 @@ function postToServer(payload) {
 function writeToTextarea(text, { autoSend = false, appendMode = 'replace' } = {}) {
     const ta = document.getElementById('send_textarea');
     if (!ta) { WARN('send_textarea not found'); return; }
+    // POL-1: snapshot pre-write state so 'scratch that' / 'undo' can restore.
+    pushUndoSnapshot('writeToTextarea');
     const next = appendMode === 'append' && ta.value
         ? (ta.value.replace(/\s+$/, '') + '\n\n' + text)
         : text;
@@ -850,6 +1522,12 @@ function onWindowMessage(event) {
             if (data.formatting_skipped && window.toastr) {
                 const reason = data.formatting_reason ? `: ${data.formatting_reason}` : '';
                 window.toastr.warning(`RP formatting skipped${reason}. Raw transcript used.`, 'Dictation Bridge');
+            }
+            // POL-3: low-confidence banner if the server tagged spans.
+            const spans = data.low_confidence_spans || data.lowConfidenceSpans;
+            if (Array.isArray(spans) && spans.length) {
+                try { renderLowConfBanner(spans); }
+                catch (err) { WARN('lowconf banner render failed', err?.message || err); }
             }
             // For popups, close so the user is back in ST. For iframes, leave open
             // so they can see the result — they close via the X or backdrop.
@@ -1061,7 +1739,7 @@ function openCheatsheet() {
             <div class="dictation-bridge-frame-wrap" style="background:#1C150C;border:2px solid #FFB648;border-radius:2px;width:min(90vw, 600px);max-height:80vh;overflow:auto;padding:18px;color:#C9B28B;font-family:inherit">
                 <div class="dictation-bridge-close" style="color:#FFB648">&times;</div>
                 <h3 style="margin:0 0 6px 0;color:#FFB648;font-size:16px;letter-spacing:0.04em">Voice commands</h3>
-                <div style="margin:0 0 12px 0;font-size:11px;color:#98876F;font-style:italic">Coming in Phase 5 — voice grammar is not yet implemented. This list is the surface the dictation pipeline will recognise once the command dispatcher ships.</div>
+                <div style="margin:0 0 12px 0;font-size:11px;color:#98876F;font-style:italic">Voice grammar is live (Phase 5 / POL-1). The dictation pipeline strips these prefixes and dispatches the action; toggle off in settings to ignore command events on this ST instance.</div>
                 <div style="margin:8px 0">${rows}</div>
                 <div style="margin-top:14px;font-size:12px;color:#98876F;border-top:1px solid rgba(255, 182, 72, 0.18);padding-top:10px">
                     <div style="margin-bottom:4px"><strong style="color:#C9B28B">Held mic</strong> — dictate while held, release to send.</div>
@@ -1150,10 +1828,19 @@ function buildSettingsPanel() {
                         <span>Receive dictation from phone via SSE (direct inject)</span>
                     </label>
 
+                    <label class="checkbox_label">
+                        <input id="dictation_bridge_voice_commands" type="checkbox" />
+                        <span>Voice commands (computer:, OOC:, "scratch that", "send" …)</span>
+                    </label>
+                    <small class="notes" style="margin-top:0">Server emits voice-command events; toggle off to ignore them in this extension instance.</small>
+
                     <div class="dictation-bridge-sse-status" style="display:flex;align-items:center;gap:8px;margin:4px 0 6px;font-size:12px;color:var(--SmartThemeBodyColor, #aaa)">
                         <span id="dictation_bridge_sse_dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#7a7a9a"></span>
                         <span id="dictation_bridge_sse_label">SSE: disconnected</span>
                     </div>
+
+                    <!-- POL-6: addressee picker (group chats only). Hidden on solo. -->
+                    <div id="dictation_bridge_addressee" style="display:none;margin:6px 0 4px 0"></div>
 
                     <small class="notes">
                         The dictation server must be running and reachable.
@@ -1177,6 +1864,7 @@ function buildSettingsPanel() {
     const mirrorEl = host.querySelector('#dictation_bridge_live_mirror');
     const broadcastEl = host.querySelector('#dictation_bridge_broadcast_state');
     const sseEl = host.querySelector('#dictation_bridge_sse_enabled');
+    const voiceCmdEl = host.querySelector('#dictation_bridge_voice_commands');
 
     // MVP-11: on touch devices the iframe path fails because ST's parent page
     // does not delegate microphone via Permissions-Policy. Drop the option from
@@ -1204,6 +1892,7 @@ function buildSettingsPanel() {
     mirrorEl.checked = !!s.liveMirror;
     broadcastEl.checked = !!s.broadcastState;
     sseEl.checked = !!s.sseEnabled;
+    if (voiceCmdEl) voiceCmdEl.checked = !!s.voiceCommandsEnabled;
     updateSseStatusIndicator(); // paint initial dot color
 
     urlEl.addEventListener('change', () => {
@@ -1239,6 +1928,16 @@ function buildSettingsPanel() {
         if (s.sseEnabled) connectSSE();
         else disconnectSSE();
     });
+    if (voiceCmdEl) {
+        voiceCmdEl.addEventListener('change', () => {
+            s.voiceCommandsEnabled = !!voiceCmdEl.checked;
+            saveSettings();
+        });
+    }
+
+    // POL-6: paint addressee picker now (in case ST is already in a group
+    // chat when the panel mounts) and on every state-payload event.
+    renderAddresseePicker();
 
     // MVP-23: privacy badge → audit-log peek modal.
     const privacyBadge = host.querySelector('#dictation_bridge_privacy_badge');
@@ -1293,7 +1992,12 @@ export async function init() {
         event_types.APP_READY,
     ];
     for (const evt of stateEvents) {
-        if (evt) eventSource.on(evt, () => postState(evt));
+        if (evt) eventSource.on(evt, () => {
+            postState(evt);
+            // POL-6: chat/character switches may flip group status — repaint
+            // the addressee picker (no-op when not in a group).
+            try { renderAddresseePicker(); } catch (e) { WARN('addressee repaint failed', e?.message || e); }
+        });
     }
     startStateHeartbeat();
     // Initial push in case we loaded mid-chat.
