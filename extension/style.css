@@ -126,6 +126,103 @@
     line-height: 1.35;
 }
 
+/* Quick-launch card. Mounts above the dictation-bridge settings drawer
+   in #extensions_settings2. Apollo amber/sage/ember tokens, sharp 2px
+   corners, ~60px tall. */
+.dictation-bridge-quick-launch .dbb-ql-card {
+    background: #1C150C;
+    border: 1px solid rgba(255, 182, 72, 0.35);
+    border-radius: 2px;
+    padding: 8px 12px;
+    margin: 0 0 8px 0;
+    color: #C9B28B;
+    font-family: inherit;
+    font-size: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.dictation-bridge-quick-launch .dbb-ql-title {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #FFB648;
+    opacity: 0.9;
+}
+
+.dictation-bridge-quick-launch .dbb-ql-brand {
+    font-weight: 600;
+}
+
+.dictation-bridge-quick-launch .dbb-ql-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.dictation-bridge-quick-launch .dbb-ql-btn {
+    flex: 1 1 auto;
+    min-width: 130px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 4px 10px;
+    font-size: 12px;
+    font-family: inherit;
+    background: transparent;
+    border: 1px solid rgba(201, 178, 139, 0.35);
+    color: #C9B28B;
+    border-radius: 2px;
+    cursor: pointer;
+    transition: border-color 120ms ease, color 120ms ease, background-color 120ms ease;
+}
+
+.dictation-bridge-quick-launch .dbb-ql-btn:hover,
+.dictation-bridge-quick-launch .dbb-ql-btn:focus {
+    border-color: #FFB648;
+    color: #FFB648;
+    background-color: rgba(255, 182, 72, 0.06);
+    outline: none;
+}
+
+.dictation-bridge-quick-launch .dbb-ql-toggle.dbb-ql-toggle-on {
+    border-color: #A8C97B;
+    color: #A8C97B;
+    background-color: rgba(168, 201, 123, 0.10);
+}
+
+.dictation-bridge-quick-launch .dbb-ql-status {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: #98876F;
+}
+
+.dictation-bridge-quick-launch .dbb-ql-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #7a7a9a;
+    flex: 0 0 auto;
+}
+
+.dictation-bridge-quick-launch .dbb-ql-sep {
+    opacity: 0.5;
+}
+
+.dictation-bridge-quick-launch .dbb-ql-mode,
+.dictation-bridge-quick-launch .dbb-ql-last {
+    font-variant-numeric: tabular-nums;
+}
+
 /* TTS read-back per-message button. Sits in .mes_buttons, inherits .mes_button
    spacing/sizing, but recolours so the speaker icon stands apart from the
    monochrome action set. Apollo amber (idle) → ember (playing). */

@@ -1071,18 +1071,21 @@ let sseStatus = { state: 'disconnected', lastEventAt: 0, lastError: '' };
 function updateSseStatusIndicator() {
     const dot = document.getElementById('dictation_bridge_sse_dot');
     const label = document.getElementById('dictation_bridge_sse_label');
-    if (!dot || !label) return;
-    const colors = {
-        connected: '#4caf50',
-        connecting: '#e6a756',
-        disconnected: '#7a7a9a',
-        error: '#cc5555',
-    };
-    dot.style.background = colors[sseStatus.state] || colors.disconnected;
-    const ago = sseStatus.lastEventAt
-        ? ` (last ${Math.max(0, Math.round((Date.now() - sseStatus.lastEventAt) / 1000))}s ago)`
-        : '';
-    label.textContent = `SSE: ${sseStatus.state}${ago}`;
+    if (dot && label) {
+        const colors = {
+            connected: '#4caf50',
+            connecting: '#e6a756',
+            disconnected: '#7a7a9a',
+            error: '#cc5555',
+        };
+        dot.style.background = colors[sseStatus.state] || colors.disconnected;
+        const ago = sseStatus.lastEventAt
+            ? ` (last ${Math.max(0, Math.round((Date.now() - sseStatus.lastEventAt) / 1000))}s ago)`
+            : '';
+        label.textContent = `SSE: ${sseStatus.state}${ago}`;
+    }
+    // Mirror into the quick-launch card if it's mounted.
+    try { paintQuickLaunchStatus(); } catch {}
 }
 
 function connectSSE() {
@@ -2095,6 +2098,142 @@ async function fetchTtsVoices() {
     return Array.isArray(data?.voices) ? data.voices : [];
 }
 
+// ─── Quick-launch panel (above settings drawer) ────────────────────────────
+// Compact card: [🎤 Open Dictation] [🔊 Read All AI Msgs] · status dot · mode
+// label · "Last: <ago>s". Mounted at #extensions_settings2 INSERT-BEFORE the
+// settings drawer container.
+const QUICK_LAUNCH_ID = 'dictation_bridge_quick_launch';
+const QUICK_LAUNCH_AGO_FRESH_MS = 60_000;       // green dot if state event in last 60s
+const QUICK_LAUNCH_AGO_STALE_MS = 5 * 60_000;   // amber if within 5min, red beyond
+let quickLaunchTickTimer = null;
+
+function buildQuickLaunchPanel() {
+    if (document.getElementById(QUICK_LAUNCH_ID)) return;
+    const anchor = document.getElementById('extensions_settings2') || document.getElementById('extensions_settings');
+    if (!anchor) { setTimeout(buildQuickLaunchPanel, 500); return; }
+
+    const wrap = document.createElement('div');
+    wrap.id = QUICK_LAUNCH_ID;
+    wrap.className = 'extension_container dictation-bridge-quick-launch';
+    wrap.innerHTML = `
+        <div class="dbb-ql-card">
+            <div class="dbb-ql-title">
+                <span class="dbb-ql-brand">Calliope</span>
+            </div>
+            <div class="dbb-ql-actions">
+                <button id="dbb_ql_open_dictation" type="button" class="menu_button dbb-ql-btn" title="Open the dictation UI (popup or modal — same as the mic button in the send bar)">
+                    <span class="fa-solid fa-microphone"></span>
+                    <span>Open Dictation</span>
+                </button>
+                <button id="dbb_ql_toggle_auto_read" type="button" class="menu_button dbb-ql-btn dbb-ql-toggle" title="Toggle auto-read of new AI messages via Calliope TTS">
+                    <span class="fa-solid fa-volume-high"></span>
+                    <span class="dbb-ql-toggle-label">Read All AI Msgs</span>
+                </button>
+            </div>
+            <div class="dbb-ql-status">
+                <span class="dbb-ql-dot" id="dbb_ql_status_dot"></span>
+                <span class="dbb-ql-status-text" id="dbb_ql_status_text">Status: connecting…</span>
+                <span class="dbb-ql-sep">·</span>
+                <span class="dbb-ql-mode" id="dbb_ql_mode">Mode: —</span>
+                <span class="dbb-ql-sep">·</span>
+                <span class="dbb-ql-last" id="dbb_ql_last">Last: never</span>
+            </div>
+        </div>
+    `;
+
+    // Insert ABOVE the settings drawer if it's already mounted; otherwise
+    // append (settings panel mount appends after, so order is preserved).
+    const settingsContainer = document.getElementById('dictation_bridge_container');
+    if (settingsContainer && settingsContainer.parentElement === anchor) {
+        anchor.insertBefore(wrap, settingsContainer);
+    } else {
+        anchor.appendChild(wrap);
+    }
+
+    wrap.querySelector('#dbb_ql_open_dictation').addEventListener('click', () => {
+        onMicClick().catch(e => WARN('quick-launch open dictation', e?.message || e));
+    });
+    wrap.querySelector('#dbb_ql_toggle_auto_read').addEventListener('click', () => {
+        toggleAutoReadAi();
+    });
+
+    paintQuickLaunchAutoReadBtn();
+    paintQuickLaunchStatus();
+
+    // Keep "Last: <ago>s" fresh on a 1Hz tick. Cheap; teardown on container
+    // remove via a parent observer would be over-engineering.
+    if (!quickLaunchTickTimer) {
+        quickLaunchTickTimer = setInterval(paintQuickLaunchStatus, 1000);
+    }
+}
+
+function paintQuickLaunchAutoReadBtn() {
+    const btn = document.getElementById('dbb_ql_toggle_auto_read');
+    if (!btn) return;
+    const on = !!settings().ttsAutoReadAi;
+    btn.classList.toggle('dbb-ql-toggle-on', on);
+    const label = btn.querySelector('.dbb-ql-toggle-label');
+    if (label) label.textContent = on ? 'Auto-read ON' : 'Read All AI Msgs';
+    btn.setAttribute('title', on
+        ? 'Auto-read is ON — every new AI message will be voiced. Click to disable.'
+        : 'Toggle auto-read of new AI messages via Calliope TTS');
+}
+
+function paintQuickLaunchStatus() {
+    const dot = document.getElementById('dbb_ql_status_dot');
+    const txt = document.getElementById('dbb_ql_status_text');
+    const modeEl = document.getElementById('dbb_ql_mode');
+    const lastEl = document.getElementById('dbb_ql_last');
+    if (!dot || !txt) return;
+
+    const now = Date.now();
+    const lastEvt = sseStatus?.lastEventAt || 0;
+    const ageMs = lastEvt ? now - lastEvt : Infinity;
+    const sseState = sseStatus?.state || 'disconnected';
+
+    let color = '#7a7a9a';   // grey — disconnected
+    let label = 'Disconnected';
+    if (sseState === 'connected') {
+        if (ageMs <= QUICK_LAUNCH_AGO_FRESH_MS) {
+            color = '#A8C97B';   // sage — fresh
+            label = 'Connected';
+        } else if (ageMs <= QUICK_LAUNCH_AGO_STALE_MS) {
+            color = '#FFB648';   // amber — stale
+            label = 'Stale';
+        } else {
+            color = '#FFB648';
+            label = 'Idle';
+        }
+    } else if (sseState === 'connecting') {
+        color = '#FFB648';
+        label = 'Connecting';
+    } else if (sseState === 'error') {
+        color = '#FF5A4E';   // ember
+        label = 'Error';
+    }
+    dot.style.background = color;
+    txt.textContent = `Status: ${label}`;
+
+    // Mode label — last successful dictation mode is the closest signal.
+    if (modeEl) {
+        const mode = lastDoneMode || '—';
+        modeEl.textContent = `Mode: ${mode}`;
+    }
+
+    if (lastEl) {
+        if (!lastEvt) {
+            lastEl.textContent = 'Last: never';
+        } else {
+            const seconds = Math.max(0, Math.round(ageMs / 1000));
+            let ago;
+            if (seconds < 60) ago = `${seconds}s ago`;
+            else if (seconds < 3600) ago = `${Math.round(seconds / 60)}m ago`;
+            else ago = `${Math.round(seconds / 3600)}h ago`;
+            lastEl.textContent = `Last: ${ago}`;
+        }
+    }
+}
+
 // ─── Settings UI ───────────────────────────────────────────────────────────
 
 function buildSettingsPanel() {
@@ -2301,6 +2440,7 @@ export async function init() {
     initialized = true;
     settings();
     window.addEventListener('message', onWindowMessage);
+    buildQuickLaunchPanel();
     buildSettingsPanel();
     // Inject now if DOM is ready, otherwise on app_ready.
     if (document.getElementById('rightSendForm')) {
