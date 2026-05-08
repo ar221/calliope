@@ -1,0 +1,44 @@
+[Unit]
+Description=Remote dictation server (whisper.cpp over HTTPS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/dictation-server
+Restart=on-failure
+RestartSec=5
+Environment=WHISPER_BIN=whisper-cli
+Environment=DICTATION_FORMATTER_PROVIDER=openai
+Environment=DICTATION_OPENAI_PROXY_URL=http://127.0.0.1:10531/v1
+Environment=DICTATION_OPENAI_RP_MODEL=gpt-5.4
+Environment=DICTATION_CLEANUP_MODEL=gpt-5.4-mini
+
+# Sandboxing per ADR-14 (Calliope roadmap, Phase 1).
+# PrivateDevices=no + explicit DeviceAllow lines: ROCm needs /dev/kfd + /dev/dri/*.
+# MemoryDenyWriteExecute=no: whisper.cpp / ROCm rely on JIT codegen.
+# IPAddressAllow/Deny intentionally NOT set here — would conflict with the LAN-bind
+# opt-in (DICTATION_BIND_HOST=0.0.0.0). v2 ships a dictation-server.service.d/lan.conf
+# drop-in for users who want loopback-only enforcement at the kernel level.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/dictation-server %h/.local/share/whisper /tmp
+ReadOnlyPaths=/mnt/hdd/AI/SillyTavern/data %h/STWork/personas %h/STWork/rules
+PrivateTmp=yes
+PrivateDevices=no
+DeviceAllow=/dev/kfd rw
+DeviceAllow=/dev/dri rw
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+# LogLevelMax filters journal verbosity per-unit (warning = warn+err+crit).
+# The roadmap (ADR-14) calls this "LogLevel=warning" — that key is [Manager]-only,
+# the per-unit equivalent is LogLevelMax.
+LogLevelMax=warning
+
+[Install]
+WantedBy=default.target

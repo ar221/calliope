@@ -1,0 +1,52 @@
+[Unit]
+Description=Whisper.cpp HTTP server for Calliope dictation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Symlink %h/.local/bin/whisper-server -> ~/projects/whisper.cpp/build/bin/whisper-server
+# is a deploy-time concern (not handled by this unit).
+# Idle shutdown: whisper-server has no native --idle-timeout flag. The Calliope
+# dictation-server (Phase 2 sibling) is responsible for stopping/starting this
+# unit on demand via `systemctl --user {start,stop} whisper-server` when N
+# minutes of inactivity pass. Do not wire idle logic here.
+ExecStart=%h/.local/bin/whisper-server \
+    --host 127.0.0.1 \
+    --port 9001 \
+    --model %h/.local/share/whisper/ggml-large-v3-turbo.bin \
+    --threads 8 \
+    --processors 1 \
+    --no-timestamps \
+    --suppress-nst \
+    --no-speech-thold 0.80 \
+    --logprob-thold -0.7 \
+    --entropy-thold 2.4 \
+    --temperature 0.0 \
+    --beam-size 5 \
+    --best-of 5 \
+    --flash-attn
+Restart=on-failure
+RestartSec=5
+
+# Sandboxing per ADR-14. Mirrors dictation-server.service.
+# PrivateDevices=no + explicit DeviceAllow: ROCm needs /dev/kfd + /dev/dri/*.
+# MemoryDenyWriteExecute=no: whisper.cpp / ROCm JIT codegen.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/whisper /tmp
+PrivateTmp=yes
+PrivateDevices=no
+DeviceAllow=/dev/kfd rw
+DeviceAllow=/dev/dri rw
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+LogLevelMax=warning
+
+[Install]
+WantedBy=default.target

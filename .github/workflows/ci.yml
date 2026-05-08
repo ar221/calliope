@@ -1,0 +1,82 @@
+# Calliope CI workflow.
+#
+# Notes:
+#   - python-version pinned to 3.12 (actions floor that covers stdlib needs).
+#     3.14 is the long-term target once GitHub-hosted runners support it.
+#   - The integration job is best-effort until a fixture WAV ships; it skips
+#     gracefully when `tests/fixtures/hello.wav` is absent (see step gate).
+
+name: ci
+
+on: [push, pull_request]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - name: Install ruff
+        run: uv tool install ruff
+      - name: Lint calliope-server
+        run: ruff check server/calliope-server
+
+  test-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: pip install pyyaml pytest wordfreq
+      - name: Run unit tests
+        run: pytest tests/ -v
+
+  test-integration:
+    runs-on: ubuntu-latest
+    # Integration job is best-effort until the fixture WAV ships. Continue
+    # the build if it fails — unit + lint are the hard gates for now.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg
+      - name: Skip if fixture is missing
+        id: fixture_check
+        run: |
+          if [ -s tests/fixtures/hello.wav ]; then
+            echo "have_fixture=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_fixture=0" >> "$GITHUB_OUTPUT"
+            echo "::notice::tests/fixtures/hello.wav missing — skipping integration smoke."
+          fi
+      - name: Build whisper.cpp tiny model
+        if: steps.fixture_check.outputs.have_fixture == '1'
+        run: |
+          git clone --depth 1 https://github.com/ggerganov/whisper.cpp /tmp/whisper.cpp
+          cd /tmp/whisper.cpp
+          make tiny
+          ./models/download-ggml-model.sh tiny
+      - name: Smoke test transcribe (HTTP, --no-ssl)
+        if: steps.fixture_check.outputs.have_fixture == '1'
+        run: |
+          # calliope-server has a --no-ssl flag (Phase 1). It does not
+          # currently have a CALLIOPE_NO_SSL env var; flag-based invocation
+          # is the supported path. TODO: consider env-var parity for easier
+          # orchestration in containerised tests.
+          export PATH="/tmp/whisper.cpp:$PATH"
+          python3 server/calliope-server --no-ssl --port 18384 &
+          SERVER_PID=$!
+          # Give the server a moment to mint the bearer token + bind.
+          sleep 3
+          curl -fsS -X POST -H "Content-Type: audio/wav" \
+            --data-binary @tests/fixtures/hello.wav \
+            "http://127.0.0.1:18384/transcribe?mode=plain" || \
+            (kill "$SERVER_PID" 2>/dev/null; exit 1)
+          kill "$SERVER_PID" 2>/dev/null || true

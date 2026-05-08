@@ -1,0 +1,16 @@
+{
+    "display_name": "Dictation Bridge",
+    "loading_order": 20,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "ayaz",
+    "version": "0.1.0",
+    "homePage": "",
+    "auto_update": false,
+    "i18n": {},
+    "hooks": {
+        "activate": "init"
+    }
+}

@@ -1,0 +1,127 @@
+/* Dictation Bridge — styling */
+
+/* Mic button in the send bar. Matches ST's other send-bar icons in size. */
+.dictation-bridge-mic {
+    width: 2em;
+    height: 2em;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    font-size: 1.1em;
+    opacity: 0.75;
+    transition: opacity 120ms ease, color 120ms ease, transform 120ms ease, background-color 120ms ease;
+    border-radius: 50%;
+    margin: 0 2px;
+}
+
+.dictation-bridge-mic:hover,
+.dictation-bridge-mic:focus {
+    opacity: 1;
+    outline: none;
+    color: var(--SmartThemeQuoteColor, currentColor);
+    background-color: rgba(255, 255, 255, 0.06);
+}
+
+.dictation-bridge-mic--active {
+    opacity: 1;
+    color: var(--SmartThemeQuoteColor, #a0e0ff);
+    animation: dictation-bridge-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes dictation-bridge-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(160, 224, 255, 0.45); }
+    50%      { box-shadow: 0 0 0 6px rgba(160, 224, 255, 0); }
+}
+
+/* Modal iframe overlay (used when openStyle === 'iframe'). */
+.dictation-bridge-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.dictation-bridge-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+}
+
+.dictation-bridge-frame-wrap {
+    position: relative;
+    width: 90vw;
+    height: 90vh;
+    max-width: 560px;
+    max-height: 95vh;
+    background: var(--SmartThemeBlurTintColor, #181820);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+    overflow: hidden;
+}
+
+.dictation-bridge-iframe {
+    width: 100%;
+    height: 100%;
+    border: 0;
+    background: transparent;
+}
+
+.dictation-bridge-close {
+    position: absolute;
+    top: 6px;
+    right: 10px;
+    z-index: 2;
+    cursor: pointer;
+    font-size: 1.6em;
+    line-height: 1;
+    color: #eee;
+    opacity: 0.75;
+    padding: 4px 8px;
+    border-radius: 50%;
+    user-select: none;
+}
+
+.dictation-bridge-close:hover {
+    opacity: 1;
+    background-color: rgba(255, 255, 255, 0.08);
+}
+
+/* Settings panel. Reuses ST's inline-drawer structure so inherits most styles. */
+.dictation_bridge_settings .inline-drawer-content {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-top: 6px;
+}
+
+.dictation_bridge_settings label {
+    margin-top: 4px;
+    font-size: 0.92em;
+    opacity: 0.85;
+}
+
+.dictation_bridge_settings input[type="text"],
+.dictation_bridge_settings select {
+    width: 100%;
+}
+
+.dictation_bridge_settings .checkbox_label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 4px;
+}
+
+.dictation_bridge_settings .notes {
+    display: block;
+    margin-top: 8px;
+    opacity: 0.65;
+    font-size: 0.85em;
+    line-height: 1.35;
+}

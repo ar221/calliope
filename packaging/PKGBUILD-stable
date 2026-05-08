@@ -1,0 +1,26 @@
+# Maintainer: Ayaz Rashid <rashid.ayaz@gmail.com>
+#
+# Calliope stable AUR package — STUB.
+#
+# This file is a documentation-only stub. The stable channel package will
+# pin to tagged releases once v1.0 (or first stable tag) is cut on this repo.
+#
+# When that happens, this file becomes a near-clone of the sibling
+# `PKGBUILD` with the following differences:
+#
+#   pkgname=calliope                  # not "-git"
+#   pkgver=$_release_tag              # e.g. 1.0.0
+#   makedepends=()                    # no git build dependency
+#   source=("$url/archive/v$pkgver.tar.gz")
+#   sha256sums=('<computed at release time>')
+#   # No pkgver() function — version is fixed to the tarball.
+#   # `provides` and `conflicts` swap so that -git supersedes stable when
+#   # both are installed simultaneously by mistake.
+#   # Retain `provides=("dictation-server")` + matching `conflicts` for
+#   # backward-compat with the old AUR namespace.
+#
+# Until v1.0 ships, the canonical path is `PKGBUILD` (-git). Stable users
+# should be redirected there with a README note in the AUR submission.
+#
+# References:
+#   - PKGBUILD (this directory) — the live -git definition

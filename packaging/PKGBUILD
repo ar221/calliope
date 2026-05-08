@@ -1,0 +1,91 @@
+# Maintainer: Ayaz Rashid <rashid.ayaz@gmail.com>
+#
+# Calliope — local-first voice dictation server for SillyTavern.
+#
+# Repo layout (post-extract):
+#   <repo>/
+#     LICENSE
+#     README.md
+#     PRIVACY.md
+#     THIRD_PARTY_NOTICES.md
+#     server/calliope-server          (single-file Python script, stdlib + optional deps)
+#     systemd/dictation-server.service
+#     systemd/whisper-server.service
+#     docs/*.md
+#
+# Backward-compat: pkgname renamed to calliope-git. The old `dictation-server`
+# namespace is kept via provides/conflicts so existing AUR users on the old
+# name get a clean upgrade path.
+#
+# TODO: confirm GitHub username/org before publishing the AUR submission.
+
+pkgname=calliope-git
+_pkgname=calliope
+pkgver=0.1.0.r0.g0000000  # placeholder; pkgver() regenerates from git
+pkgrel=1
+pkgdesc="Local-first voice dictation server for SillyTavern (Calliope)"
+arch=('any')
+url="https://github.com/ayaz-rashid/calliope"  # TODO: confirm GitHub username/org
+license=('MIT')
+depends=(
+  'python>=3.10'
+  'whisper.cpp'
+  'ffmpeg'
+  'pipewire'
+  'wtype'
+  'wl-clipboard'
+)
+optdepends=(
+  'rocm-hip-runtime: GPU acceleration on AMD'
+  'cuda: GPU acceleration on NVIDIA'
+  'qrencode: phone pairing QR code in --setup wizard'
+  'tailscale: zero-friction LAN HTTPS via tailscale-cert'
+  'mkcert: local-CA cert path'
+  'python-yaml: YAML config support'
+  'python-wordfreq: improved vocab fuzzy collision detection'
+)
+makedepends=('git')
+provides=("${_pkgname}" "dictation-server")
+conflicts=("${_pkgname}" "dictation-server")
+source=("git+${url}.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$srcdir/$_pkgname"
+  printf "%s.r%s.g%s" \
+    "$(git describe --tags --abbrev=0 2>/dev/null || echo 0.1.0)" \
+    "$(git rev-list --count HEAD)" \
+    "$(git rev-parse --short HEAD)"
+}
+
+package() {
+  cd "$srcdir/$_pkgname"
+
+  # Server script.
+  install -Dm755 "server/calliope-server" "$pkgdir/usr/bin/calliope-server"
+
+  # systemd user units. Names retained (dictation-server / whisper-server) for
+  # backward compat with existing user installs and roadmap docs. Users who
+  # prefer the new binary path can override ExecStart via a drop-in.
+  install -Dm644 "systemd/dictation-server.service" \
+    "$pkgdir/usr/lib/systemd/user/dictation-server.service"
+  install -Dm644 "systemd/whisper-server.service" \
+    "$pkgdir/usr/lib/systemd/user/whisper-server.service"
+
+  # Licensing.
+  install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "THIRD_PARTY_NOTICES.md" \
+    "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_NOTICES.md"
+
+  # Top-level docs.
+  install -Dm644 "README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 "PRIVACY.md" "$pkgdir/usr/share/doc/$pkgname/PRIVACY.md"
+
+  # Doc bundle. nullglob so an empty docs/ directory doesn't expand to the
+  # literal pattern and break the build.
+  shopt -s nullglob
+  for doc in docs/*.md; do
+    install -Dm644 "$doc" "$pkgdir/usr/share/doc/$pkgname/$(basename "$doc")"
+  done
+  shopt -u nullglob
+}
