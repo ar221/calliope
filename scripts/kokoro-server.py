@@ -108,8 +108,13 @@ def _audio_to_wav_bytes(samples: np.ndarray, sample_rate: int) -> bytes:
     rather than scale to keep amplitude consistent across requests.
     """
     if samples.ndim > 1:
-        # Force mono — average channels rather than dropping.
-        samples = samples.mean(axis=-1)
+        # Kokoro returns shape (1, N_samples). Squeeze the leading 1-dim.
+        # mean(axis=-1) was a bug — it collapsed samples to a single value,
+        # producing a 46-byte WAV. Fall back to channel-mean only if the
+        # array is genuinely multi-channel after squeeze.
+        samples = np.squeeze(samples)
+        if samples.ndim > 1:
+            samples = samples.mean(axis=0)
     samples = np.clip(samples, -1.0, 1.0)
     pcm16 = (samples * 32767.0).astype(np.int16)
     buf = io.BytesIO()
