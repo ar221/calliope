@@ -221,6 +221,21 @@ IDLE_SHUTDOWN_SECONDS = int(os.environ.get("WHISPER_IDLE_SHUTDOWN_SECONDS", "300
 IDLE_SHUTDOWN_DISABLED = bool(os.environ.get("WHISPER_IDLE_SHUTDOWN_DISABLED"))
 IDLE_SHUTDOWN_CHECK_INTERVAL = 60.0  # seconds between idle checks
 
+# ─── TTS — Kokoro-82M proxy (read-back UX) ───────────────
+# Lifecycle mirrors whisper-server: a sibling user unit (`kokoro-server.service`)
+# runs the long-lived Kokoro process on 127.0.0.1:9002. The dictation-server
+# proxies POST /tts and GET /tts/voices through to it, with on-demand boot
+# and idle-shutdown to keep the model out of memory between uses.
+KOKORO_SERVER_URL = os.environ.get("KOKORO_SERVER_URL", "http://127.0.0.1:9002")
+KOKORO_DEFAULT_VOICE = os.environ.get("KOKORO_DEFAULT_VOICE", "af_heart")
+KOKORO_IDLE_SHUTDOWN_SECONDS = int(os.environ.get("KOKORO_IDLE_SHUTDOWN_SECONDS", "600"))
+KOKORO_IDLE_SHUTDOWN_DISABLED = bool(os.environ.get("KOKORO_IDLE_SHUTDOWN_DISABLED"))
+KOKORO_PROBE_TIMEOUT = 1.0
+KOKORO_BOOT_TIMEOUT = 10.0
+KOKORO_REQUEST_TIMEOUT = 60.0
+KOKORO_VOICES_TTL_SECONDS = 60.0
+TTS_MAX_TEXT_CHARS = 5000
+
 log = logging.getLogger("dictation-server")
 
 # Phase 2 — last-transcribe timestamp (monotonic) drives the idle-shutdown
@@ -228,6 +243,17 @@ log = logging.getLogger("dictation-server")
 _last_transcribe_ts: float = 0.0
 _last_transcribe_lock = threading.Lock()
 _idle_shutdown_thread: threading.Thread | None = None
+
+# TTS — last-tts timestamp drives the Kokoro idle-shutdown daemon.
+_last_tts_ts: float = 0.0
+_last_tts_lock = threading.Lock()
+_kokoro_idle_thread: threading.Thread | None = None
+
+# TTS — in-memory voices cache. Refreshed on TTL miss; protects the model
+# server from a stampede of /tts/voices polls from the phone UI.
+_kokoro_voices_cache: dict | None = None
+_kokoro_voices_cache_ts: float = 0.0
+_kokoro_voices_lock = threading.Lock()
 
 # ─── Session transcript (in-memory) ──────────────────────
 session_transcript: list[dict] = []
@@ -1546,6 +1572,229 @@ def _start_idle_shutdown_thread() -> None:
     )
     t.start()
     _idle_shutdown_thread = t
+
+
+# ─── TTS — Kokoro proxy helpers ──────────────────────────
+# All callable as module functions so tests can mock urllib.request.urlopen
+# and exercise validation without instantiating DictationHandler.
+
+
+def _kokoro_probe(timeout: float = KOKORO_PROBE_TIMEOUT) -> bool:
+    """True iff GET /health on kokoro-server returns within `timeout`s."""
+    try:
+        req = urllib.request.Request(KOKORO_SERVER_URL + "/health", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status < 600
+    except urllib.error.HTTPError as e:
+        return e.code < 600
+    except Exception:
+        return False
+
+
+def _ensure_kokoro_alive(boot_timeout: float = KOKORO_BOOT_TIMEOUT) -> bool:
+    """Probe kokoro-server; if dead, `systemctl --user start kokoro-server`
+    and poll up to `boot_timeout` seconds. Returns True on alive."""
+    if _kokoro_probe(timeout=KOKORO_PROBE_TIMEOUT):
+        return True
+    log.info("kokoro-server not responding — attempting `systemctl --user start kokoro-server`")
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "start", "kokoro-server"],
+            check=False, capture_output=True, timeout=10,
+        )
+    except Exception as e:
+        log.warning(f"systemctl start kokoro-server failed: {e}")
+        return False
+    deadline = time.monotonic() + boot_timeout
+    while time.monotonic() < deadline:
+        if _kokoro_probe(timeout=KOKORO_PROBE_TIMEOUT):
+            log.info("kokoro-server up")
+            return True
+        time.sleep(0.25)
+    log.warning("kokoro-server did not become healthy within %.1fs", boot_timeout)
+    return False
+
+
+def _mark_tts_activity() -> None:
+    """Update the TTS idle-shutdown timer's last-active timestamp."""
+    global _last_tts_ts
+    with _last_tts_lock:
+        _last_tts_ts = time.monotonic()
+
+
+def _kokoro_idle_shutdown_loop() -> None:
+    """Background daemon: stop kokoro-server after N seconds of TTS inactivity.
+
+    Mirrors `_idle_shutdown_loop` but for the Kokoro process. Disabled
+    entirely when KOKORO_IDLE_SHUTDOWN_DISABLED is set.
+    """
+    if KOKORO_IDLE_SHUTDOWN_DISABLED:
+        log.info("Kokoro idle-shutdown disabled by env (KOKORO_IDLE_SHUTDOWN_DISABLED)")
+        return
+    log.info(
+        "Kokoro idle-shutdown thread started; will stop kokoro-server after %ds idle",
+        KOKORO_IDLE_SHUTDOWN_SECONDS,
+    )
+    while True:
+        time.sleep(IDLE_SHUTDOWN_CHECK_INTERVAL)
+        with _last_tts_lock:
+            last = _last_tts_ts
+        if last <= 0:
+            continue
+        idle_for = time.monotonic() - last
+        if idle_for < KOKORO_IDLE_SHUTDOWN_SECONDS:
+            continue
+        if not _kokoro_probe(timeout=KOKORO_PROBE_TIMEOUT):
+            with _last_tts_lock:
+                _last_tts_ts = 0.0
+            continue
+        log.info("kokoro-server idle for %.0fs — stopping to release memory", idle_for)
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "stop", "kokoro-server"],
+                check=False, capture_output=True, timeout=10,
+            )
+        except Exception as e:
+            log.warning(f"systemctl stop kokoro-server failed: {e}")
+        with _last_tts_lock:
+            _last_tts_ts = 0.0
+
+
+def _start_kokoro_idle_shutdown_thread() -> None:
+    """Idempotent starter for the Kokoro idle-shutdown daemon."""
+    global _kokoro_idle_thread
+    if _kokoro_idle_thread is not None and _kokoro_idle_thread.is_alive():
+        return
+    t = threading.Thread(
+        target=_kokoro_idle_shutdown_loop,
+        name="kokoro-idle-shutdown",
+        daemon=True,
+    )
+    t.start()
+    _kokoro_idle_thread = t
+
+
+def _validate_tts_request(body: object) -> tuple[str, str, float, dict | None]:
+    """Validate a /tts request body. Returns (text, voice, speed, error_or_None).
+
+    `error_or_None` is a dict with {error, code, status} when validation fails;
+    None on success. Pure function for unit testing.
+    """
+    if not isinstance(body, dict):
+        return "", "", 1.0, {
+            "error": "Expected a JSON object",
+            "code": "bad_input",
+            "status": 400,
+        }
+    text = str(body.get("text", "") or "").strip()
+    if not text:
+        return "", "", 1.0, {
+            "error": "Missing 'text'",
+            "code": "missing_param",
+            "status": 400,
+        }
+    if len(text) > TTS_MAX_TEXT_CHARS:
+        return text, "", 1.0, {
+            "error": f"'text' exceeds {TTS_MAX_TEXT_CHARS} chars",
+            "code": "text_too_long",
+            "status": 400,
+        }
+    voice = str(body.get("voice") or KOKORO_DEFAULT_VOICE).strip()
+    if not voice:
+        voice = KOKORO_DEFAULT_VOICE
+    raw_speed = body.get("speed", 1.0)
+    try:
+        speed = float(raw_speed) if raw_speed is not None else 1.0
+    except (TypeError, ValueError):
+        return text, voice, 1.0, {
+            "error": "'speed' must be a number",
+            "code": "bad_input",
+            "status": 400,
+        }
+    if not (0.5 <= speed <= 2.0):
+        return text, voice, speed, {
+            "error": "'speed' must be between 0.5 and 2.0",
+            "code": "bad_input",
+            "status": 400,
+        }
+    return text, voice, speed, None
+
+
+def _synthesize_via_kokoro(text: str, voice: str, speed: float = 1.0) -> tuple[bytes, str]:
+    """POST to kokoro-server's /synthesize. Returns (audio_bytes, content_type).
+
+    Raises RuntimeError on transport / HTTP error so the handler can map
+    to a 502/503. Caller is responsible for liveness probe (`_ensure_kokoro_alive`).
+    """
+    body = json.dumps({
+        "text": text,
+        "voice": voice,
+        "speed": speed,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        KOKORO_SERVER_URL + "/synthesize",
+        data=body,
+        method="POST",
+    )
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Content-Length", str(len(body)))
+    try:
+        with urllib.request.urlopen(req, timeout=KOKORO_REQUEST_TIMEOUT) as resp:
+            audio = resp.read()
+            ctype = resp.headers.get("Content-Type", "audio/wav")
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            err_body = ""
+        raise RuntimeError(f"kokoro-server HTTP {e.code}: {err_body}")
+    except Exception as e:
+        raise RuntimeError(f"kokoro-server request failed: {e}")
+    return audio, ctype
+
+
+def _fetch_kokoro_voices(force: bool = False) -> dict:
+    """Return the cached voices payload, refreshing after KOKORO_VOICES_TTL_SECONDS.
+
+    Shape mirrors kokoro-server's /voices: {"voices": [{id, label}, ...]}.
+    Raises RuntimeError on transport failure when no cached value exists.
+    """
+    global _kokoro_voices_cache, _kokoro_voices_cache_ts
+    now = time.monotonic()
+    with _kokoro_voices_lock:
+        cached = _kokoro_voices_cache
+        ts = _kokoro_voices_cache_ts
+    if not force and cached is not None and (now - ts) < KOKORO_VOICES_TTL_SECONDS:
+        return cached
+    try:
+        req = urllib.request.Request(KOKORO_SERVER_URL + "/voices", method="GET")
+        with urllib.request.urlopen(req, timeout=KOKORO_REQUEST_TIMEOUT) as resp:
+            raw = resp.read()
+        data = json.loads(raw)
+    except urllib.error.HTTPError as e:
+        if cached is not None:
+            return cached  # serve stale on upstream error
+        raise RuntimeError(f"kokoro-server /voices HTTP {e.code}")
+    except Exception as e:
+        if cached is not None:
+            return cached
+        raise RuntimeError(f"kokoro-server /voices failed: {e}")
+    if not isinstance(data, dict) or not isinstance(data.get("voices"), list):
+        if cached is not None:
+            return cached
+        raise RuntimeError("kokoro-server /voices: malformed response")
+    with _kokoro_voices_lock:
+        _kokoro_voices_cache = data
+        _kokoro_voices_cache_ts = now
+    return data
+
+
+def _invalidate_kokoro_voices_cache() -> None:
+    """Test hook — drop the voices cache."""
+    global _kokoro_voices_cache, _kokoro_voices_cache_ts
+    with _kokoro_voices_lock:
+        _kokoro_voices_cache = None
+        _kokoro_voices_cache_ts = 0.0
 
 
 def transcribe(audio_path: Path, model: str = DEFAULT_MODEL, use_gpu: bool = True,
@@ -7694,6 +7943,8 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"modes": load_char_modes()})
         elif path == "/audit/network":
             self._handle_audit_network(query)
+        elif path == "/tts/voices":
+            self._handle_tts_voices()
         elif _is_icon_path(path):
             # POL-5 / Agent 4 §8.3 — manifest references /icon-192.png and
             # /icon-512.png. Asset binaries are deploy-time; until they
@@ -7959,9 +8210,74 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                         return
             self.send_error_json(f"No transcript entry with id '{entry_id}'",
                                  code="entry_not_found", status=404, retry_ok=False)
+        elif path == "/tts":
+            self._handle_tts()
         else:
             self.send_response(404)
             self.end_headers()
+
+    # ─── TTS handlers (Kokoro-82M proxy) ──────────────────
+    def _handle_tts(self) -> None:
+        """POST /tts — synthesize text via kokoro-server, stream WAV back.
+
+        Body: {text: str, voice?: str, speed?: float}. Auth-gated by the
+        do_POST `require_auth` check upstream.
+        """
+        try:
+            body = self.read_json_body()
+        except Exception:
+            self.send_error_json("Invalid JSON", code="bad_json", status=400)
+            return
+        text, voice, speed, err = _validate_tts_request(body)
+        if err is not None:
+            self.send_error_json(err["error"], code=err["code"], status=err["status"])
+            return
+        if not _ensure_kokoro_alive():
+            self.send_error_json(
+                "kokoro-server unreachable",
+                code="tts_unavailable", status=503, retry_ok=True,
+            )
+            return
+        try:
+            audio_bytes, ctype = _synthesize_via_kokoro(text, voice, speed=speed)
+        except RuntimeError as e:
+            log.warning("TTS synthesize failed: %s", e)
+            self.send_error_json(
+                f"TTS synthesis failed: {e}",
+                code="tts_failed", status=502, retry_ok=True,
+            )
+            return
+        _mark_tts_activity()
+        # Stream raw audio. Don't go through send_json — Content-Type matters.
+        self.send_response(200)
+        self.send_header("Content-Type", ctype or "audio/wav")
+        self.send_header("Content-Length", str(len(audio_bytes)))
+        self._set_cors_origin()
+        self.end_headers()
+        try:
+            self.wfile.write(audio_bytes)
+        except Exception:
+            # Client disconnected mid-stream — not actionable.
+            pass
+
+    def _handle_tts_voices(self) -> None:
+        """GET /tts/voices — proxy kokoro-server's voices list with a 60s TTL cache."""
+        if not _ensure_kokoro_alive():
+            self.send_error_json(
+                "kokoro-server unreachable",
+                code="tts_unavailable", status=503, retry_ok=True,
+            )
+            return
+        try:
+            payload = _fetch_kokoro_voices()
+        except RuntimeError as e:
+            log.warning("/tts/voices upstream failed: %s", e)
+            self.send_error_json(
+                f"Voice list unavailable: {e}",
+                code="tts_failed", status=502, retry_ok=True,
+            )
+            return
+        self.send_json(payload)
 
     def _handle_vocab_add(self):
         """POST /vocab — append a vocab entry, persist atomically, return full list."""
@@ -9481,6 +9797,9 @@ def main():
     # boot before any clients connect is safe even when whisper-server isn't
     # running yet.
     _start_idle_shutdown_thread()
+    # TTS idle-shutdown daemon — only acts after first /tts call (driven by
+    # _mark_tts_activity). Safe to start before kokoro-server is running.
+    _start_kokoro_idle_shutdown_thread()
 
     server = http.server.ThreadingHTTPServer((args.host, args.port), DictationHandler)
     server.daemon_threads = True
