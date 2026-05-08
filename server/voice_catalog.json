@@ -1,0 +1,434 @@
+{
+  "af_alloy": {
+    "gender": "feminine",
+    "accent": "american",
+    "tone": ["neutral", "clear", "professional", "smooth"],
+    "age": "adult",
+    "energy": "medium",
+    "notes": "Clean and versatile; good narrator or composed character voice"
+  },
+  "af_aoede": {
+    "gender": "feminine",
+    "accent": "american",
+    "tone": ["melodic", "expressive", "warm", "bright"],
+    "age": "young adult",
+    "energy": "medium",
+    "notes": "Named after the Greek muse of song; animated and musical delivery"
+  },
+  "af_bella": {
+    "gender": "feminine",
+    "accent": "american",
+    "tone": ["sultry", "warm", "intimate", "smooth"],
+    "age": "adult",
+    "energy": "low",
+    "notes": "Dark and intimate; strong choice for seductive or intense characters"
+  },
+  "af_heart": {
+    "gender": "feminine",
+    "accent": "american",
+    "tone": ["warm", "soft", "expressive", "natural"],
+    "age": "young adult",
+    "energy": "medium",
+    "notes": "Default voice; broadly versatile, works well for most characters"
+  },
+  "af_jessica": {
+    "gender": "feminine",
+    "accent": "american",
+    "tone": ["natural", "conversational", "warm"],
+    "age": "young adult",
+    "energy": "medium",
+    "notes": "Relaxed and natural; everyday characters, sidekicks, friendly npcs"
+  },
+  "af_kore": {
+    "gender": "feminine",
+    "accent": "american",
+    "tone": ["ethereal", "soft", "mysterious", "cold"],
+    "age": "young adult",
+    "energy": "low",
+    "notes": "Named after Persephone; good for otherworldly, aloof, or supernatural characters"
+  },
+  "af_nicole": {
+    "gender": "feminine",
+    "accent": "american",
+    "tone": ["calm", "clear", "neutral", "smooth"],
+    "age": "adult",
+    "energy": "low",
+    "notes": "Composed and even-keeled; reliable for secondary characters or calm protagonists"
+  },
+  "af_nova": {
+    "gender": "feminine",
+    "accent": "american",
+    "tone": ["bright", "energetic", "expressive", "warm"],
+    "age": "young adult",
+    "energy": "high",
+    "notes": "High energy and upbeat; cheerful, enthusiastic, or extroverted characters"
+  },
+  "af_river": {
+    "gender": "feminine",
+    "accent": "american",
+    "tone": ["calm", "natural", "soft", "smooth"],
+    "age": "adult",
+    "energy": "low",
+    "notes": "Flowing and unhurried; grounded characters, nature themes, introspective narration"
+  },
+  "af_sarah": {
+    "gender": "feminine",
+    "accent": "american",
+    "tone": ["warm", "natural", "conversational", "expressive"],
+    "age": "adult",
+    "energy": "medium",
+    "notes": "Down-to-earth and relatable; broad applicability"
+  },
+  "af_sky": {
+    "gender": "feminine",
+    "accent": "american",
+    "tone": ["bright", "airy", "light", "playful"],
+    "age": "young adult",
+    "energy": "high",
+    "notes": "Youthful and buoyant; teen characters, comedic roles, high-spirited personas"
+  },
+  "am_adam": {
+    "gender": "masculine",
+    "accent": "american",
+    "tone": ["warm", "natural", "calm", "smooth"],
+    "age": "adult",
+    "energy": "medium",
+    "notes": "Reliable and warm; good all-purpose masculine voice"
+  },
+  "am_echo": {
+    "gender": "masculine",
+    "accent": "american",
+    "tone": ["resonant", "clear", "deep", "smooth"],
+    "age": "adult",
+    "energy": "medium",
+    "notes": "Rich resonance; suited for narration, confident leads, or introspective voices"
+  },
+  "am_eric": {
+    "gender": "masculine",
+    "accent": "american",
+    "tone": ["warm", "natural", "friendly", "conversational"],
+    "age": "young adult",
+    "energy": "medium",
+    "notes": "Approachable and natural; everyman characters, sidekicks"
+  },
+  "am_fenrir": {
+    "gender": "masculine",
+    "accent": "american",
+    "tone": ["deep", "dark", "powerful", "cold"],
+    "age": "mature",
+    "energy": "medium",
+    "notes": "Named after the Norse wolf; intense and commanding — villains, warriors, antagonists"
+  },
+  "am_liam": {
+    "gender": "masculine",
+    "accent": "american",
+    "tone": ["friendly", "bright", "conversational", "warm"],
+    "age": "young adult",
+    "energy": "medium",
+    "notes": "Light and sociable; good for charming, outgoing, or comedic roles"
+  },
+  "am_michael": {
+    "gender": "masculine",
+    "accent": "american",
+    "tone": ["clear", "professional", "neutral", "authoritative"],
+    "age": "adult",
+    "energy": "medium",
+    "notes": "Clean and credible; leaders, experts, or neutral narrators"
+  },
+  "am_onyx": {
+    "gender": "masculine",
+    "accent": "american",
+    "tone": ["deep", "smooth", "dark", "authoritative"],
+    "age": "mature",
+    "energy": "low",
+    "notes": "Low and commanding; excellent for antagonists, mysterious figures, or noir narration"
+  },
+  "am_puck": {
+    "gender": "masculine",
+    "accent": "american",
+    "tone": ["playful", "light", "bright", "mischievous"],
+    "age": "young adult",
+    "energy": "high",
+    "notes": "Named after Shakespeare's trickster; comic relief, tricksters, chaotic neutral characters"
+  },
+  "am_santa": {
+    "gender": "masculine",
+    "accent": "american",
+    "tone": ["warm", "jolly", "deep", "expressive"],
+    "age": "mature",
+    "energy": "medium",
+    "notes": "Warm and booming; paternal figures, jovial authority, holiday energy"
+  },
+  "bf_alice": {
+    "gender": "feminine",
+    "accent": "british",
+    "tone": ["crisp", "articulate", "clear", "formal"],
+    "age": "adult",
+    "energy": "medium",
+    "notes": "Classic British clarity; well-bred characters, precision roles"
+  },
+  "bf_emma": {
+    "gender": "feminine",
+    "accent": "british",
+    "tone": ["warm", "refined", "natural", "smooth"],
+    "age": "adult",
+    "energy": "medium",
+    "notes": "Approachable British warmth; educated characters without aristocratic stiffness"
+  },
+  "bf_isabella": {
+    "gender": "feminine",
+    "accent": "british",
+    "tone": ["elegant", "smooth", "formal", "authoritative"],
+    "age": "adult",
+    "energy": "low",
+    "notes": "Composed and distinguished; aristocratic characters, authority figures, older protagonists"
+  },
+  "bf_lily": {
+    "gender": "feminine",
+    "accent": "british",
+    "tone": ["soft", "gentle", "light", "warm"],
+    "age": "young adult",
+    "energy": "low",
+    "notes": "Delicate and understated; shy characters, caretakers, soft-spoken roles"
+  },
+  "bm_daniel": {
+    "gender": "masculine",
+    "accent": "british",
+    "tone": ["warm", "natural", "calm", "friendly"],
+    "age": "adult",
+    "energy": "medium",
+    "notes": "Reliable British warmth; everyday lead, trustworthy mentor, grounded narrator"
+  },
+  "bm_fable": {
+    "gender": "masculine",
+    "accent": "british",
+    "tone": ["narrative", "expressive", "deep", "warm"],
+    "age": "adult",
+    "energy": "medium",
+    "notes": "Purpose-built for storytelling; omniscient narrators, bards, saga-tellers"
+  },
+  "bm_george": {
+    "gender": "masculine",
+    "accent": "british",
+    "tone": ["authoritative", "clear", "formal", "deep"],
+    "age": "mature",
+    "energy": "medium",
+    "notes": "Commanding and assured; military officers, professors, senior authority figures"
+  },
+  "bm_lewis": {
+    "gender": "masculine",
+    "accent": "british",
+    "tone": ["natural", "conversational", "warm", "smooth"],
+    "age": "young adult",
+    "energy": "medium",
+    "notes": "Relaxed British accent; likable leads, intellectuals with approachable energy"
+  },
+  "ef_dora": {
+    "gender": "feminine",
+    "accent": "european",
+    "tone": ["warm", "natural", "expressive"],
+    "age": "adult",
+    "energy": "medium",
+    "notes": "European-accented feminine voice"
+  },
+  "em_alex": {
+    "gender": "masculine",
+    "accent": "european",
+    "tone": ["natural", "clear", "neutral"],
+    "age": "adult",
+    "energy": "medium",
+    "notes": "European-accented masculine voice"
+  },
+  "em_santa": {
+    "gender": "masculine",
+    "accent": "european",
+    "tone": ["warm", "deep", "jolly"],
+    "age": "mature",
+    "energy": "medium",
+    "notes": "European-accented warm masculine voice"
+  },
+  "ff_siwis": {
+    "gender": "feminine",
+    "accent": "french",
+    "tone": ["smooth", "expressive", "elegant", "warm"],
+    "age": "adult",
+    "energy": "medium",
+    "notes": "French-accented; Francophone characters or French-speaking settings"
+  },
+  "hf_alpha": {
+    "gender": "feminine",
+    "accent": "hindi",
+    "tone": ["warm", "expressive", "melodic"],
+    "age": "adult",
+    "energy": "medium",
+    "notes": "Hindi-accented feminine voice"
+  },
+  "hf_beta": {
+    "gender": "feminine",
+    "accent": "hindi",
+    "tone": ["soft", "clear", "natural"],
+    "age": "young adult",
+    "energy": "medium",
+    "notes": "Hindi-accented feminine voice, softer variant"
+  },
+  "hm_omega": {
+    "gender": "masculine",
+    "accent": "hindi",
+    "tone": ["deep", "authoritative", "warm"],
+    "age": "adult",
+    "energy": "medium",
+    "notes": "Hindi-accented masculine voice"
+  },
+  "hm_psi": {
+    "gender": "masculine",
+    "accent": "hindi",
+    "tone": ["natural", "clear", "warm"],
+    "age": "adult",
+    "energy": "medium",
+    "notes": "Hindi-accented masculine voice, lighter variant"
+  },
+  "if_sara": {
+    "gender": "feminine",
+    "accent": "italian",
+    "tone": ["warm", "expressive", "melodic", "bright"],
+    "age": "adult",
+    "energy": "medium",
+    "notes": "Italian-accented; Italophone characters or Mediterranean settings"
+  },
+  "im_nicola": {
+    "gender": "masculine",
+    "accent": "italian",
+    "tone": ["warm", "expressive", "smooth"],
+    "age": "adult",
+    "energy": "medium",
+    "notes": "Italian-accented masculine voice"
+  },
+  "jf_alpha": {
+    "gender": "feminine",
+    "accent": "japanese",
+    "tone": ["clear", "natural", "soft"],
+    "age": "young adult",
+    "energy": "medium",
+    "notes": "Japanese-accented feminine voice, neutral register"
+  },
+  "jf_gongitsune": {
+    "gender": "feminine",
+    "accent": "japanese",
+    "tone": ["ethereal", "soft", "mysterious", "expressive"],
+    "age": "young adult",
+    "energy": "low",
+    "notes": "Named after a fox spirit; otherworldly or mystical Japanese characters"
+  },
+  "jf_nezumi": {
+    "gender": "feminine",
+    "accent": "japanese",
+    "tone": ["light", "bright", "playful", "natural"],
+    "age": "young adult",
+    "energy": "medium",
+    "notes": "Nezumi (mouse); lively and quick-paced Japanese characters"
+  },
+  "jf_tebukuro": {
+    "gender": "feminine",
+    "accent": "japanese",
+    "tone": ["warm", "soft", "gentle"],
+    "age": "adult",
+    "energy": "low",
+    "notes": "Tebukuro (gloves); gentle and careful tone for tender Japanese characters"
+  },
+  "jm_kumo": {
+    "gender": "masculine",
+    "accent": "japanese",
+    "tone": ["calm", "deep", "natural"],
+    "age": "adult",
+    "energy": "low",
+    "notes": "Kumo (cloud/spider); calm and measured Japanese masculine voice"
+  },
+  "pf_dora": {
+    "gender": "feminine",
+    "accent": "portuguese",
+    "tone": ["warm", "expressive", "melodic"],
+    "age": "adult",
+    "energy": "medium",
+    "notes": "Portuguese-accented feminine voice"
+  },
+  "pm_alex": {
+    "gender": "masculine",
+    "accent": "portuguese",
+    "tone": ["natural", "warm", "clear"],
+    "age": "adult",
+    "energy": "medium",
+    "notes": "Portuguese-accented masculine voice"
+  },
+  "pm_santa": {
+    "gender": "masculine",
+    "accent": "portuguese",
+    "tone": ["warm", "deep", "friendly"],
+    "age": "mature",
+    "energy": "medium",
+    "notes": "Portuguese-accented warm masculine voice"
+  },
+  "zf_xiaobei": {
+    "gender": "feminine",
+    "accent": "chinese",
+    "tone": ["bright", "clear", "natural"],
+    "age": "young adult",
+    "energy": "medium",
+    "notes": "Mandarin-accented feminine voice"
+  },
+  "zf_xiaoni": {
+    "gender": "feminine",
+    "accent": "chinese",
+    "tone": ["warm", "soft", "expressive"],
+    "age": "young adult",
+    "energy": "medium",
+    "notes": "Mandarin-accented feminine voice, warmer register"
+  },
+  "zf_xiaoxiao": {
+    "gender": "feminine",
+    "accent": "chinese",
+    "tone": ["bright", "energetic", "playful"],
+    "age": "young adult",
+    "energy": "high",
+    "notes": "Mandarin-accented feminine voice, lively"
+  },
+  "zf_xiaoyi": {
+    "gender": "feminine",
+    "accent": "chinese",
+    "tone": ["calm", "smooth", "elegant"],
+    "age": "adult",
+    "energy": "low",
+    "notes": "Mandarin-accented feminine voice, refined"
+  },
+  "zm_yunjian": {
+    "gender": "masculine",
+    "accent": "chinese",
+    "tone": ["deep", "authoritative", "clear"],
+    "age": "adult",
+    "energy": "medium",
+    "notes": "Mandarin-accented masculine voice, commanding"
+  },
+  "zm_yunxi": {
+    "gender": "masculine",
+    "accent": "chinese",
+    "tone": ["natural", "warm", "expressive"],
+    "age": "adult",
+    "energy": "medium",
+    "notes": "Mandarin-accented masculine voice, natural"
+  },
+  "zm_yunxia": {
+    "gender": "masculine",
+    "accent": "chinese",
+    "tone": ["deep", "smooth", "calm"],
+    "age": "mature",
+    "energy": "low",
+    "notes": "Mandarin-accented masculine voice, deeper register"
+  },
+  "zm_yunyang": {
+    "gender": "masculine",
+    "accent": "chinese",
+    "tone": ["bright", "clear", "energetic"],
+    "age": "young adult",
+    "energy": "high",
+    "notes": "Mandarin-accented masculine voice, livelier"
+  }
+}

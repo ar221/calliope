@@ -2167,6 +2167,44 @@ function buildAudiobookPayload() {
     };
 }
 
+async function fetchVoiceSuggest(payload) {
+    const cfg = settings();
+    const url = `${cfg.serverUrl.replace(/\/+$/, '')}/tts/voices/suggest`;
+    const res = await fetch(url, {
+        method: 'POST',
+        mode: 'cors',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+        let detail = '';
+        try { detail = (await res.json())?.error || ''; } catch {}
+        const err = new Error(detail || `voice_suggest_http_${res.status}`);
+        err.status = res.status;
+        throw err;
+    }
+    return await res.json();
+}
+
+function buildVoiceSuggestPayload() {
+    const s = settings();
+    const char = characters?.[this_chid];
+    const recent = (Array.isArray(chat) ? chat : [])
+        .filter(m => m && !m.is_system && typeof m.mes === 'string')
+        .slice(-10)
+        .map(m => m.mes);
+    return {
+        name: currentTtsProfileName(),
+        description: char?.description || '',
+        personality: char?.personality || '',
+        recent_messages: recent,
+        existing_voices: s.ttsVoiceProfiles || {},
+        narrator: s.ttsVoice || 'af_heart',
+        n: 3,
+    };
+}
+
 async function fetchAudiobookExport(payload) {
     const cfg = settings();
     const url = `${cfg.serverUrl.replace(/\/+$/, '')}/tts/audiobook`;
@@ -2697,6 +2735,12 @@ function buildSettingsPanel() {
                             <button id="dictation_bridge_audiobook_export" type="button" class="menu_button" style="padding:3px 10px;font-size:12px;border:1px solid rgba(201, 178, 139, 0.45);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Export chat WAV</button>
                             <small class="notes" style="margin:0 0 0 4px">Uses narrator fallback plus saved character voice profiles.</small>
                         </div>
+
+                        <div style="display:flex;gap:6px;align-items:center;margin:4px 0 0 0">
+                            <button id="dictation_bridge_tts_suggest" type="button" class="menu_button" style="padding:3px 10px;font-size:12px;border:1px solid rgba(201, 178, 139, 0.45);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Suggest voice</button>
+                            <small class="notes" style="margin:0 0 0 4px">Top 3 voices based on character card + recent dialogue.</small>
+                        </div>
+                        <div id="dictation_bridge_tts_suggestion_panel" style="display:none;margin-top:6px;border:1px solid rgba(201,178,139,0.2);border-radius:3px;padding:6px 8px;background:rgba(0,0,0,0.2)"></div>
                     </div>
 
                     <small class="notes">
@@ -2799,6 +2843,8 @@ function buildSettingsPanel() {
     const ttsTestEl = host.querySelector('#dictation_bridge_tts_test');
     const ttsSavePersonaEl = host.querySelector('#dictation_bridge_tts_save_persona');
     const audiobookExportEl = host.querySelector('#dictation_bridge_audiobook_export');
+    const ttsSuggestEl = host.querySelector('#dictation_bridge_tts_suggest');
+    const ttsSuggestionPanelEl = host.querySelector('#dictation_bridge_tts_suggestion_panel');
     const ttsProfileHintEl = host.querySelector('#dictation_bridge_tts_profile_hint');
 
     const paintTtsProfileHint = () => {
@@ -2922,6 +2968,73 @@ function buildSettingsPanel() {
     if (audiobookExportEl) {
         audiobookExportEl.addEventListener('click', () => {
             exportCurrentChatAudiobook(audiobookExportEl).catch(e => WARN('export audiobook', e?.message || e));
+        });
+    }
+
+    if (ttsSuggestEl && ttsSuggestionPanelEl) {
+        ttsSuggestEl.addEventListener('click', async () => {
+            const prev = ttsSuggestEl.textContent;
+            ttsSuggestEl.textContent = 'Thinking…';
+            ttsSuggestEl.setAttribute('disabled', 'disabled');
+            ttsSuggestionPanelEl.style.display = 'none';
+            try {
+                const { suggestions } = await fetchVoiceSuggest(buildVoiceSuggestPayload());
+                if (!suggestions || !suggestions.length) {
+                    toast('info', 'No suggestions — character card may be empty');
+                    return;
+                }
+                ttsSuggestionPanelEl.innerHTML = suggestions.map(s => `
+                    <div style="display:flex;align-items:center;gap:6px;padding:3px 0;border-bottom:1px solid rgba(201,178,139,0.1)">
+                        <code style="color:#C9B28B;font-size:12px;min-width:110px">${escapeHtml(s.voice)}</code>
+                        <span style="color:#888;font-size:11px;flex:1">${escapeHtml(s.reason)}</span>
+                        <button data-voice="${escapeHtml(s.voice)}" class="calliope-suggest-sample menu_button"
+                            style="padding:2px 7px;font-size:11px;border:1px solid rgba(201,178,139,0.35);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer;white-space:nowrap">Sample</button>
+                        <button data-voice="${escapeHtml(s.voice)}" class="calliope-suggest-use menu_button"
+                            style="padding:2px 7px;font-size:11px;border:1px solid rgba(201,178,139,0.45);background:rgba(201,178,139,0.08);color:#C9B28B;border-radius:2px;cursor:pointer;white-space:nowrap">Use</button>
+                    </div>
+                `).join('');
+                ttsSuggestionPanelEl.style.display = 'block';
+
+                ttsSuggestionPanelEl.querySelectorAll('.calliope-suggest-sample').forEach(btn => {
+                    btn.addEventListener('click', async () => {
+                        const voice = btn.getAttribute('data-voice');
+                        const prevLabel = btn.textContent;
+                        btn.textContent = '…';
+                        btn.setAttribute('disabled', 'disabled');
+                        try {
+                            const blob = await fetchTts('Hello. My voice is ready for your story.', voice);
+                            stopTts();
+                            await createAndPlayTtsAudio(blob, () => {});
+                        } catch (e) {
+                            toast('error', `Sample failed: ${e?.message || 'unknown'}`);
+                        } finally {
+                            btn.textContent = prevLabel;
+                            btn.removeAttribute('disabled');
+                        }
+                    });
+                });
+
+                ttsSuggestionPanelEl.querySelectorAll('.calliope-suggest-use').forEach(btn => {
+                    btn.addEventListener('click', () => {
+                        const voice = btn.getAttribute('data-voice');
+                        if (ttsVoiceEl) {
+                            ttsVoiceEl.value = voice;
+                            ttsVoiceEl.dispatchEvent(new Event('change'));
+                        } else {
+                            const profileName = rememberTtsVoiceForCurrentProfile(voice);
+                            saveSettings();
+                            paintTtsProfileHint();
+                            if (profileName) toast('success', `Voice set for ${profileName}`);
+                        }
+                        ttsSuggestionPanelEl.style.display = 'none';
+                    });
+                });
+            } catch (e) {
+                toast('error', `Voice suggestion failed: ${e?.message || 'unknown'}`);
+            } finally {
+                ttsSuggestEl.textContent = prev;
+                ttsSuggestEl.removeAttribute('disabled');
+            }
         });
     }
 

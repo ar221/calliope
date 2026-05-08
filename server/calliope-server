@@ -1921,6 +1921,147 @@ def _invalidate_kokoro_voices_cache() -> None:
         _kokoro_voices_cache_ts = 0.0
 
 
+# ─── Voice Casting — catalog + suggestion scorer ─────────────────────────────
+
+_VOICE_CATALOG: dict | None = None
+_VOICE_CATALOG_PATH = Path(__file__).resolve().with_name("voice_catalog.json")
+
+_SUGGEST_KEYWORD_TONES: dict[str, list[str]] = {
+    "warm":         ["warm"],              "kind":          ["warm"],
+    "sweet":        ["warm"],              "gentle":        ["warm", "soft"],
+    "caring":       ["warm"],              "nurturing":     ["warm"],
+    "loving":       ["warm"],              "tender":        ["warm", "soft"],
+    "dark":         ["dark"],              "evil":          ["dark", "cold"],
+    "cruel":        ["cold"],              "villain":       ["dark", "cold", "authoritative"],
+    "sinister":     ["dark", "cold"],      "cold":          ["cold"],
+    "icy":          ["cold"],              "menacing":      ["dark", "cold"],
+    "soft":         ["soft"],              "quiet":         ["soft"],
+    "shy":          ["soft"],              "timid":         ["soft"],
+    "delicate":     ["soft"],              "meek":          ["soft"],
+    "seductive":    ["sultry", "intimate"],"flirtatious":   ["sultry"],
+    "sensual":      ["sultry", "intimate"],"alluring":      ["sultry"],
+    "intimate":     ["intimate"],          "sultry":        ["sultry"],
+    "cheerful":     ["bright", "energetic"],"bubbly":       ["bright", "playful"],
+    "enthusiastic": ["energetic"],         "lively":        ["bright", "energetic"],
+    "excited":      ["energetic"],         "happy":         ["bright", "warm"],
+    "perky":        ["bright", "playful"], "energetic":     ["energetic"],
+    "playful":      ["playful"],           "mischievous":   ["playful"],
+    "witty":        ["playful"],           "comedic":       ["playful"],
+    "trickster":    ["playful"],           "funny":         ["playful", "bright"],
+    "sarcastic":    ["playful"],
+    "mysterious":   ["mysterious", "ethereal", "cold"],
+    "enigmatic":    ["mysterious", "ethereal"],
+    "supernatural": ["ethereal"],          "otherworldly":  ["ethereal"],
+    "mystical":     ["ethereal"],          "ethereal":      ["ethereal"],
+    "ghost":        ["ethereal", "cold"],  "spirit":        ["ethereal"],
+    "authoritative":["authoritative"],     "commanding":    ["authoritative", "deep"],
+    "dominant":     ["authoritative"],     "powerful":      ["authoritative", "deep"],
+    "strict":       ["authoritative"],     "leader":        ["authoritative"],
+    "elegant":      ["elegant", "smooth", "formal"],
+    "refined":      ["smooth", "formal"],  "sophisticated": ["elegant", "smooth"],
+    "aristocrat":   ["elegant", "formal"], "formal":        ["formal"],
+    "professional": ["professional", "neutral"],
+    "narrator":     ["narrative", "clear", "expressive"],
+    "stoic":        ["neutral", "calm"],   "calm":          ["calm"],
+    "composed":     ["calm", "smooth"],    "deep":          ["deep"],
+    "gruff":        ["deep", "raspy"],     "raspy":         ["raspy"],
+    "wise":         ["calm", "authoritative"],
+}
+
+
+def _load_voice_catalog() -> dict:
+    global _VOICE_CATALOG
+    if _VOICE_CATALOG is not None:
+        return _VOICE_CATALOG
+    try:
+        with open(_VOICE_CATALOG_PATH, encoding="utf-8") as fh:
+            _VOICE_CATALOG = json.load(fh)
+    except Exception as exc:
+        log.warning("voice_catalog.json load failed: %s", exc)
+        _VOICE_CATALOG = {}
+    return _VOICE_CATALOG
+
+
+def _suggest_voices(
+    name: str,
+    description: str,
+    personality: str,
+    recent_messages: list[str],
+    existing_voices: dict[str, str],
+    narrator: str,
+    n: int = 3,
+) -> list[dict]:
+    catalog = _load_voice_catalog()
+    if not catalog:
+        return []
+
+    text = " ".join(filter(None, [name, description, personality] + list(recent_messages)[-8:])).lower()
+
+    fem = sum(text.count(w) for w in (" she ", " her ", " woman ", " girl ", " female ", " lady "))
+    masc = sum(text.count(w) for w in (" he ", " him ", " his ", " man ", " boy ", " male ", " gentleman "))
+    gender_pref: str | None = None
+    if fem > masc * 1.5:
+        gender_pref = "feminine"
+    elif masc > fem * 1.5:
+        gender_pref = "masculine"
+
+    desired_tones: set[str] = set()
+    for keyword, tones in _SUGGEST_KEYWORD_TONES.items():
+        if keyword in text:
+            desired_tones.update(tones)
+
+    accent_pref: str | None = None
+    if any(w in text for w in ("british", "london", " uk ")):
+        accent_pref = "british"
+    elif any(w in text for w in ("american", " us ")):
+        accent_pref = "american"
+    elif "french" in text or "paris" in text:
+        accent_pref = "french"
+    elif "italian" in text or "italy" in text:
+        accent_pref = "italian"
+    elif "japanese" in text or "japan" in text:
+        accent_pref = "japanese"
+    elif "chinese" in text or "mandarin" in text:
+        accent_pref = "chinese"
+
+    used_voices: set[str] = set(existing_voices.values())
+    if narrator:
+        used_voices.add(narrator)
+
+    scored: list[tuple[float, str, str]] = []
+    for voice_id, meta in catalog.items():
+        score = 0.0
+        reason_parts: list[str] = []
+
+        if gender_pref:
+            if meta["gender"] == gender_pref:
+                score += 4.0
+                reason_parts.append(meta["gender"])
+            else:
+                score -= 3.0
+
+        voice_tones = set(meta.get("tone", []))
+        matched = voice_tones & desired_tones
+        if matched:
+            score += len(matched) * 1.5
+            reason_parts.extend(sorted(matched)[:2])
+
+        if accent_pref and meta.get("accent") == accent_pref:
+            score += 2.0
+            reason_parts.append(meta["accent"])
+        elif not accent_pref and meta.get("accent") in ("american", "british"):
+            score += 0.3
+
+        if voice_id in used_voices:
+            score -= 1.5
+
+        reason = ", ".join(dict.fromkeys(reason_parts))[:64] or meta.get("notes", "")[:64]
+        scored.append((score, voice_id, reason))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [{"voice": vid, "score": round(sc, 2), "reason": rsn} for sc, vid, rsn in scored[:n]]
+
+
 def transcribe(audio_path: Path, model: str = DEFAULT_MODEL, use_gpu: bool = True,
                prompt: str = "", language: str = "en") -> str:
     """Run whisper STT against `audio_path` and return cleaned text.
@@ -8156,6 +8297,8 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             self._handle_audit_network(query)
         elif path == "/tts/voices":
             self._handle_tts_voices()
+        elif path == "/tts/voices/catalog":
+            self._handle_tts_voices_catalog()
         elif _is_icon_path(path):
             # POL-5 / Agent 4 §8.3 — manifest references /icon-192.png and
             # /icon-512.png. Asset binaries are deploy-time; until they
@@ -8425,6 +8568,8 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             self._handle_tts()
         elif path == "/tts/audiobook":
             self._handle_tts_audiobook()
+        elif path == "/tts/voices/suggest":
+            self._handle_tts_voices_suggest()
         else:
             self.send_response(404)
             self.end_headers()
@@ -8544,6 +8689,36 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(audiobook)
         except Exception:
             pass
+
+    def _handle_tts_voices_catalog(self) -> None:
+        """GET /tts/voices/catalog — serve the local voice metadata catalog."""
+        self.send_json({"catalog": _load_voice_catalog()})
+
+    def _handle_tts_voices_suggest(self) -> None:
+        """POST /tts/voices/suggest — heuristic voice suggestions for a character.
+
+        Body: {name, description?, personality?, recent_messages?, existing_voices?, narrator?, n?}
+        Returns: {suggestions: [{voice, score, reason}]}
+        """
+        try:
+            body = self.read_json_body()
+        except Exception:
+            self.send_error_json("Invalid JSON", code="bad_json", status=400)
+            return
+        if not isinstance(body, dict):
+            self.send_error_json("Body must be an object", code="bad_json", status=400)
+            return
+        name = str(body.get("name") or "")
+        description = str(body.get("description") or "")
+        personality = str(body.get("personality") or "")
+        recent = body.get("recent_messages")
+        recent = [str(m) for m in (recent if isinstance(recent, list) else [])]
+        existing = body.get("existing_voices")
+        existing = existing if isinstance(existing, dict) else {}
+        narrator = str(body.get("narrator") or "")
+        n = min(max(int(body.get("n") or 3), 1), 10)
+        suggestions = _suggest_voices(name, description, personality, recent, existing, narrator, n)
+        self.send_json({"suggestions": suggestions})
 
     def _handle_vocab_add(self):
         """POST /vocab — append a vocab entry, persist atomically, return full list."""
