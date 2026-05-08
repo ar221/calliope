@@ -2316,6 +2316,32 @@ function buildSettingsPanel() {
                     <!-- POL-6: addressee picker (group chats only). Hidden on solo. -->
                     <div id="dictation_bridge_addressee" style="display:none;margin:6px 0 4px 0"></div>
 
+                    <!-- TTS read-back (Kokoro backend) ─────────────────── -->
+                    <div class="dbb-tts-settings" style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(201, 178, 139, 0.18)">
+                        <div style="font-size:11px;letter-spacing:0.06em;text-transform:uppercase;color:#FFB648;margin-bottom:4px">TTS (read-back)</div>
+
+                        <label class="checkbox_label">
+                            <input id="dictation_bridge_tts_auto_read" type="checkbox" />
+                            <span>Auto-read every new AI message</span>
+                        </label>
+
+                        <label class="checkbox_label" title="Read streamed text as it arrives — needs server streaming support (deferred)">
+                            <input id="dictation_bridge_tts_stream_partials" type="checkbox" disabled />
+                            <span style="opacity:0.7">Read streaming partials (server support pending)</span>
+                        </label>
+
+                        <label for="dictation_bridge_tts_voice">Voice</label>
+                        <select id="dictation_bridge_tts_voice" class="text_pole">
+                            <option value="af_heart">af_heart (Kokoro default)</option>
+                        </select>
+                        <small class="notes" style="margin-top:0">Voices populate from <code>/tts/voices</code>. Falls back to <code>af_heart</code> if the endpoint isn't ready.</small>
+
+                        <div style="display:flex;gap:6px;align-items:center;margin:4px 0 0 0">
+                            <button id="dictation_bridge_tts_test" type="button" class="menu_button" style="padding:3px 10px;font-size:12px;border:1px solid rgba(201, 178, 139, 0.45);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Test voice</button>
+                            <small class="notes" style="margin:0 0 0 4px">Plays a short sample with the selected voice.</small>
+                        </div>
+                    </div>
+
                     <small class="notes">
                         The dictation server must be running and reachable.
                         Self-signed cert: visit the URL once in a browser tab and accept the warning before using the mic button.
@@ -2406,6 +2432,103 @@ function buildSettingsPanel() {
         voiceCmdEl.addEventListener('change', () => {
             s.voiceCommandsEnabled = !!voiceCmdEl.checked;
             saveSettings();
+        });
+    }
+
+    // ─── TTS settings wiring ───────────────────────────────────────────────
+    const ttsAutoEl = host.querySelector('#dictation_bridge_tts_auto_read');
+    const ttsStreamEl = host.querySelector('#dictation_bridge_tts_stream_partials');
+    const ttsVoiceEl = host.querySelector('#dictation_bridge_tts_voice');
+    const ttsTestEl = host.querySelector('#dictation_bridge_tts_test');
+
+    if (ttsAutoEl) {
+        ttsAutoEl.checked = !!s.ttsAutoReadAi;
+        ttsAutoEl.addEventListener('change', () => {
+            s.ttsAutoReadAi = !!ttsAutoEl.checked;
+            saveSettings();
+            try { paintQuickLaunchAutoReadBtn(); } catch {}
+        });
+    }
+    if (ttsStreamEl) {
+        ttsStreamEl.checked = !!s.ttsReadStreamingPartials;
+        // TODO: wire when server streaming TTS lands. For now keep disabled
+        // but mirror the persisted value so toggling default in code works.
+        ttsStreamEl.addEventListener('change', () => {
+            s.ttsReadStreamingPartials = !!ttsStreamEl.checked;
+            saveSettings();
+        });
+    }
+
+    // Populate voice picker — try server, fall back to single hard-coded
+    // entry if /tts/voices isn't there yet (sibling backend may still be in
+    // flight). Don't disable the picker on failure.
+    if (ttsVoiceEl) {
+        // Pre-select persisted voice (the markup already has af_heart).
+        if (s.ttsVoice && s.ttsVoice !== 'af_heart') {
+            const opt = document.createElement('option');
+            opt.value = s.ttsVoice;
+            opt.textContent = s.ttsVoice;
+            ttsVoiceEl.appendChild(opt);
+            ttsVoiceEl.value = s.ttsVoice;
+        }
+        fetchTtsVoices().then(voices => {
+            if (!voices || !voices.length) return;
+            // Replace options with server-provided list. Preserve current
+            // selection if it's in the new list.
+            const prev = ttsVoiceEl.value;
+            ttsVoiceEl.innerHTML = '';
+            for (const v of voices) {
+                const opt = document.createElement('option');
+                opt.value = v.id || v.name || '';
+                opt.textContent = v.label || v.id || v.name || '';
+                ttsVoiceEl.appendChild(opt);
+            }
+            ttsVoiceEl.value = voices.some(v => (v.id || v.name) === prev) ? prev : (voices[0].id || voices[0].name || 'af_heart');
+            // Persist if the previous saved id is gone from the list.
+            if (s.ttsVoice !== ttsVoiceEl.value) {
+                s.ttsVoice = ttsVoiceEl.value;
+                saveSettings();
+            }
+        }).catch(e => {
+            // Backend missing — keep the single af_heart fallback. One toast
+            // (deduped via notifyTtsMissing) only on user-initiated calls.
+            WARN('tts/voices fetch failed (using fallback)', e?.message || e);
+        });
+        ttsVoiceEl.addEventListener('change', () => {
+            s.ttsVoice = ttsVoiceEl.value || 'af_heart';
+            saveSettings();
+        });
+    }
+
+    if (ttsTestEl) {
+        ttsTestEl.addEventListener('click', async () => {
+            const sample = 'Hello, my name is Calliope. I read for you.';
+            const prev = ttsTestEl.textContent;
+            ttsTestEl.textContent = 'Testing…';
+            ttsTestEl.setAttribute('disabled', 'disabled');
+            try {
+                const blob = await fetchTts(sample, settings().ttsVoice || 'af_heart');
+                ttsBackendAvailable = true;
+                stopTts();
+                const url = URL.createObjectURL(blob);
+                currentTtsBlobUrl = url;
+                const audio = new Audio(url);
+                currentTtsAudio = audio;
+                audio.addEventListener('ended', () => {
+                    if (currentTtsAudio === audio) stopTts();
+                });
+                await audio.play();
+            } catch (e) {
+                const status = e?.status || 0;
+                if (status === 404 || status === 501 || status === 503 || status === 0) {
+                    notifyTtsMissing(e?.message || `status_${status}`);
+                } else {
+                    toast('error', `Test voice failed: ${e?.message || 'unknown'}`);
+                }
+            } finally {
+                ttsTestEl.textContent = prev;
+                ttsTestEl.removeAttribute('disabled');
+            }
         });
     }
 
