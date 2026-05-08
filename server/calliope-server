@@ -556,13 +556,38 @@ def discover_characters() -> list[dict]:
     return characters
 
 
+def discover_group_characters(group_id: str) -> list[dict]:
+    """POL-6 — return only the members of `group_id` (subset of full list).
+
+    Each entry mirrors `discover_characters` shape (`{id, name}`) so the
+    addressee picker can drop in the same chip rendering. Empty list when
+    the group id is unknown.
+    """
+    members = ChatReader.group_member_objects(group_id)
+    return [{"id": m["name"], "name": m["name"]} for m in members]
+
+
 def load_character_card(char_id: str) -> dict:
-    """Extract chara_card_v2 JSON from a character PNG's tEXt chunk."""
+    """Extract chara_card_v2 JSON from a character PNG's tEXt chunk.
+
+    POL-6: when `char_id` is a group id (e.g. the ST extension still
+    forwarding `selected_group` while the addressee picker rolls out),
+    return an explicit error envelope instead of an empty dict so the
+    caller can branch deliberately. Existing valid character cards are
+    unaffected.
+    """
     import struct
     import base64
 
     card_path = CHARACTERS_DIR / f"{char_id}.png"
     if not card_path.exists():
+        # Disambiguate: a UUID-ish id with no PNG → could be a group id
+        # the bridge sent before the addressee picker shipped.
+        try:
+            if char_id and char_id in ChatReader.get_group_id_set():
+                return {"error": "group_id_not_a_character", "group_id": char_id}
+        except Exception:  # pragma: no cover — defensive: never let group probe break card load
+            pass
         return {}
 
     try:
@@ -593,7 +618,10 @@ def build_character_context(char_id: str) -> str:
         return ""
 
     card = load_character_card(char_id)
-    if not card:
+    if not card or card.get("error"):
+        # POL-6: a group-id surfaces as {error: 'group_id_not_a_character'}.
+        # Treat as "no character context" rather than crashing on a `name`
+        # lookup — the addressee picker is the right surface to resolve this.
         return ""
 
     parts = []
@@ -821,6 +849,108 @@ class ChatReader:
                 # Members are stored as "CharName.png" — strip extension
                 return [m.replace(".png", "") for m in members]
         return []
+
+    # ─── POL-6 — group-id helpers + last-speaker tracking ─────
+    @staticmethod
+    def find_group_by_id(group_id: str) -> dict | None:
+        """Return the group definition matching `group_id`, or None.
+
+        Matches against the group def's `id` field. Used by
+        `/characters?group=…` and the addressee-picker plumbing.
+        """
+        if not group_id:
+            return None
+        for group in ChatReader._load_group_defs():
+            if str(group.get("id", "")) == group_id:
+                return group
+        return None
+
+    @staticmethod
+    def get_group_id_set() -> set[str]:
+        """Return the set of all known group ids on disk.
+
+        Used by `load_character_card` to disambiguate a group-id
+        accidentally passed where a character-id is expected (the bridge
+        used to do this; addressee picker fixes it forward).
+        """
+        return {
+            str(g.get("id", ""))
+            for g in ChatReader._load_group_defs()
+            if g.get("id")
+        }
+
+    @staticmethod
+    def group_member_objects(group_id: str) -> list[dict]:
+        """Return per-member `[{name, avatar}]` dicts for a group.
+
+        `avatar` is the on-disk filename (`Hana.png`); `name` is the
+        stem (`Hana`). Used by `/characters?group=…` and the
+        `/state` + `/active-chat` group payloads.
+        """
+        group = ChatReader.find_group_by_id(group_id)
+        if not group:
+            return []
+        out: list[dict] = []
+        for raw in group.get("members", []) or []:
+            avatar = str(raw)
+            name = avatar[:-4] if avatar.lower().endswith(".png") else avatar
+            out.append({"name": name, "avatar": avatar})
+        return out
+
+    @staticmethod
+    def get_group_last_speaker(group_id: str) -> str | None:
+        """Return the most recent non-user speaker in a group chat.
+
+        Reads the tail of the group chat (existing chat-tail helpers)
+        and finds the rightmost `is_user: false` message. Returns the
+        speaker `name` field, or None when the chat has no AI messages
+        yet (cold-start / brand-new group).
+
+        Cached per `(group_id, mtime)` to avoid re-tailing the chat
+        file on every /state poll.
+        """
+        global _group_last_speaker_cache
+        if not group_id:
+            return None
+        group = ChatReader.find_group_by_id(group_id)
+        if not group:
+            return None
+        chat_file = ChatReader._find_group_chat_file(group)
+        if chat_file is None:
+            return None
+        try:
+            mtime = chat_file.stat().st_mtime
+        except OSError:
+            return None
+        cache_key = (group_id, mtime)
+        with _group_last_speaker_lock:
+            cached = _group_last_speaker_cache.get(cache_key)
+            if cached is not None:
+                return cached or None  # may be sentinel ""
+        messages = ChatReader.read_chat_messages(
+            group.get("name", ""), "group", last_n=20,
+        )
+        last_ai_name: str | None = None
+        for msg in reversed(messages):
+            if msg.get("is_user"):
+                continue
+            name = str(msg.get("name", "") or "").strip()
+            if name and name.lower() != "you":
+                last_ai_name = name
+                break
+        with _group_last_speaker_lock:
+            # Trim cache to prevent unbounded growth (keep ~32 entries).
+            if len(_group_last_speaker_cache) > 64:
+                _group_last_speaker_cache.clear()
+            _group_last_speaker_cache[cache_key] = last_ai_name or ""
+        return last_ai_name
+
+
+# POL-6 — last-speaker cache (`(group_id, mtime) -> name|""`).
+# A sentinel "" means "we checked, no AI message yet" — distinct from
+# cache miss. Lock protects both read + write paths.
+_group_last_speaker_cache: dict = {}
+_group_last_speaker_lock = threading.Lock()
 
 
 class ContextBuilder:
@@ -1858,6 +1988,29 @@ def snapshot_state() -> dict:
         remembered = get_char_mode(snap["characterId"])
         if remembered:
             snap["rememberedMode"] = remembered
+
+    # POL-6 — normalize chatType to solo/group + inject group payload.
+    # Existing `chatType` in `st_state` is whatever the bridge posts
+    # (typically `individual`/`group`/empty). We don't rename it; we
+    # *also* surface the normalized value so consumers can switch on
+    # solo/group without remembering ST's legacy "individual" string.
+    legacy = (snap.get("chatType") or "").lower()
+    if legacy == "group":
+        snap["chatType"] = "group"
+        # When ST posts a group chat, characterId is sometimes the group id.
+        # Use that; otherwise fall back to chatId (which is the chat-file id).
+        candidate_group_id = snap.get("characterId", "") or snap.get("chatId", "")
+        if candidate_group_id:
+            group = ChatReader.find_group_by_id(candidate_group_id)
+            if group is not None:
+                snap["groupId"] = candidate_group_id
+                snap["groupMembers"] = ChatReader.group_member_objects(candidate_group_id)
+                snap["lastSpeaker"] = ChatReader.get_group_last_speaker(candidate_group_id)
+    elif legacy == "individual" or (legacy == "" and snap.get("characterId")):
+        snap["chatType"] = "solo"
+    elif not legacy:
+        # Leave chatType empty — ST hasn't posted state yet.
+        snap["chatType"] = ""
     return snap
 
 
@@ -7396,7 +7549,18 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/personas":
             self.send_json({"personas": discover_personas()})
         elif path == "/characters":
-            self.send_json({"characters": discover_characters()})
+            # POL-6 — `?group=<groupId>` filters to that group's members.
+            group_id = query.get("group", [""])[0].strip()
+            if group_id:
+                members = discover_group_characters(group_id)
+                last_speaker = ChatReader.get_group_last_speaker(group_id)
+                self.send_json({
+                    "characters": members,
+                    "groupId": group_id,
+                    "lastSpeaker": last_speaker,
+                })
+            else:
+                self.send_json({"characters": discover_characters()})
         elif path == "/recent-chats":
             chats = ChatReader.get_recent_chats(limit=20)
             # Strip internal 'file' field from response
@@ -7415,12 +7579,29 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 )
                 is_group = active["type"] == "group"
                 context_text = ContextBuilder.format_messages(messages, is_group=is_group)
-                self.send_json({
+                # POL-6 — chatType normalised to solo/group + optional
+                # group payload (members + last speaker). `type` is
+                # preserved as-is (`individual`/`group`) for legacy
+                # consumers; normalised value lives on `chatType`.
+                payload: dict = {
                     "name": active["name"],
                     "type": active["type"],
+                    "chatType": "group" if is_group else "solo",
                     "messages": messages,
                     "context_text": context_text,
-                })
+                }
+                if is_group:
+                    # Resolve group_id from the active chat's name.
+                    group_id = ""
+                    for g in ChatReader._load_group_defs():
+                        if g.get("name", "") == active["name"]:
+                            group_id = str(g.get("id", "") or "")
+                            break
+                    if group_id:
+                        payload["groupId"] = group_id
+                        payload["groupMembers"] = ChatReader.group_member_objects(group_id)
+                        payload["lastSpeaker"] = ChatReader.get_group_last_speaker(group_id)
+                self.send_json(payload)
         elif path == "/chat-context":
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             chat_name = qs.get("name", [""])[0]
