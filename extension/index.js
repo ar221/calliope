@@ -1317,6 +1317,11 @@ function buildEmbedUrl() {
     if (ctx.chatId) qp.set('chat', String(ctx.chatId));
     if (ctx.personaId) qp.set('persona', String(ctx.personaId));
     if (ctx.characterId) qp.set('character', String(ctx.characterId));
+    // Pass bearer token via query so the embedded UI can stash it in
+    // sessionStorage and attach to its own fetch + EventSource calls.
+    // Server-side / is auth-exempt; child API calls remain gated.
+    const token = (cfg.serverToken || '').trim();
+    if (token) qp.set('token', token);
     return `${base}/?${qp.toString()}`;
 }
 
