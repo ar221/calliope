@@ -126,10 +126,36 @@ def _audio_to_wav_bytes(samples: np.ndarray, sample_rate: int) -> bytes:
     return buf.getvalue()
 
 
-_SENT_SPLIT_RE = __import__('re').compile(r'(?<=[.!?…])\s+|(?<=\n)')
+_RE = __import__('re')
+_SENT_SPLIT_RE = _RE.compile(r'(?<=[.!?…])\s+|(?<=\n)')
+_SOFT_SPLIT_RE = _RE.compile(r'(?<=[,;:])\s+')
 
 
-def _split_for_synth(text: str, max_chars: int = 500) -> list[str]:
+def _split_long_fragment(fragment: str, max_chars: int) -> list[str]:
+    """Split a single long sentence below Kokoro's internal splitter threshold."""
+    fragment = fragment.strip()
+    if len(fragment) <= max_chars:
+        return [fragment] if fragment else []
+
+    pieces: list[str] = []
+    for soft in [p.strip() for p in _SOFT_SPLIT_RE.split(fragment) if p.strip()]:
+        if len(soft) <= max_chars:
+            pieces.append(soft)
+            continue
+        words = soft.split()
+        cur = ''
+        for word in words:
+            if cur and len(cur) + 1 + len(word) > max_chars:
+                pieces.append(cur)
+                cur = word[:max_chars]
+            else:
+                cur = word if not cur else cur + ' ' + word
+        if cur:
+            pieces.append(cur)
+    return pieces
+
+
+def _split_for_synth(text: str, max_chars: int = 100) -> list[str]:
     """Split text into chunks safe for kokoro.create().
 
     Upstream kokoro-onnx has a multi-batch concat bug: when input phonemes
@@ -141,8 +167,13 @@ def _split_for_synth(text: str, max_chars: int = 500) -> list[str]:
     text = (text or '').strip()
     if not text:
         return []
-    # Split by sentence-ending punctuation + newlines.
-    parts = [p.strip() for p in _SENT_SPLIT_RE.split(text) if p and p.strip()]
+    # Split by sentence-ending punctuation + newlines, then split long prose
+    # sentences again. Kokoro's own splitter can still hit the concat bug on
+    # long single sentences, so keep each model call deliberately small.
+    sentence_parts = [p.strip() for p in _SENT_SPLIT_RE.split(text) if p and p.strip()]
+    parts: list[str] = []
+    for part in sentence_parts:
+        parts.extend(_split_long_fragment(part, max_chars))
     if not parts:
         return [text]
     # Re-glue tiny adjacent fragments up to max_chars per chunk.

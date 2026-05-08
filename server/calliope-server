@@ -1525,6 +1525,7 @@ def _idle_shutdown_loop() -> None:
     Disabled entirely when IDLE_SHUTDOWN_DISABLED is set (users who keep the
     GPU-heavy ComfyUI pipeline off can leave whisper-server warm).
     """
+    global _last_transcribe_ts
     if IDLE_SHUTDOWN_DISABLED:
         log.info("Idle-shutdown disabled by env (WHISPER_IDLE_SHUTDOWN_DISABLED)")
         return
@@ -1628,6 +1629,7 @@ def _kokoro_idle_shutdown_loop() -> None:
     Mirrors `_idle_shutdown_loop` but for the Kokoro process. Disabled
     entirely when KOKORO_IDLE_SHUTDOWN_DISABLED is set.
     """
+    global _last_tts_ts
     if KOKORO_IDLE_SHUTDOWN_DISABLED:
         log.info("Kokoro idle-shutdown disabled by env (KOKORO_IDLE_SHUTDOWN_DISABLED)")
         return
