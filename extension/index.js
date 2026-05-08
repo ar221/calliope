@@ -68,6 +68,7 @@ const DEFAULTS = {
     voiceCommandsEnabled: true,  // POL-1: server-emitted dictation-command SSE dispatcher
     // ─── TTS read-back (Calliope Kokoro backend) ───────────────────────────
     ttsAutoReadAi: false,        // auto-fire TTS on every new AI message
+    ttsAutoReadPersonaQuoted: true, // auto-fire TTS on new user messages, quoted dialogue only
     ttsReadStreamingPartials: false, // stream partial TTS — needs server streaming (deferred)
     ttsVoice: 'af_heart',        // Kokoro default voice id
     ttsVoiceProfiles: {},        // WOW-2: character/addressee name -> Kokoro voice id
@@ -1402,10 +1403,12 @@ function connectSSE() {
                 if (doAutoSend) {
                     const btn = document.getElementById('send_but');
                     if (btn) btn.click(); else WARN('send_but not found, cannot auto-send');
+                    setTimeout(() => maybeReadDictatedPersonaText(text), 200);
                 }
             }
         } else {
             writeToTextarea(text, { autoSend: doAutoSend, appendMode: cfg.appendMode });
+            if (doAutoSend) setTimeout(() => maybeReadDictatedPersonaText(text), 200);
         }
 
         if (data.formatting_skipped && window.toastr) {
@@ -1679,6 +1682,7 @@ function onWindowMessage(event) {
             if (!text) { WARN('dictation-result had empty text'); return; }
             const cfg = settings();
             writeToTextarea(text, { autoSend: cfg.autoSend, appendMode: cfg.appendMode });
+            if (cfg.autoSend) setTimeout(() => maybeReadDictatedPersonaText(text), 200);
             if (data.formatting_skipped && window.toastr) {
                 const reason = data.formatting_reason ? `: ${data.formatting_reason}` : '';
                 window.toastr.warning(`RP formatting skipped${reason}. Raw transcript used.`, 'Dictation Bridge');
@@ -1943,6 +1947,9 @@ let ttsBackendAvailable = null; // null = unknown; true/false after first call
 let ttsBackendNotifiedMissing = false;
 let ttsAutoReadInitDone = false; // gate: don't auto-read on chat-load first messages
 let ttsLastReadMesid = -1;
+let ttsLastReadPersonaMesid = -1;
+let ttsLastDictatedPersonaQuoted = '';
+let ttsLastDictatedPersonaAt = 0;
 let ttsObserver = null;
 
 function ttsAudioErrorDetails(audio, blob) {
@@ -2085,10 +2092,11 @@ function extractMessageText(mesEl) {
     const mesid = parseInt(mesEl.getAttribute('mesid') || '-1', 10);
     if (Array.isArray(chat) && mesid >= 0 && chat[mesid]) {
         const raw = String(chat[mesid].mes || '').trim();
-        if (raw) return stripMarkdownForTts(raw);
+        if (raw) return chat[mesid].is_user ? extractQuotedDialogueForTts(raw) : stripMarkdownForTts(raw);
     }
     const t = mesEl.querySelector('.mes_text');
-    return stripMarkdownForTts(String(t?.textContent || '').trim());
+    const raw = String(t?.textContent || '').trim();
+    return isUserMessageEl(mesEl) ? extractQuotedDialogueForTts(raw) : stripMarkdownForTts(raw);
 }
 
 /** Light markdown stripping — Kokoro doesn't render markup; raw symbols become noise. */
@@ -2106,6 +2114,26 @@ function stripMarkdownForTts(s) {
         .replace(/\s+\n/g, '\n')
         .replace(/[ \t]{2,}/g, ' ')
         .trim();
+}
+
+function isUserMessageEl(mesEl) {
+    if (!mesEl) return false;
+    if (mesEl.getAttribute('is_user') === 'true') return true;
+    const mesid = parseInt(mesEl.getAttribute('mesid') || '-1', 10);
+    return Array.isArray(chat) && mesid >= 0 && chat[mesid]?.is_user === true;
+}
+
+function extractQuotedDialogueForTts(s) {
+    if (!s) return '';
+    const text = String(s);
+    const parts = [];
+    const re = /["“]([^"”]+)["”]/g;
+    let match;
+    while ((match = re.exec(text)) !== null) {
+        const piece = stripMarkdownForTts(match[1]).trim();
+        if (piece) parts.push(piece);
+    }
+    return parts.join('\n').slice(0, 4000).trim();
 }
 
 function isTtsMessageEl(mesEl) {
@@ -2152,7 +2180,8 @@ function buildAudiobookPayload() {
     if (Array.isArray(chat)) {
         for (const m of chat) {
             if (!m || m.is_system) continue;
-            const text = stripMarkdownForTts(String(m.mes || ''));
+            const raw = String(m.mes || '');
+            const text = m.is_user ? extractQuotedDialogueForTts(raw) : stripMarkdownForTts(raw);
             if (!text) continue;
             const name = m.is_user ? currentPersonaTtsProfileName() : String(m.name || '').trim();
             const voice = voiceMap[normalizeVoiceProfileKey(name)] || '';
@@ -2296,7 +2325,7 @@ async function readMessageAloud(mesEl, btn) {
 
     const text = extractMessageText(mesEl);
     if (!text) {
-        toast('warning', 'No text to read');
+        toast('warning', isUserMessageEl(mesEl) ? 'No quoted dialogue to read' : 'No text to read');
         return;
     }
 
@@ -2433,6 +2462,52 @@ function maybeAutoReadAi(mesid) {
     }
     const fresh = mesEl.querySelector(`.${TTS_BTN_CLASS}`);
     if (fresh) readMessageAloud(mesEl, fresh).catch(err => WARN('autoRead', err?.message || err));
+}
+
+function maybeAutoReadPersonaQuoted(mesid) {
+    const cfg = settings();
+    if (!cfg.ttsAutoReadPersonaQuoted) return;
+    if (!ttsAutoReadInitDone) return;
+    const id = parseInt(mesid, 10);
+    if (!Number.isFinite(id) || id < 0) return;
+    if (id <= ttsLastReadPersonaMesid) return;
+    ttsLastReadPersonaMesid = id;
+    const m = chat?.[id];
+    if (!m || !m.is_user || m.is_system) return;
+    const quoted = extractQuotedDialogueForTts(String(m.mes || ''));
+    if (!quoted) return;
+    if (quoted === ttsLastDictatedPersonaQuoted && Date.now() - ttsLastDictatedPersonaAt < 5000) return;
+    const mesEl = document.querySelector(`#chat .mes[mesid="${id}"]`);
+    if (!mesEl) return;
+    let btn = mesEl.querySelector(`.${TTS_BTN_CLASS}`);
+    if (!btn) {
+        injectTtsButtonOn(mesEl);
+        btn = mesEl.querySelector(`.${TTS_BTN_CLASS}`);
+    }
+    if (btn) readMessageAloud(mesEl, btn).catch(err => WARN('autoReadPersona', err?.message || err));
+}
+
+function maybeReadDictatedPersonaText(text) {
+    if (!settings().ttsAutoReadPersonaQuoted) return;
+    const quoted = extractQuotedDialogueForTts(text);
+    if (!quoted) return;
+    ttsLastDictatedPersonaQuoted = quoted;
+    ttsLastDictatedPersonaAt = Date.now();
+    fetchTts(quoted, (settings().ttsVoiceProfiles || {})[normalizeVoiceProfileKey(currentPersonaTtsProfileName())] || settings().ttsVoice || 'af_heart')
+        .then(blob => {
+            ttsBackendAvailable = true;
+            stopTts();
+            return createAndPlayTtsAudio(blob, () => stopTts());
+        })
+        .catch(e => {
+            const status = e?.status || 0;
+            if (status === 404 || status === 501 || status === 503 || status === 0) {
+                notifyTtsMissing(e?.message || `status_${status}`);
+            } else {
+                WARN('dictated persona TTS failed', e?.message || e);
+                toast('error', `Persona TTS failed: ${e?.message || 'unknown'}`);
+            }
+        });
 }
 
 /** Read the most recent AI message ("computer: read last"). */
@@ -2714,6 +2789,11 @@ function buildSettingsPanel() {
                             <span>Auto-read every new AI message</span>
                         </label>
 
+                        <label class="checkbox_label" title="For your persona messages, only text inside double quotes is read aloud; narration/exposition is skipped.">
+                            <input id="dictation_bridge_tts_auto_read_persona" type="checkbox" />
+                            <span>Auto-read my quoted dialogue</span>
+                        </label>
+
                         <label class="checkbox_label" title="Read streamed text as it arrives — needs server streaming support (deferred)">
                             <input id="dictation_bridge_tts_stream_partials" type="checkbox" disabled />
                             <span style="opacity:0.7">Read streaming partials (server support pending)</span>
@@ -2838,6 +2918,7 @@ function buildSettingsPanel() {
 
     // ─── TTS settings wiring ───────────────────────────────────────────────
     const ttsAutoEl = host.querySelector('#dictation_bridge_tts_auto_read');
+    const ttsAutoPersonaEl = host.querySelector('#dictation_bridge_tts_auto_read_persona');
     const ttsStreamEl = host.querySelector('#dictation_bridge_tts_stream_partials');
     const ttsVoiceEl = host.querySelector('#dictation_bridge_tts_voice');
     const ttsTestEl = host.querySelector('#dictation_bridge_tts_test');
@@ -2863,6 +2944,13 @@ function buildSettingsPanel() {
             s.ttsAutoReadAi = !!ttsAutoEl.checked;
             saveSettings();
             try { paintQuickLaunchAutoReadBtn(); } catch {}
+        });
+    }
+    if (ttsAutoPersonaEl) {
+        ttsAutoPersonaEl.checked = !!s.ttsAutoReadPersonaQuoted;
+        ttsAutoPersonaEl.addEventListener('change', () => {
+            s.ttsAutoReadPersonaQuoted = !!ttsAutoPersonaEl.checked;
+            saveSettings();
         });
     }
     if (ttsStreamEl) {
@@ -3120,6 +3208,9 @@ export async function init() {
         // New chat: reset auto-read gate + sweep existing messages.
         ttsAutoReadInitDone = false;
         ttsLastReadMesid = -1;
+        ttsLastReadPersonaMesid = -1;
+        ttsLastDictatedPersonaQuoted = '';
+        ttsLastDictatedPersonaAt = 0;
         stopTts();
         setTimeout(() => {
             sweepInjectTtsButtons();
@@ -3150,6 +3241,7 @@ export async function init() {
             const id = parseInt(mesid, 10);
             const el = document.querySelector(`#chat .mes[mesid="${id}"]`);
             if (el) injectTtsButtonOn(el);
+            maybeAutoReadPersonaQuoted(mesid);
         });
     }
     // First-load fallback: if there's no chat yet, the gate stays closed
