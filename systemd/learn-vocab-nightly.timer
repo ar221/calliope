@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Calliope adaptive lexicon scan nightly
+
+[Timer]
+OnCalendar=*-*-* 04:20:00
+Persistent=true
+RandomizedDelaySec=20m
+Unit=learn-vocab-nightly.service
+
+[Install]
+WantedBy=timers.target

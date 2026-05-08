@@ -107,6 +107,37 @@ def test_stoplist_filters_common_words(mod, tmp_path):
     assert "Kaelthas" in words
 
 
+def test_mining_strips_html_and_css_noise(mod, tmp_path):
+    """Rendered ST markup must not leak font/color/hex junk into vocab."""
+    chats_dir = _make_chats(tmp_path, "Test", [
+        ["<font color='#aabbcc'>Kaelthas Kaelthas Kaelthas</font> font color aabbcc"],
+    ])
+    proposals, _, _ = mod.mine_character(
+        chats_dir / "Test", set(), min_freq=3, cap=80, proper_only=False,
+    )
+    words = {w for w, _ in proposals}
+    assert "Kaelthas" in words
+    assert "font" not in {w.lower() for w in words}
+    assert "color" not in {w.lower() for w in words}
+    assert "aabbcc" not in {w.lower() for w in words}
+
+
+def test_mining_normalizes_possessives_and_drops_contractions(mod, tmp_path):
+    """Names should survive as canonical terms; prose contractions should not."""
+    chats_dir = _make_chats(tmp_path, "Test", [
+        ["Camilla's Camilla's Camilla's you're you're you're didn't didn't didn't"],
+    ])
+    proposals, _, _ = mod.mine_character(
+        chats_dir / "Test", set(), min_freq=3, cap=80, proper_only=False,
+    )
+    words = {w for w, _ in proposals}
+    lowered = {w.lower() for w in words}
+    assert "Camilla" in words
+    assert "camilla's" not in lowered
+    assert "you're" not in lowered
+    assert "didn't" not in lowered
+
+
 # ─── Frequency threshold ─────────────────────────────────────────────
 
 
@@ -132,6 +163,7 @@ def test_min_freq_three_default(mod, tmp_path):
     ])
     proposals, _, _ = mod.mine_character(
         chats_dir / "Test", set(), min_freq=3, cap=80,
+        proper_only=False,
     )
     assert ("Foobar", 3) in proposals
 
@@ -152,6 +184,7 @@ def test_casing_keeps_longest_representative(mod, tmp_path):
     ])
     proposals, _, _ = mod.mine_character(
         chats_dir / "Test", set(), min_freq=3, cap=80,
+        proper_only=False,
     )
     rep = dict(proposals)
     # 'kaelthas' lowercase key — variants kaelthas, KAELTHAS, Kaelthas (3x).
@@ -202,7 +235,7 @@ def test_cap_limits_per_character(mod, tmp_path):
     repeated = " ".join([line] * 5)  # each appears 5 times
     chats_dir = _make_chats(tmp_path, "Test", [[repeated]])
     proposals, _, _ = mod.mine_character(
-        chats_dir / "Test", set(), min_freq=3, cap=4,
+        chats_dir / "Test", set(), min_freq=3, cap=4, proper_only=False,
     )
     assert len(proposals) == 4
     # All four must come from the distinct set.

@@ -1,0 +1,21 @@
+[Unit]
+Description=Calliope adaptive lexicon nightly scan
+Documentation=file:%h/Github/calliope/README.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Github/calliope
+ExecStart=%h/Github/calliope/scripts/learn-vocab --min-freq 10 --cap 8 --apply --merge-characters --quiet
+
+# Learner reads SillyTavern chat JSONL and updates Calliope vocab.yaml only.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=/mnt/hdd/AI/SillyTavern/data %h/Github/calliope
+ReadWritePaths=%h/.local/share/dictation-server /tmp
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native

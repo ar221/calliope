@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import html
 import json
 import os
 import pathlib
@@ -79,6 +80,41 @@ DEFAULT_VOCAB_YAML = pathlib.Path(
 
 # Same shape as server build_whisper_prompt token regex (recon line 107).
 TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z'\-]+")
+HTML_TAG_RE = re.compile(r"<[^>]+>")
+HEX_COLOR_RE = re.compile(r"#[0-9A-Fa-f]{3,8}\b")
+CONTRACTION_SUFFIXES = ("n't", "'re", "'ve", "'ll", "'d", "'m")
+
+# Domain-specific junk seen in SillyTavern exports and model boilerplate. This
+# is deliberately conservative: keep names/lore terms, drop markup/prose noise
+# that makes Whisper prompts worse rather than better.
+EXTRA_STOPWORDS = {
+    "font", "color", "style", "class", "span", "div", "nbsp", "br", "href",
+    "sfx", "ooc", "system", "status", "current", "physical", "personality",
+    "scenario", "description", "repetition", "solution", "limitations",
+    "location", "environment", "details", "character", "characters", "summary",
+    "continuation", "approximate", "overuse", "generic", "medium", "mental",
+    "focus", "vary", "extra", "latest", "unknown", "available", "critique",
+    "repetitive", "random", "constant", "reminder", "response", "respond",
+    "length", "overused", "frequent", "excessive", "analysis", "descriptions",
+    "discarded", "explore", "instead", "internal", "private", "social",
+    "keep", "react", "acknowledge", "engage", "unlikely", "limited",
+    "regular", "attempting", "revealing", "main", "secondary",
+    "actions", "action", "slightly", "barely", "softly", "gently", "slowly",
+    "quietly", "through", "against", "around", "between", "before", "behind",
+    "across", "toward", "towards", "without", "under", "where", "while",
+    "those", "these", "once", "made", "came", "feel", "says", "looks",
+    "looked", "gaze", "smile", "chest", "fingers", "fabric", "black", "white",
+    "red", "pale", "pink", "brown", "dark", "edge", "weight", "attention",
+    "speech", "situation", "show", "step", "please", "based", "given", "tell",
+    "planning", "despite", "intimate", "must", "though", "casual", "write",
+    "playful", "confident", "seductive", "direct", "realistic", "fanfic",
+    "breathy", "sultry", "flirtatious", "professional", "soft", "sweet",
+    "messy", "curious", "strong", "tight", "bold", "neutral", "vulgar",
+    "aggressive", "confrontational", "rough", "tough", "gruff",
+    "npcs", "npc", "stop", "continue", "master", "fuck",
+    "didn't", "doesn't", "wasn't", "isn't", "aren't", "don't", "you're",
+    "she's", "he's", "i'm", "it's", "that's", "what's", "can't", "won't",
+}
 
 # Inline fallback stoplist (~1000 most-common English words) used when
 # `wordfreq` is unavailable. Sourced from public-domain English word
@@ -188,9 +224,54 @@ def iter_chat_messages(char_dir: pathlib.Path) -> Iterable[str]:
                 continue
             if not isinstance(obj, dict):
                 continue
+            if obj.get("is_system") is True:
+                continue
             mes = obj.get("mes")
             if isinstance(mes, str) and mes:
-                yield mes
+                yield clean_message_text(mes)
+
+
+def clean_message_text(text: str) -> str:
+    """Remove ST/HTML rendering noise before token mining."""
+    text = html.unescape(text)
+    text = HEX_COLOR_RE.sub(" ", text)
+    text = HTML_TAG_RE.sub(" ", text)
+    return text
+
+
+def normalize_candidate_token(tok: str, stoplist: set[str]) -> str | None:
+    """Return a prompt-worthy token representative or None."""
+    tok = tok.strip("'-. ")
+    if len(tok) < 3:
+        return None
+    lo = tok.lower()
+    if lo.endswith("'s") and len(tok) > 4:
+        tok = tok[:-2]
+        lo = tok.lower()
+    if lo.endswith(CONTRACTION_SUFFIXES):
+        return None
+    if lo in stoplist or lo in EXTRA_STOPWORDS:
+        return None
+    if len(lo) <= 3 and lo.islower():
+        return None
+    if re.fullmatch(r"[a-f]{3,8}", lo):
+        return None
+    if "-" in tok and all(part.lower() in stoplist or part.lower() in EXTRA_STOPWORDS for part in tok.split("-")):
+        return None
+    return tok
+
+
+def is_proper_or_lore_token(tok: str) -> bool:
+    """Default mining mode: names, acronyms, and distinctive lore terms."""
+    if tok[0].isupper():
+        return True
+    if tok.isupper() and len(tok) > 3:
+        return True
+    if "'" in tok and not tok.lower().endswith(CONTRACTION_SUFFIXES):
+        return True
+    if "-" in tok and any(part[:1].isupper() for part in tok.split("-")):
+        return True
+    return False
 
 
 def mine_character(
@@ -198,6 +279,7 @@ def mine_character(
     stoplist: set[str],
     min_freq: int,
     cap: int,
+    proper_only: bool = True,
 ) -> tuple[list[tuple[str, int]], int, int]:
     """Mine one character directory.
 
@@ -213,9 +295,12 @@ def mine_character(
     for mes in iter_chat_messages(char_dir):
         msg_count += 1
         for tok in TOKEN_RE.findall(mes):
-            lo = tok.lower()
-            if lo in stoplist:
+            tok = normalize_candidate_token(tok, stoplist)
+            if not tok:
                 continue
+            if proper_only and not is_proper_or_lore_token(tok):
+                continue
+            lo = tok.lower()
             counts[lo] += 1
             # Keep longest-form representative (Kael'thas > kael).
             if len(tok) > len(casing.get(lo, "")):
@@ -331,6 +416,7 @@ def process_character(
     cap: int,
     apply: bool,
     merge_characters: bool,
+    proper_only: bool,
 ) -> dict:
     """Process one character. Mutates `vocab` in place when apply=True.
 
@@ -354,7 +440,8 @@ def process_character(
         return result
 
     proposals, chat_count, msg_count = mine_character(
-        char_dir, stoplist, min_freq=min_freq, cap=cap
+        char_dir, stoplist, min_freq=min_freq, cap=cap,
+        proper_only=proper_only,
     )
     result["chats"] = chat_count
     result["messages"] = msg_count
@@ -463,6 +550,9 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="With --apply, extend an existing entry's "
                    "characters[] list when a candidate is already scoped "
                    "to a different character.")
+    p.add_argument("--include-common-terms", action="store_true",
+                   help="Also mine lowercase/common prose terms. Default is "
+                   "proper nouns, acronyms, and lore-style tokens only.")
     p.add_argument("--json", action="store_true",
                    help="Emit machine-readable JSON results to stdout.")
     p.add_argument("--quiet", action="store_true",
@@ -522,6 +612,7 @@ def main(argv: list[str] | None = None) -> int:
             cap=args.cap,
             apply=args.apply,
             merge_characters=args.merge_characters,
+            proper_only=not args.include_common_terms,
         )
         results.append(result)
         if not args.json:

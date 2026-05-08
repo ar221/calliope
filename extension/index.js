@@ -70,6 +70,7 @@ const DEFAULTS = {
     ttsAutoReadAi: false,        // auto-fire TTS on every new AI message
     ttsReadStreamingPartials: false, // stream partial TTS — needs server streaming (deferred)
     ttsVoice: 'af_heart',        // Kokoro default voice id
+    ttsVoiceProfiles: {},        // WOW-2: character/addressee name -> Kokoro voice id
 };
 
 /**
@@ -193,6 +194,117 @@ function resolveLastSpeaker() {
     return '';
 }
 
+function stringifySceneContinuityValue(value, depth = 0) {
+    if (value == null || depth > 3) return '';
+    if (typeof value === 'string') return value.trim();
+    if (Array.isArray(value)) {
+        return value.map(v => stringifySceneContinuityValue(v, depth + 1)).filter(Boolean).join('; ');
+    }
+    if (typeof value === 'object') {
+        const parts = [];
+        for (const [k, v] of Object.entries(value)) {
+            if (typeof v === 'function') continue;
+            const text = stringifySceneContinuityValue(v, depth + 1);
+            if (text) parts.push(`${k}: ${text}`);
+        }
+        return parts.join('; ');
+    }
+    return String(value).trim();
+}
+
+function extractSceneContinuity() {
+    const candidates = [];
+    const add = (label, value) => {
+        const text = stringifySceneContinuityValue(value);
+        if (text && text.length > 8) candidates.push(`${label}: ${text}`);
+    };
+    const preferred = [];
+    const addPreferred = (value) => {
+        const text = stringifySceneContinuityValue(value);
+        if (text && text.length > 8) preferred.push(text);
+    };
+
+    // Known/likely tracker globals if a custom continuity extension exposes one.
+    try {
+        addPreferred(window.sceneContinuityTracker?.getText?.());
+        addPreferred(window.SceneContinuityTracker?.getText?.());
+        add('scene', window.sceneContinuity || window.currentSceneContinuity);
+    } catch (e) {
+        WARN('scene continuity global scan failed', e?.message || e);
+    }
+
+    if (preferred.length) {
+        return preferred
+            .map(s => s.replace(/\s+/g, ' ').trim())
+            .filter(Boolean)
+            .join('\n')
+            .slice(0, 2000);
+    }
+
+    try {
+        add('scene', getContext()?.chatMetadata?.sceneContinuity);
+    } catch (e) {
+        WARN('scene continuity chatMetadata scan failed', e?.message || e);
+    }
+
+    const seen = new Set();
+    return candidates
+        .map(s => s.replace(/\s+/g, ' ').trim())
+        .filter(s => {
+            const key = s.toLowerCase();
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        })
+        .join('\n')
+        .slice(0, 2000);
+}
+
+function normalizeVoiceProfileKey(name) {
+    return String(name || '').trim().toLowerCase();
+}
+
+function currentTtsProfileName() {
+    if (selected_group && activeAddressee?.groupId === String(selected_group)
+        && activeAddressee.characterName && activeAddressee.characterName !== '*all') {
+        return activeAddressee.characterName;
+    }
+    if (selected_group) return resolveLastSpeaker() || '';
+    return characters?.[this_chid]?.name || '';
+}
+
+function messageSpeakerName(mesEl) {
+    if (!mesEl) return '';
+    const mesid = parseInt(mesEl.getAttribute('mesid') || '-1', 10);
+    if (Array.isArray(chat) && mesid >= 0 && chat[mesid]) {
+        const m = chat[mesid];
+        if (typeof m.name === 'string' && m.name.trim()) return m.name.trim();
+        if (typeof m.original_avatar === 'string') {
+            const ch = (characters || []).find(c => c?.avatar === m.original_avatar);
+            if (ch?.name) return ch.name;
+        }
+    }
+    const nameEl = mesEl.querySelector('.name_text, .ch_name, .mes_name, .avatar img[title]');
+    return String(nameEl?.textContent || nameEl?.getAttribute?.('title') || '').trim();
+}
+
+function resolveTtsVoiceForMessage(mesEl) {
+    const s = settings();
+    const profiles = s.ttsVoiceProfiles || {};
+    const speaker = messageSpeakerName(mesEl) || currentTtsProfileName();
+    const profiled = profiles[normalizeVoiceProfileKey(speaker)];
+    return profiled || s.ttsVoice || 'af_heart';
+}
+
+function rememberTtsVoiceForCurrentProfile(voice) {
+    const name = currentTtsProfileName();
+    if (!name || !voice) return '';
+    const s = settings();
+    if (!s.ttsVoiceProfiles || typeof s.ttsVoiceProfiles !== 'object') s.ttsVoiceProfiles = {};
+    s.ttsVoiceProfiles[normalizeVoiceProfileKey(name)] = voice;
+    return name;
+}
+
 /** Build the /state payload the server expects. */
 function buildStatePayload() {
     const ctx = currentContext();
@@ -219,6 +331,8 @@ function buildStatePayload() {
         characterName,
         personaId: ctx.personaId,
         lastAiMessage: ctx.lastAi,
+        sceneContinuity: extractSceneContinuity(),
+        sceneContinuityMeta: JSON.stringify(window.sceneContinuityTracker?.getMeta?.() || {}),
         sourceDevice: 'st-desktop',
         // POL-6 additions — server treats them as optional.
         groupId,
@@ -1807,11 +1921,104 @@ const TTS_AUTO_READ_LAST_KEY = 'dbb_auto_read_last_mesid';
 let currentTtsAudio = null;     // single global Audio so a new click stops the prior one
 let currentTtsBlobUrl = null;
 let currentTtsBtn = null;
+let currentTtsAudioContext = null;
+let currentTtsAudioSource = null;
 let ttsBackendAvailable = null; // null = unknown; true/false after first call
 let ttsBackendNotifiedMissing = false;
 let ttsAutoReadInitDone = false; // gate: don't auto-read on chat-load first messages
 let ttsLastReadMesid = -1;
 let ttsObserver = null;
+
+function ttsAudioErrorDetails(audio, blob) {
+    const err = audio?.error;
+    return `code=${err?.code || 'none'} ready=${audio?.readyState ?? 'n/a'} network=${audio?.networkState ?? 'n/a'} blob=${blob?.size || 0} type=${blob?.type || 'none'}`;
+}
+
+function normalizeTtsBlob(blob) {
+    if (blob?.type && blob.type.startsWith('audio/')) return blob;
+    return new Blob([blob], { type: 'audio/wav' });
+}
+
+function waitForTtsAudioReady(audio, blob) {
+    return new Promise((resolve, reject) => {
+        let done = false;
+        const cleanup = () => {
+            audio.removeEventListener('loadedmetadata', onReady);
+            audio.removeEventListener('canplay', onReady);
+            audio.removeEventListener('error', onError);
+        };
+        const finish = (fn, value) => {
+            if (done) return;
+            done = true;
+            cleanup();
+            fn(value);
+        };
+        const onReady = () => finish(resolve);
+        const onError = () => finish(reject, new Error(`audio_load_failed ${ttsAudioErrorDetails(audio, blob)}`));
+        audio.addEventListener('loadedmetadata', onReady, { once: true });
+        audio.addEventListener('canplay', onReady, { once: true });
+        audio.addEventListener('error', onError, { once: true });
+        audio.load();
+        if (audio.readyState >= HTMLMediaElement.HAVE_METADATA) onReady();
+    });
+}
+
+async function createAndPlayTtsAudio(blob, onEnded) {
+    const audioBlob = normalizeTtsBlob(blob);
+    currentTtsBlobUrl = URL.createObjectURL(audioBlob);
+    const audio = new Audio();
+    audio.preload = 'auto';
+    audio.src = currentTtsBlobUrl;
+    currentTtsAudio = audio;
+    audio.addEventListener('ended', onEnded);
+    audio.addEventListener('error', () => {
+        WARN('tts audio element error', ttsAudioErrorDetails(audio, audioBlob));
+    });
+    try {
+        await waitForTtsAudioReady(audio, audioBlob);
+        await audio.play();
+    } catch (e) {
+        WARN('html audio playback failed; trying WebAudio fallback', e?.message || e, ttsAudioErrorDetails(audio, audioBlob));
+        try { audio.pause(); } catch {}
+        try { URL.revokeObjectURL(currentTtsBlobUrl); } catch {}
+        currentTtsBlobUrl = null;
+        return await createAndPlayTtsWebAudio(audioBlob, onEnded, e);
+    }
+    return audio;
+}
+
+async function createAndPlayTtsWebAudio(blob, onEnded, originalError) {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) {
+        const err = new Error(`${originalError?.message || originalError} (${blob?.size || 0} bytes; WebAudio unavailable)`);
+        err.name = originalError?.name || 'AudioPlaybackError';
+        throw err;
+    }
+    const ctx = new AudioCtx();
+    currentTtsAudioContext = ctx;
+    const buffer = await ctx.decodeAudioData(await blob.arrayBuffer());
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(ctx.destination);
+    currentTtsAudioSource = source;
+    const playback = {
+        paused: false,
+        pause() {
+            this.paused = true;
+            try { source.stop(); } catch {}
+            try { ctx.close(); } catch {}
+        },
+    };
+    currentTtsAudio = playback;
+    source.onended = () => {
+        playback.paused = true;
+        try { ctx.close(); } catch {}
+        if (currentTtsAudio === playback) onEnded?.();
+    };
+    if (ctx.state === 'suspended') await ctx.resume();
+    source.start(0);
+    return playback;
+}
 
 function ttsSetButtonState(btn, state) {
     if (!btn) return;
@@ -1836,6 +2043,10 @@ function ttsSetButtonState(btn, state) {
 }
 
 function stopTts() {
+    try { currentTtsAudioSource?.stop(); } catch {}
+    try { currentTtsAudioContext?.close(); } catch {}
+    currentTtsAudioSource = null;
+    currentTtsAudioContext = null;
     try { currentTtsAudio?.pause(); } catch {}
     if (currentTtsBlobUrl) {
         try { URL.revokeObjectURL(currentTtsBlobUrl); } catch {}
@@ -1944,7 +2155,7 @@ async function readMessageAloud(mesEl, btn) {
 
     let blob;
     try {
-        blob = await fetchTts(text, settings().ttsVoice || 'af_heart');
+        blob = await fetchTts(text, resolveTtsVoiceForMessage(mesEl));
         ttsBackendAvailable = true;
     } catch (e) {
         const status = e?.status || 0;
@@ -1961,23 +2172,10 @@ async function readMessageAloud(mesEl, btn) {
     }
 
     try {
-        currentTtsBlobUrl = URL.createObjectURL(blob);
-        const audio = new Audio(currentTtsBlobUrl);
-        audio.preload = 'auto';
-        currentTtsAudio = audio;
-        audio.addEventListener('ended', () => {
-            if (currentTtsAudio === audio) stopTts();
-        });
-        audio.addEventListener('error', () => {
-            const me = audio.error;
-            const code = me?.code;
-            const msg = me?.message;
-            WARN('tts audio element error', { code, msg });
-            toast('error', `TTS playback error code=${code} ${msg || ''}`);
-            if (currentTtsAudio === audio) stopTts();
-        });
         try {
-            await audio.play();
+            const audio = await createAndPlayTtsAudio(blob, () => {
+                if (currentTtsAudio === audio) stopTts();
+            });
             ttsSetButtonState(btn, 'playing');
         } catch (playErr) {
             // Autoplay-policy or NotAllowedError: gesture chain broken
@@ -2374,7 +2572,7 @@ function buildSettingsPanel() {
                         <select id="dictation_bridge_tts_voice" class="text_pole">
                             <option value="af_heart">af_heart (Kokoro default)</option>
                         </select>
-                        <small class="notes" style="margin-top:0">Voices populate from <code>/tts/voices</code>. Falls back to <code>af_heart</code> if the endpoint isn't ready.</small>
+                        <small id="dictation_bridge_tts_profile_hint" class="notes" style="margin-top:0">Voices populate from <code>/tts/voices</code>. Changing the picker saves a profile for the active character/addressee.</small>
 
                         <div style="display:flex;gap:6px;align-items:center;margin:4px 0 0 0">
                             <button id="dictation_bridge_tts_test" type="button" class="menu_button" style="padding:3px 10px;font-size:12px;border:1px solid rgba(201, 178, 139, 0.45);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Test voice</button>
@@ -2480,6 +2678,17 @@ function buildSettingsPanel() {
     const ttsStreamEl = host.querySelector('#dictation_bridge_tts_stream_partials');
     const ttsVoiceEl = host.querySelector('#dictation_bridge_tts_voice');
     const ttsTestEl = host.querySelector('#dictation_bridge_tts_test');
+    const ttsProfileHintEl = host.querySelector('#dictation_bridge_tts_profile_hint');
+
+    const paintTtsProfileHint = () => {
+        if (!ttsProfileHintEl) return;
+        const name = currentTtsProfileName();
+        const key = normalizeVoiceProfileKey(name);
+        const voice = (settings().ttsVoiceProfiles || {})[key] || settings().ttsVoice || 'af_heart';
+        ttsProfileHintEl.innerHTML = name
+            ? `Voice profile for <strong>${escapeHtml(name)}</strong>: <code>${escapeHtml(voice)}</code>. Change picker to update this character.`
+            : 'Voices populate from <code>/tts/voices</code>. Change picker to set the global fallback voice.';
+    };
 
     if (ttsAutoEl) {
         ttsAutoEl.checked = !!s.ttsAutoReadAi;
@@ -2511,6 +2720,14 @@ function buildSettingsPanel() {
             ttsVoiceEl.appendChild(opt);
             ttsVoiceEl.value = s.ttsVoice;
         }
+        const profileVoice = (s.ttsVoiceProfiles || {})[normalizeVoiceProfileKey(currentTtsProfileName())];
+        if (profileVoice && profileVoice !== ttsVoiceEl.value) {
+            const opt = document.createElement('option');
+            opt.value = profileVoice;
+            opt.textContent = profileVoice;
+            ttsVoiceEl.appendChild(opt);
+            ttsVoiceEl.value = profileVoice;
+        }
         fetchTtsVoices().then(voices => {
             if (!voices || !voices.length) return;
             // Replace options with server-provided list. Preserve current
@@ -2524,11 +2741,12 @@ function buildSettingsPanel() {
                 ttsVoiceEl.appendChild(opt);
             }
             ttsVoiceEl.value = voices.some(v => (v.id || v.name) === prev) ? prev : (voices[0].id || voices[0].name || 'af_heart');
-            // Persist if the previous saved id is gone from the list.
-            if (s.ttsVoice !== ttsVoiceEl.value) {
+            // Persist global fallback only when no character profile is active.
+            if (!profileVoice && s.ttsVoice !== ttsVoiceEl.value) {
                 s.ttsVoice = ttsVoiceEl.value;
                 saveSettings();
             }
+            paintTtsProfileHint();
         }).catch(e => {
             // Backend missing — keep the single af_heart fallback. One toast
             // (deduped via notifyTtsMissing) only on user-initiated calls.
@@ -2536,8 +2754,12 @@ function buildSettingsPanel() {
         });
         ttsVoiceEl.addEventListener('change', () => {
             s.ttsVoice = ttsVoiceEl.value || 'af_heart';
+            const profileName = rememberTtsVoiceForCurrentProfile(s.ttsVoice);
             saveSettings();
+            paintTtsProfileHint();
+            if (profileName) toast('success', `Saved TTS voice for ${profileName}`);
         });
+        paintTtsProfileHint();
     }
 
     if (ttsTestEl) {
@@ -2547,17 +2769,12 @@ function buildSettingsPanel() {
             ttsTestEl.textContent = 'Testing…';
             ttsTestEl.setAttribute('disabled', 'disabled');
             try {
-                const blob = await fetchTts(sample, settings().ttsVoice || 'af_heart');
+                const blob = await fetchTts(sample, (settings().ttsVoiceProfiles || {})[normalizeVoiceProfileKey(currentTtsProfileName())] || settings().ttsVoice || 'af_heart');
                 ttsBackendAvailable = true;
                 stopTts();
-                const url = URL.createObjectURL(blob);
-                currentTtsBlobUrl = url;
-                const audio = new Audio(url);
-                currentTtsAudio = audio;
-                audio.addEventListener('ended', () => {
+                const audio = await createAndPlayTtsAudio(blob, () => {
                     if (currentTtsAudio === audio) stopTts();
                 });
-                await audio.play();
             } catch (e) {
                 const status = e?.status || 0;
                 if (status === 404 || status === 501 || status === 503 || status === 0) {

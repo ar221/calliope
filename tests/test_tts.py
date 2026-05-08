@@ -136,6 +136,7 @@ def test_synthesize_returns_audio_bytes(mod):
     assert sent == {"text": "hello world", "voice": "af_heart", "speed": 1.0}
     assert call_req.full_url.endswith("/synthesize")
     assert call_req.method == "POST"
+    assert mocked.call_args.kwargs["timeout"] == mod.KOKORO_REQUEST_TIMEOUT
 
 
 def test_synthesize_raises_runtime_error_on_transport_failure(mod):

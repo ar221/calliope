@@ -232,7 +232,7 @@ KOKORO_IDLE_SHUTDOWN_SECONDS = int(os.environ.get("KOKORO_IDLE_SHUTDOWN_SECONDS"
 KOKORO_IDLE_SHUTDOWN_DISABLED = bool(os.environ.get("KOKORO_IDLE_SHUTDOWN_DISABLED"))
 KOKORO_PROBE_TIMEOUT = 1.0
 KOKORO_BOOT_TIMEOUT = 10.0
-KOKORO_REQUEST_TIMEOUT = 60.0
+KOKORO_REQUEST_TIMEOUT = float(os.environ.get("KOKORO_REQUEST_TIMEOUT", "240"))
 KOKORO_VOICES_TTL_SECONDS = 60.0
 TTS_MAX_TEXT_CHARS = 5000
 
@@ -270,6 +270,8 @@ st_state: dict = {
     "characterName": "",
     "personaId": "",
     "lastAiMessage": "",
+    "sceneContinuity": "",
+    "sceneContinuityMeta": "",
     "mode": "",
     "sourceDevice": "",
     "lastUpdated": 0.0,  # unix timestamp
@@ -2265,11 +2267,44 @@ def snapshot_state() -> dict:
     return snap
 
 
+def sanitize_scene_continuity(value: object) -> str:
+    """Keep compact scene facts; drop tracker config/template noise."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    # Older bridge builds could append WTracker config after the useful SCT
+    # block. Strip from the first obvious config/template marker onward.
+    markers = (
+        "\ntracker:", " tracker: enabled:", " mesTrackerTemplate:",
+        " generateContextTemplate:", " characterDescriptionTemplate:",
+        "\nscene: version:", " scene: version:",
+    )
+    cut = len(text)
+    for marker in markers:
+        idx = text.find(marker)
+        if idx != -1:
+            cut = min(cut, idx)
+    text = text[:cut].strip()
+    lines = []
+    for line in text.splitlines():
+        compact = line.strip()
+        if not compact:
+            continue
+        hay = compact.lower()
+        if any(k in hay for k in (
+            "mestrackertemplate", "generatecontexttemplate",
+            "characterdescriptiontemplate", "selectedcompletionpreset",
+        )):
+            continue
+        lines.append(compact)
+    return "\n".join(lines)[:2000]
+
+
 def update_state(payload: dict) -> dict:
     """Merge incoming ST state payload. Returns snapshot after merge."""
     allowed_keys = {
         "chatId", "chatType", "characterId", "characterName",
-        "personaId", "lastAiMessage", "mode", "sourceDevice",
+        "personaId", "lastAiMessage", "sceneContinuity", "sceneContinuityMeta", "mode", "sourceDevice",
     }
     with state_lock:
         for k in allowed_keys:
@@ -2279,6 +2314,12 @@ def update_state(payload: dict) -> dict:
                 if k == "lastAiMessage" and isinstance(val, str):
                     # cap to 4000 chars so phone UI receives a reasonable blob
                     st_state[k] = val[:4000]
+                elif k == "sceneContinuity":
+                    # compact tracker state; enough for location/clothing/position
+                    # without bloating every RP formatter request.
+                    st_state[k] = sanitize_scene_continuity(val)
+                elif k == "sceneContinuityMeta" and isinstance(val, str):
+                    st_state[k] = val[:1000]
                 elif val is None:
                     st_state[k] = ""
                 else:
@@ -2475,6 +2516,7 @@ def format_rp(text: str, mode: int = 1, context: str = "",
                persona_id: str = "", use_rules: bool = False,
                prose_format: bool = False, character_id: str = "",
                chat_context: str = "",
+               scene_continuity: str = "",
                system_prompt_override: str = "",
                endpoint_override: str = "",
                skip_persona_character: bool = False,
@@ -2490,6 +2532,7 @@ def format_rp(text: str, mode: int = 1, context: str = "",
     skip_persona_character skips the persona/character injection blocks so the
     caller (persona_pov step) can build its own framing.
     user_content_override bypasses the default user-content assembly entirely.
+    scene_continuity is compact visual/spatial state from ST extensions.
 
     request_id: when non-empty, request `stream: true` from the proxy and emit
     `dictation-token` SSE events with {requestId, delta, done} as tokens
@@ -2547,6 +2590,13 @@ def format_rp(text: str, mode: int = 1, context: str = "",
         user_content = user_content_override
     else:
         user_content = ""
+
+        if mode == 2 and scene_continuity.strip():
+            user_content += (
+                "[SCENE CONTINUITY from SillyTavern tracker — respect these current visual/spatial facts; "
+                "do NOT narrate them unless relevant to the dictated line:]\n"
+                + scene_continuity.strip()[:2000] + "\n\n"
+            )
 
         # Add ST chat history context if available (most authoritative, goes first)
         if mode == 2 and chat_context:
@@ -2706,7 +2756,26 @@ DEFAULT_MODES: list[dict] = [
         "whisper_model": DEFAULT_MODEL,
         "pipeline": ["whisper", "hallucination_filter", "command_dispatch", "vocab_correct", "disfluency_clean", "persona_pov"],
         "system_prompt": "",  # built dynamically from persona + character
-        "temperature": 0.7,
+        "temperature": 0.4,
+        "preset": "pyrite",
+        "use_persona": True,
+        "use_character": True,
+        "use_chat_context": True,
+        "use_rules": False,
+    },
+    {
+        "id": "narrator_past",
+        "label": "Narrator Past",
+        "icon": "book-open",
+        "whisper_model": DEFAULT_MODEL,
+        "pipeline": ["whisper", "hallucination_filter", "command_dispatch", "vocab_correct", "disfluency_clean", "rp_enhance"],
+        "system_prompt": (
+            "Rewrite dictated speech into third-person past-tense narration for the current SillyTavern scene. "
+            "Keep the speaker's intent and continuity, but convert first-person actions into clean third-person prose. "
+            "Use past tense. Preserve dialogue in quotes when the user dictated spoken words. "
+            "Do not continue the scene, do not answer as the character, and do not add new events. Output only the rewrite."
+        ),
+        "temperature": 0.4,
         "preset": "pyrite",
         "use_persona": True,
         "use_character": True,
@@ -3486,7 +3555,8 @@ def build_whisper_prompt(character_id: str = "") -> str:
 
 
 # ─── Phase 2: Pipeline runner ────────────────────────────
-def _build_persona_pov_prompt(persona: dict, character: dict, chat_context: str) -> tuple[str, str]:
+def _build_persona_pov_prompt(persona: dict, character: dict, chat_context: str,
+                              scene_continuity: str = "") -> tuple[str, str]:
     """Build the (system_prompt, user_content) pair for persona_pov mode."""
     persona_name = persona.get("name", "the persona")
     character_name = character.get("name", "the character")
@@ -3500,6 +3570,12 @@ def _build_persona_pov_prompt(persona: dict, character: dict, chat_context: str)
     char_card = (character.get("card") or "").strip()
     if char_card:
         sections.append(char_card)
+    if scene_continuity.strip():
+        sections.append(
+            "Current scene continuity from SillyTavern tracker:\n"
+            + scene_continuity.strip()[:2000]
+            + "\nRespect these visual/spatial facts. Do not restate them unless relevant."
+        )
     if chat_context:
         sections.append("Recent chat log:\n" + chat_context)
     sections.append(
@@ -3507,6 +3583,15 @@ def _build_persona_pov_prompt(persona: dict, character: dict, chat_context: str)
         f"addressing {character_name}, consistent with the tone of the ongoing chat. "
         f"Do NOT respond as {character_name}. Only polish what was dictated. "
         f"Preserve intent exactly. Output only the rewrite."
+    )
+    sections.append(
+        "Voice tuning examples:\n"
+        "Input: i missed you so much\n"
+        "Output: I missed you so much.\n"
+        "Input: come here and kiss me\n"
+        "Output: Come here and kiss me.\n"
+        "Keep the persona's cadence, but stay close to the dictated words. "
+        "Do not add extra actions, reactions, or new scene detail."
     )
     system_prompt = "\n\n".join(sections)
     return system_prompt, ""
@@ -3517,6 +3602,7 @@ def run_pipeline(text: str, mode: dict,
                  persona_id: str = "",
                  character_id: str = "",
                  chat_context: str = "",
+                 scene_continuity: str = "",
                  use_rules: bool = False,
                  prose_format: bool = False,
                  provider: str = DEFAULT_FORMATTER_PROVIDER,
@@ -3667,6 +3753,7 @@ def run_pipeline(text: str, mode: dict,
                 prose_format=prose_format,
                 character_id=character_id if mode.get("use_character") else "",
                 chat_context=chat_context if mode.get("use_chat_context") else "",
+                scene_continuity=scene_continuity,
                 system_prompt_override=system,
                 endpoint_override="/v1/messages",
                 temperature=mode.get("temperature"),
@@ -3689,6 +3776,7 @@ def run_pipeline(text: str, mode: dict,
                 prose_format=prose_format,
                 character_id=character_id if mode.get("use_character") else "",
                 chat_context=chat_context if mode.get("use_chat_context") else "",
+                scene_continuity=scene_continuity,
                 system_prompt_override=system,
                 endpoint_override=endpoint,
                 temperature=mode.get("temperature"),
@@ -3716,6 +3804,7 @@ def run_pipeline(text: str, mode: dict,
                     prose_format=prose_format,
                     character_id=character_id,
                     chat_context=chat_context,
+                    scene_continuity=scene_continuity,
                     temperature=mode.get("temperature"),
                     provider=provider,
                     request_id=request_id,  # MVP-13
@@ -3733,7 +3822,7 @@ def run_pipeline(text: str, mode: dict,
 
             character = {"name": char_name, "card": char_card_text}
             system_prompt, _unused_user_override = _build_persona_pov_prompt(
-                persona, character, chat_context,
+                persona, character, chat_context, scene_continuity,
             )
             user_content = f"The dictated line:\n{out}"
             endpoint = "/v1/pyrite/messages" if mode.get("preset") == "pyrite" else "/v1/messages"
@@ -8369,8 +8458,14 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         chat_source = data.get("chat_source", "")
         persona_id = data.get("persona", "")
         character_id = data.get("character", "")
+        scene_continuity = str(data.get("sceneContinuity") or "")[:2000]
         use_rules = bool(data.get("rules", False))
         prose_format = bool(data.get("prose", False))
+
+        if not scene_continuity:
+            state_snap = snapshot_state()
+            if state_snap.get("fresh"):
+                scene_continuity = str(state_snap.get("sceneContinuity") or "")[:2000]
 
         # Build chat context if source is not manual
         chat_context = ""
@@ -8425,6 +8520,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             persona_id=persona_id,
             character_id=character_id,
             chat_context=chat_context,
+            scene_continuity=scene_continuity,
             use_rules=use_rules,
             prose_format=prose_format,
             provider=provider,
@@ -8519,6 +8615,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         character_id = params.get("character", [""])[0]
         use_rules = params.get("rules", ["0"])[0] == "1"
         prose_format = params.get("prose", ["0"])[0] == "1"
+        scene_continuity = ""
 
         # Phase 3: fill in blanks from state when `use_state=1` and state is fresh.
         # Explicit params always take precedence over state (manual override wins).
@@ -8532,6 +8629,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             if not chat_source and state_snap.get("chatId"):
                 ctype = state_snap.get("chatType", "individual") or "individual"
                 chat_source = f"{ctype}:{state_snap['chatId']}"
+            scene_continuity = str(state_snap.get("sceneContinuity") or "")[:2000]
 
         # chat_id tag for per-chat transcript filtering (Phase 3)
         chat_id_for_entry = ""
@@ -8665,6 +8763,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 persona_id=persona_id,
                 character_id=character_id,
                 chat_context=chat_context,
+                scene_continuity=scene_continuity,
                 use_rules=use_rules,
                 prose_format=prose_format,
                 provider=provider,
