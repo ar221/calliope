@@ -125,3 +125,15 @@
     font-size: 0.85em;
     line-height: 1.35;
 }
+
+/* POL-3: low-confidence "did you mean?" banner */
+#dictation_bridge_lowconf_banner .dbb-lc-chip:hover,
+#dictation_bridge_lowconf_banner .dbb-lc-chip:focus {
+    background: rgba(255, 182, 72, 0.14);
+    outline: none;
+}
+
+#dictation_bridge_lowconf_popover .dbb-lc-alt:hover,
+#dictation_bridge_lowconf_popover .dbb-lc-keep:hover {
+    background: rgba(255, 182, 72, 0.12);
+}

@@ -424,6 +424,261 @@ function handleDictationStateEvent(data) {
     }
 }
 
+// ─── POL-3: low-confidence "did you mean?" banner ─────────────────────────
+// Server adds `low_confidence_spans: [{text, start, end, confidence,
+// alternatives?: string[]}]` to the /transcribe response and the
+// dictation-result SSE event. We render a slim banner above the textarea:
+//
+//   Low confidence: [wear] [shore] [lithium]   ✕
+//
+// Each chip is a button: click → small popover with top-3 alternatives +
+// "Keep original". Selecting an alternative replaces the word in the
+// textarea (best-effort whole-word replacement, preserving cursor).
+//
+// This is the v1 banner-style implementation. The full overlay version
+// (positioned wavy underline aligned with textarea content) is deferred
+// to Phase 5 v2 — see roadmap POL-3 for the rationale.
+const LOWCONF_BANNER_ID = 'dictation_bridge_lowconf_banner';
+const LOWCONF_POPOVER_ID = 'dictation_bridge_lowconf_popover';
+const LOWCONF_BANNER_HIDE_MS = 10_000; // auto-dismiss after 10s
+
+let lowConfBannerTimer = null;
+let lowConfBannerInputBound = false;
+
+function clearLowConfBanner() {
+    if (lowConfBannerTimer) { clearTimeout(lowConfBannerTimer); lowConfBannerTimer = null; }
+    const el = document.getElementById(LOWCONF_BANNER_ID);
+    if (el) try { el.remove(); } catch {}
+    closeLowConfPopover();
+}
+
+function closeLowConfPopover() {
+    const pop = document.getElementById(LOWCONF_POPOVER_ID);
+    if (pop) try { pop.remove(); } catch {}
+}
+
+/** Replace first whole-word occurrence of `word` in #send_textarea with `replacement`. */
+function replaceWordInTextarea(word, replacement) {
+    const ta = document.getElementById('send_textarea');
+    if (!ta || !word) return false;
+    const value = ta.value || '';
+    // Word-boundary match, case-insensitive, first occurrence only.
+    const re = new RegExp(`\\b${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+    const m = value.match(re);
+    if (!m || m.index == null) return false;
+    pushUndoSnapshot('lowconf-replace');
+    const start = m.index;
+    const end = start + m[0].length;
+    // setRangeText is the cleanest path that preserves cursor placement.
+    try {
+        ta.focus();
+        ta.setSelectionRange(start, end);
+        if (typeof ta.setRangeText === 'function') {
+            ta.setRangeText(replacement, start, end, 'end');
+        } else {
+            ta.value = value.slice(0, start) + replacement + value.slice(end);
+            ta.setSelectionRange(start + replacement.length, start + replacement.length);
+        }
+    } catch {
+        ta.value = value.slice(0, start) + replacement + value.slice(end);
+    }
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    return true;
+}
+
+async function fetchWordAlternatives(word, contextText) {
+    const cfg = settings();
+    const url = `${cfg.serverUrl.replace(/\/+$/, '')}/word-alternatives`;
+    try {
+        const res = await fetch(url, {
+            method: 'POST',
+            mode: 'cors',
+            cache: 'no-store',
+            headers: { 'Content-Type': 'application/json', ...authHeaders() },
+            body: JSON.stringify({ word, context: contextText || '' }),
+        });
+        if (!res.ok) return [];
+        const data = await res.json();
+        if (Array.isArray(data?.alternatives)) return data.alternatives.slice(0, 3);
+        return [];
+    } catch (e) {
+        WARN('word-alternatives fetch failed', e?.message || e);
+        return [];
+    }
+}
+
+function buildLowConfPopover(word, alternatives, anchorRect) {
+    closeLowConfPopover();
+    const pop = document.createElement('div');
+    pop.id = LOWCONF_POPOVER_ID;
+    pop.style.cssText = [
+        'position:fixed',
+        `left:${Math.max(8, Math.round(anchorRect.left))}px`,
+        `top:${Math.max(8, Math.round(anchorRect.bottom + 6))}px`,
+        'z-index:10002',
+        'background:#1C150C',
+        'border:1px solid #FFB648',
+        'border-radius:2px',
+        'padding:8px',
+        'min-width:180px',
+        'max-width:280px',
+        'box-shadow:0 6px 18px rgba(0,0,0,0.45)',
+        'font-size:12px',
+        'color:#C9B28B',
+    ].join(';');
+    const altRows = (alternatives || []).map(a => `
+        <div class="dbb-lc-alt" data-alt="${escapeHtml(a)}" style="padding:4px 6px;cursor:pointer;border-radius:2px">${escapeHtml(a)}</div>
+    `).join('');
+    pop.innerHTML = `
+        <div style="font-size:11px;color:#98876F;margin-bottom:4px">Replace &ldquo;${escapeHtml(word)}&rdquo; with:</div>
+        <div class="dbb-lc-list">
+            ${altRows || '<div style="opacity:0.65;padding:4px 6px">No alternatives available</div>'}
+            <div class="dbb-lc-keep" style="padding:4px 6px;cursor:pointer;border-top:1px solid rgba(255, 182, 72, 0.18);margin-top:4px;color:#98876F">Keep original</div>
+        </div>
+    `;
+    document.body.appendChild(pop);
+
+    // Hover affordance.
+    pop.querySelectorAll('.dbb-lc-alt, .dbb-lc-keep').forEach(el => {
+        el.addEventListener('mouseenter', () => { el.style.background = 'rgba(255, 182, 72, 0.12)'; });
+        el.addEventListener('mouseleave', () => { el.style.background = 'transparent'; });
+    });
+
+    pop.querySelectorAll('.dbb-lc-alt').forEach(el => {
+        el.addEventListener('click', () => {
+            const alt = el.getAttribute('data-alt') || '';
+            if (alt && replaceWordInTextarea(word, alt)) {
+                toast('success', `Replaced &ldquo;${word}&rdquo; → &ldquo;${alt}&rdquo;`);
+            }
+            closeLowConfPopover();
+            // Remove the chip whose word we resolved.
+            const chip = document.querySelector(`#${LOWCONF_BANNER_ID} [data-word="${CSS.escape(word.toLowerCase())}"]`);
+            if (chip) try { chip.remove(); } catch {}
+            const banner = document.getElementById(LOWCONF_BANNER_ID);
+            if (banner && !banner.querySelector('.dbb-lc-chip')) clearLowConfBanner();
+        });
+    });
+    pop.querySelector('.dbb-lc-keep')?.addEventListener('click', () => {
+        const chip = document.querySelector(`#${LOWCONF_BANNER_ID} [data-word="${CSS.escape(word.toLowerCase())}"]`);
+        if (chip) try { chip.remove(); } catch {}
+        closeLowConfPopover();
+        const banner = document.getElementById(LOWCONF_BANNER_ID);
+        if (banner && !banner.querySelector('.dbb-lc-chip')) clearLowConfBanner();
+    });
+
+    // Clicks outside dismiss.
+    setTimeout(() => {
+        document.addEventListener('click', onDocClickClosePopover, { once: true, capture: true });
+    }, 0);
+}
+
+function onDocClickClosePopover(e) {
+    const pop = document.getElementById(LOWCONF_POPOVER_ID);
+    if (!pop) return;
+    if (pop.contains(e.target)) {
+        // Re-arm if the click was inside the popover (keep open).
+        document.addEventListener('click', onDocClickClosePopover, { once: true, capture: true });
+        return;
+    }
+    closeLowConfPopover();
+}
+
+/**
+ * POL-3 entry point: render the low-confidence banner from a list of
+ * spans (shape: {text, alternatives?, confidence?}). De-dups by word,
+ * skips empty alternatives, no-ops if list is empty.
+ */
+function renderLowConfBanner(spans) {
+    clearLowConfBanner();
+    if (!Array.isArray(spans) || spans.length === 0) return;
+
+    // De-dup by lowercased word; preserve first occurrence's alternatives.
+    const seen = new Map();
+    for (const s of spans) {
+        const word = String(s?.text || '').trim();
+        if (!word) continue;
+        const key = word.toLowerCase();
+        if (seen.has(key)) continue;
+        const alts = Array.isArray(s.alternatives) ? s.alternatives.filter(Boolean).slice(0, 3) : [];
+        seen.set(key, { word, alts });
+    }
+    if (seen.size === 0) return;
+
+    const ta = document.getElementById('send_textarea');
+    if (!ta || !ta.parentElement) return;
+
+    const banner = document.createElement('div');
+    banner.id = LOWCONF_BANNER_ID;
+    banner.setAttribute('role', 'status');
+    banner.style.cssText = [
+        'display:flex',
+        'flex-wrap:wrap',
+        'align-items:center',
+        'gap:6px',
+        'box-sizing:border-box',
+        'width:100%',
+        'padding:6px 10px',
+        'margin:0 0 4px 0',
+        'background:#1C150C',
+        'border:1px solid rgba(255, 182, 72, 0.35)',
+        'border-radius:2px',
+        'color:#C9B28B',
+        'font-size:12px',
+    ].join(';');
+
+    const labelHtml = `<span style="color:#FFB648;font-weight:600">Low confidence:</span>`;
+    const chips = [...seen.values()].map(({ word, alts }) => `
+        <button type="button"
+                class="dbb-lc-chip"
+                data-word="${escapeHtml(word.toLowerCase())}"
+                data-alts="${escapeHtml(JSON.stringify(alts))}"
+                title="Click to choose alternative"
+                style="padding:2px 8px;border:1px solid rgba(255, 182, 72, 0.55);background:transparent;color:#FFB648;border-radius:2px;cursor:pointer;font-size:12px;font-family:inherit;text-decoration:underline wavy var(--ap-amber, #FFB648);text-decoration-thickness:1px">${escapeHtml(word)}</button>
+    `).join('');
+    const dismissHtml = `<button type="button" id="dbb_lc_dismiss" title="Dismiss (Esc)" style="margin-left:auto;background:transparent;border:0;color:#98876F;cursor:pointer;font-size:14px;padding:0 4px">&times;</button>`;
+
+    banner.innerHTML = `${labelHtml}${chips}${dismissHtml}`;
+    ta.parentElement.insertBefore(banner, ta);
+
+    // Wire chip clicks.
+    banner.querySelectorAll('.dbb-lc-chip').forEach(chip => {
+        chip.addEventListener('click', async (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            const word = chip.textContent.trim();
+            let alts = [];
+            try { alts = JSON.parse(chip.getAttribute('data-alts') || '[]'); } catch {}
+            // If server didn't ship alternatives, fetch fresh — uses bearer auth.
+            if (!alts || alts.length === 0) {
+                const ctxText = (document.getElementById('send_textarea')?.value || '').slice(0, 400);
+                alts = await fetchWordAlternatives(word, ctxText);
+            }
+            const rect = chip.getBoundingClientRect();
+            buildLowConfPopover(word, alts, rect);
+        });
+    });
+
+    banner.querySelector('#dbb_lc_dismiss')?.addEventListener('click', clearLowConfBanner);
+
+    // Auto-dismiss after 10s, on textarea input, or Esc.
+    lowConfBannerTimer = setTimeout(clearLowConfBanner, LOWCONF_BANNER_HIDE_MS);
+    if (!lowConfBannerInputBound) {
+        ta.addEventListener('input', onTextareaInputDismissBanner, { passive: true });
+        document.addEventListener('keydown', onEscDismissBanner);
+        lowConfBannerInputBound = true;
+    }
+}
+
+function onTextareaInputDismissBanner() {
+    if (document.getElementById(LOWCONF_BANNER_ID)) clearLowConfBanner();
+}
+
+function onEscDismissBanner(e) {
+    if (e.key === 'Escape' && document.getElementById(LOWCONF_BANNER_ID)) {
+        clearLowConfBanner();
+    }
+}
+
 // ─── POL-1: undo stack + voice command dispatcher ─────────────────────────
 // Per Agent 4 §5.4: undo stack lives in the extension, not the server.
 // Each writeToTextarea() snapshot pushes {prevValue, ts} (capped at 8).
@@ -851,6 +1106,18 @@ function connectSSE() {
         } else if (window.toastr) {
             window.toastr.success('Received from phone', 'Dictation Bridge', { timeOut: 1500 });
         }
+
+        // POL-3: render low-confidence "did you mean?" banner if the server
+        // tagged any spans below the confidence threshold. Banner auto-hides
+        // on textarea input, Esc, or after 10s.
+        if (Array.isArray(data.low_confidence_spans) && data.low_confidence_spans.length) {
+            try { renderLowConfBanner(data.low_confidence_spans); }
+            catch (err) { WARN('lowconf banner render failed', err?.message || err); }
+        } else if (Array.isArray(data.lowConfidenceSpans) && data.lowConfidenceSpans.length) {
+            // Tolerate camelCase server payload as well.
+            try { renderLowConfBanner(data.lowConfidenceSpans); }
+            catch (err) { WARN('lowconf banner render failed', err?.message || err); }
+        }
     });
 
     sseSource.addEventListener('error', (e) => {
@@ -1102,6 +1369,12 @@ function onWindowMessage(event) {
             if (data.formatting_skipped && window.toastr) {
                 const reason = data.formatting_reason ? `: ${data.formatting_reason}` : '';
                 window.toastr.warning(`RP formatting skipped${reason}. Raw transcript used.`, 'Dictation Bridge');
+            }
+            // POL-3: low-confidence banner if the server tagged spans.
+            const spans = data.low_confidence_spans || data.lowConfidenceSpans;
+            if (Array.isArray(spans) && spans.length) {
+                try { renderLowConfBanner(spans); }
+                catch (err) { WARN('lowconf banner render failed', err?.message || err); }
             }
             // For popups, close so the user is back in ST. For iframes, leave open
             // so they can see the result — they close via the X or backdrop.
