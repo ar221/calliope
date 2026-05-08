@@ -5075,6 +5075,35 @@ WEB_UI = r"""<!DOCTYPE html>
 <div class="toast" id="toast"></div>
 
 <script>
+// Hotfix: token bootstrap. Read ?token= from URL OR sessionStorage; wrap
+// fetch + EventSource to attach Authorization: Bearer / ?token= for all
+// API calls. Loopback clients bypass auth server-side; this is for LAN
+// access (phone, ST popup at LAN IP).
+(function () {
+  const url_tok = new URLSearchParams(location.search).get('token') || '';
+  const stored = sessionStorage.getItem('dictationToken') || '';
+  const TOKEN = url_tok || stored;
+  if (url_tok) sessionStorage.setItem('dictationToken', url_tok);
+  if (!TOKEN) return;
+  const _origFetch = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    init = init || {};
+    const headers = new Headers(init.headers || {});
+    if (!headers.has('Authorization')) headers.set('Authorization', 'Bearer ' + TOKEN);
+    init.headers = headers;
+    return _origFetch(input, init);
+  };
+  const _OrigES = window.EventSource;
+  window.EventSource = function (url, opts) {
+    try {
+      const u = new URL(url, location.origin);
+      if (!u.searchParams.has('token')) u.searchParams.set('token', TOKEN);
+      url = u.toString();
+    } catch (e) { /* fall through with original url */ }
+    return new _OrigES(url, opts);
+  };
+})();
+
 let mediaRecorder = null;
 let audioChunks = [];
 let recording = false;
@@ -7156,6 +7185,9 @@ PWA_MANIFEST = json.dumps({
 # ─── HTTP Handler ─────────────────────────────────────────
 # Endpoints exempt from bearer-token auth (still loopback-bypassed).
 _AUTH_EXEMPT_PATHS = frozenset({
+    "/",                # Embedded phone UI HTML — bootstrap surface;
+                        # JS wraps fetch/EventSource to attach token from
+                        # ?token= query or sessionStorage on every API call.
     "/health",
     "/manifest.json",
 })
