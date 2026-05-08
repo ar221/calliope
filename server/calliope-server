@@ -168,6 +168,9 @@ _CONFIG_EXT = "yaml" if _HAVE_YAML else "json"
 MODES_FILE = DATA_DIR / f"modes.{_CONFIG_EXT}"
 VOCAB_FILE = DATA_DIR / f"vocab.{_CONFIG_EXT}"
 CHAR_MODES_FILE = DATA_DIR / f"char-modes.{_CONFIG_EXT}"
+# Phase 5 / POL-1 — voice macro grammar persistence. Optional user file;
+# absent → hardcoded defaults (see DEFAULT_VOICE_SENTINEL / DEFAULT_VOICE_INTENTS).
+VOICE_MACROS_FILE = DATA_DIR / f"voice_macros.{_CONFIG_EXT}"
 WHISPER_PROMPT_TOKEN_CAP = 200  # approx; we truncate by word count
 
 # Phase 3 — ST state sync
@@ -2210,7 +2213,7 @@ DEFAULT_MODES: list[dict] = [
         "label": "Plain",
         "icon": "mic",
         "whisper_model": DEFAULT_MODEL,
-        "pipeline": ["whisper", "hallucination_filter"],
+        "pipeline": ["whisper", "hallucination_filter", "command_dispatch"],
         "system_prompt": "",
         "temperature": 0.0,
         "preset": "default",
@@ -2224,7 +2227,7 @@ DEFAULT_MODES: list[dict] = [
         "label": "Grammar Clean",
         "icon": "broom",
         "whisper_model": DEFAULT_MODEL,
-        "pipeline": ["whisper", "hallucination_filter", "vocab_correct", "grammar_clean"],
+        "pipeline": ["whisper", "hallucination_filter", "command_dispatch", "vocab_correct", "grammar_clean"],
         "system_prompt": GRAMMAR_CLEAN_SYSTEM,
         "temperature": 0.2,
         "preset": "default",
@@ -2238,7 +2241,7 @@ DEFAULT_MODES: list[dict] = [
         "label": "RP Format",
         "icon": "italic",
         "whisper_model": DEFAULT_MODEL,
-        "pipeline": ["whisper", "hallucination_filter", "vocab_correct", "rp_format"],
+        "pipeline": ["whisper", "hallucination_filter", "command_dispatch", "vocab_correct", "rp_format"],
         "system_prompt": "",  # empty → use built-in RP_SYSTEM_FORMAT
         "temperature": 0.4,
         "preset": "default",
@@ -2253,7 +2256,7 @@ DEFAULT_MODES: list[dict] = [
         "icon": "sparkles",
         "whisper_model": DEFAULT_MODEL,
         # disfluency_clean merged into rp_enhance system prompt — see ADR-9 / Agent 3 §10.
-        "pipeline": ["whisper", "hallucination_filter", "vocab_correct", "rp_enhance"],
+        "pipeline": ["whisper", "hallucination_filter", "command_dispatch", "vocab_correct", "rp_enhance"],
         "system_prompt": "",  # empty → use built-in RP_SYSTEM_ENHANCE
         "temperature": 0.7,
         "preset": "pyrite",
@@ -2267,13 +2270,31 @@ DEFAULT_MODES: list[dict] = [
         "label": "Persona POV",
         "icon": "user",
         "whisper_model": DEFAULT_MODEL,
-        "pipeline": ["whisper", "hallucination_filter", "vocab_correct", "disfluency_clean", "persona_pov"],
+        "pipeline": ["whisper", "hallucination_filter", "command_dispatch", "vocab_correct", "disfluency_clean", "persona_pov"],
         "system_prompt": "",  # built dynamically from persona + character
         "temperature": 0.7,
         "preset": "pyrite",
         "use_persona": True,
         "use_character": True,
         "use_chat_context": True,
+        "use_rules": False,
+    },
+    {
+        # POL-1 — pure command mode. No vocab/format steps; whisper output
+        # is fed straight to the regex dispatcher. Useful as a phone-side
+        # "voice cockpit" mode that always emits an SSE command + drops the
+        # canonical text (no chat injection).
+        "id": "command",
+        "label": "Command",
+        "icon": "terminal",
+        "whisper_model": DEFAULT_MODEL,
+        "pipeline": ["whisper", "hallucination_filter", "command_dispatch"],
+        "system_prompt": "",
+        "temperature": 0.0,
+        "preset": "default",
+        "use_persona": False,
+        "use_character": False,
+        "use_chat_context": False,
         "use_rules": False,
     },
 ]
@@ -2542,6 +2563,273 @@ def hallucination_filter(text: str) -> tuple[str, bool, str]:
     return text, False, ""
 
 
+# ─── Phase 5 / POL-1 — Voice command grammar ─────────────
+# A regex pre-pass on the raw whisper output (runs in-pipeline AFTER
+# `hallucination_filter`, BEFORE `vocab_correct`). Sentinel-prefixed
+# utterances (`computer: ...`, `hey computer ...`) match a small set
+# of intent verbs and emit a `dictation-command` SSE event.
+#
+# The frontends (ST extension, phone PWA) translate intents to UI
+# actions: `send` → click `#send_but`, `swipe` → click `.mes_swipe_right`,
+# etc. The server only classifies + routes; it never fires DOM clicks.
+#
+# Two sentinels live separately:
+#   1. The voice command sentinel ("computer" by default), routed through
+#      `command_dispatch` as a pipeline step.
+#   2. The legacy `OOC:` / `out of character` ST convention: detected in
+#      `_handle_transcribe` BEFORE the pipeline runs (because it forces a
+#      mode override to `grammar_clean`). See `OOC_PREFIX_RE` below.
+#
+# Reference: ADR-11, Agent 3 §3, vds-roadmap §4 Phase 5 (POL-1).
+
+# Hardcoded fallback sentinel + intent grammar. User override via
+# voice_macros.yaml is hot-reloadable (mtime cache, mirrors load_modes).
+DEFAULT_VOICE_SENTINEL = "computer"
+
+# Each entry: {phrase: [aliases], intent: <name>, args: <static dict>,
+#              args_after?: <key>}. `args_after`, when set, captures any
+# trailing residual after the matched phrase into `args[<key>]` and
+# clears the residual (e.g. `computer regen polish for clarity` →
+# intent=regenerate, args={hint: "polish for clarity"}, residual="").
+DEFAULT_VOICE_INTENTS: list[dict] = [
+    {"phrase": ["send"], "intent": "send"},
+    {"phrase": ["swipe right", "next swipe", "swipe next"],
+     "intent": "swipe", "args": {"direction": "right"}},
+    {"phrase": ["swipe left", "previous swipe", "swipe prev",
+                "swipe previous"],
+     "intent": "swipe", "args": {"direction": "left"}},
+    {"phrase": ["swipe"], "intent": "swipe", "args": {"direction": "right"}},
+    {"phrase": ["regenerate", "regen"], "intent": "regenerate"},
+    {"phrase": ["delete that", "delete last"], "intent": "delete_last"},
+    {"phrase": ["scratch that", "undo"], "intent": "undo"},
+    {"phrase": ["new paragraph"], "intent": "new_paragraph"},
+    {"phrase": ["scene break"], "intent": "scene_break"},
+    {"phrase": ["stop", "cancel"], "intent": "stop"},
+    {"phrase": ["clear"], "intent": "clear"},
+    {"phrase": ["append"], "intent": "append"},
+    {"phrase": ["replace"], "intent": "replace"},
+]
+
+# Pure-command intents short-circuit the pipeline (residual ignored).
+# Mixed intents (`append`, `replace`) keep residual flowing to vocab/format.
+PURE_COMMAND_INTENTS = frozenset({
+    "send", "swipe", "regenerate", "delete_last", "undo",
+    "new_paragraph", "scene_break", "stop", "clear",
+})
+
+# Hot-reloadable voice macros cache (mtime-based, mirrors load_vocab).
+_voice_macros_cache: dict = {
+    "data": {"sentinel": DEFAULT_VOICE_SENTINEL,
+             "intents": list(DEFAULT_VOICE_INTENTS),
+             "regex": None},
+    "mtime": 0.0,
+}
+voice_macros_lock = threading.Lock()
+
+# Module-level seed regex (the spec's "always-available" grammar). Used
+# when no voice_macros.yaml file is present and the user hasn't customised
+# the sentinel.
+COMMAND_RE = re.compile(
+    r"^\s*(?:computer|hey computer)[\s,:.]+"
+    r"(send|swipe(?:\s+(?:left|right|next|prev))?|regenerate|"
+    r"delete that|delete last|new paragraph|scene break|stop|cancel|"
+    r"scratch that|clear|append|replace|undo)\b",
+    re.IGNORECASE,
+)
+
+# Backwards-compat: SillyTavern's OOC convention. Detected separately in
+# `_handle_transcribe` so it can flip the mode override to grammar_clean.
+OOC_PREFIX_RE = re.compile(
+    r"^\s*(?:OOC|out[\s\-]of[\s\-]character)[\s:.]+",
+    re.IGNORECASE,
+)
+
+
+def _build_voice_macros_regex(sentinel: str, intents: list[dict]) -> re.Pattern:
+    """Compile a sentinel + alternation regex from intent definitions.
+
+    Returns a regex with two capture groups: (1) the matched phrase
+    (lowercase-comparable) and (2) the original (untouched) text after
+    the sentinel boundary, used for trailing-residual capture.
+    """
+    sentinel_alts = [re.escape(sentinel.strip())]
+    sentinel_alts.append(re.escape(f"hey {sentinel.strip()}"))
+    sentinel_pat = "(?:" + "|".join(sentinel_alts) + ")"
+
+    # Sort longest first so multi-word phrases match before their
+    # single-word prefixes (e.g. "swipe right" before "swipe").
+    all_phrases: list[str] = []
+    for entry in intents:
+        for p in entry.get("phrase", []) or []:
+            if isinstance(p, str) and p.strip():
+                all_phrases.append(p.strip())
+    all_phrases.sort(key=lambda p: -len(p))
+    if not all_phrases:
+        all_phrases = ["send"]
+    phrase_alts = "|".join(re.escape(p) for p in all_phrases)
+
+    return re.compile(
+        rf"^\s*{sentinel_pat}[\s,:.]+({phrase_alts})\b",
+        re.IGNORECASE,
+    )
+
+
+def _ensure_voice_macros_compiled(state: dict) -> dict:
+    """Populate state['regex'] in-place if missing. Pure setup helper."""
+    if state.get("regex") is None:
+        state["regex"] = _build_voice_macros_regex(
+            state.get("sentinel", DEFAULT_VOICE_SENTINEL),
+            state.get("intents", DEFAULT_VOICE_INTENTS),
+        )
+    return state
+
+
+def load_voice_macros() -> dict:
+    """Return current voice-macro config: {sentinel, intents, regex}.
+
+    Hot-reloads when VOICE_MACROS_FILE mtime changes. Falls back to
+    DEFAULT_VOICE_SENTINEL + DEFAULT_VOICE_INTENTS if file is absent or
+    malformed.
+    """
+    try:
+        mtime = VOICE_MACROS_FILE.stat().st_mtime
+    except FileNotFoundError:
+        with voice_macros_lock:
+            if _voice_macros_cache["mtime"] != 0.0 or _voice_macros_cache["data"].get("regex") is None:
+                _voice_macros_cache["data"] = {
+                    "sentinel": DEFAULT_VOICE_SENTINEL,
+                    "intents": list(DEFAULT_VOICE_INTENTS),
+                    "regex": None,
+                }
+                _voice_macros_cache["mtime"] = 0.0
+            return _ensure_voice_macros_compiled(_voice_macros_cache["data"])
+
+    with voice_macros_lock:
+        if _voice_macros_cache["data"].get("regex") is not None and _voice_macros_cache["mtime"] == mtime:
+            return _voice_macros_cache["data"]
+        try:
+            raw = VOICE_MACROS_FILE.read_bytes()
+            if _HAVE_YAML:
+                parsed = yaml.safe_load(raw) if raw.strip() else {}
+            else:
+                parsed = json.loads(raw) if raw.strip() else {}
+            if not isinstance(parsed, dict):
+                raise ValueError(f"Expected mapping at top of {VOICE_MACROS_FILE}")
+            sentinel = str(parsed.get("sentinel") or DEFAULT_VOICE_SENTINEL).strip() \
+                or DEFAULT_VOICE_SENTINEL
+            raw_intents = parsed.get("intents") or []
+            normalized: list[dict] = []
+            if isinstance(raw_intents, list):
+                for entry in raw_intents:
+                    if not isinstance(entry, dict):
+                        continue
+                    phrases = entry.get("phrase") or []
+                    if isinstance(phrases, str):
+                        phrases = [phrases]
+                    if not phrases:
+                        continue
+                    intent_name = str(entry.get("intent") or "").strip()
+                    if not intent_name:
+                        continue
+                    norm: dict = {
+                        "phrase": [str(p).strip() for p in phrases if str(p).strip()],
+                        "intent": intent_name,
+                    }
+                    if isinstance(entry.get("args"), dict):
+                        norm["args"] = dict(entry["args"])
+                    if entry.get("args_after"):
+                        norm["args_after"] = str(entry["args_after"]).strip()
+                    if norm["phrase"]:
+                        normalized.append(norm)
+            if not normalized:
+                normalized = list(DEFAULT_VOICE_INTENTS)
+            data = {
+                "sentinel": sentinel,
+                "intents": normalized,
+                "regex": _build_voice_macros_regex(sentinel, normalized),
+            }
+        except Exception as e:
+            log.warning(f"Failed to parse {VOICE_MACROS_FILE}: {e} — falling back to defaults")
+            data = {
+                "sentinel": DEFAULT_VOICE_SENTINEL,
+                "intents": list(DEFAULT_VOICE_INTENTS),
+                "regex": _build_voice_macros_regex(
+                    DEFAULT_VOICE_SENTINEL, DEFAULT_VOICE_INTENTS,
+                ),
+            }
+        _voice_macros_cache["data"] = data
+        _voice_macros_cache["mtime"] = mtime
+        return data
+
+
+def command_dispatch(text: str) -> tuple[str, dict | None]:
+    """Pre-pass: detect a sentinel-prefixed voice command in `text`.
+
+    Returns (residual_text, command_dict_or_None).
+      - `command_dict` shape: {intent: str, args: dict, source_text: str,
+                                phrase: str}. None when no command is found.
+      - `residual_text`: text remaining AFTER the matched command phrase.
+        Empty string for pure-command utterances. Falls through to the
+        rest of the pipeline as content for `append` / `replace` etc.
+
+    Sentinel + grammar are user-customisable via VOICE_MACROS_FILE; the
+    module-level `COMMAND_RE` constant remains the seed/fallback when
+    no override exists (see Agent 3 §3).
+    """
+    if not text:
+        return text, None
+    cfg = load_voice_macros()
+    rx: re.Pattern = cfg.get("regex") or COMMAND_RE
+    m = rx.match(text)
+    if not m:
+        return text, None
+    matched_phrase = m.group(1).strip().lower()
+    residual = text[m.end():].strip()
+    # Strip trailing punctuation/whitespace that whisper appends to a
+    # short utterance (e.g. "Computer, send.") — leave content intact when
+    # there is real text after a sentence break.
+    residual = re.sub(r"^[\s,.;:!?]+", "", residual)
+    residual = re.sub(r"^[\s,.;:!?]+$", "", residual)
+
+    # Resolve intent + static args by matching against the configured table.
+    intents = cfg.get("intents") or DEFAULT_VOICE_INTENTS
+    chosen: dict | None = None
+    for entry in intents:
+        phrases_lc = [p.lower() for p in entry.get("phrase", [])]
+        # Compare against the longest matching phrase the regex captured.
+        # Regex alternation prefers earlier alternatives; we pre-sorted by
+        # length when building the pattern, so an exact lookup suffices.
+        if matched_phrase in phrases_lc:
+            chosen = entry
+            break
+    if chosen is None:
+        # Fallback: use the matched phrase itself as the intent name.
+        chosen = {"intent": matched_phrase.replace(" ", "_"), "args": {}}
+
+    args: dict = dict(chosen.get("args") or {})
+    if chosen.get("args_after") and residual:
+        args[chosen["args_after"]] = residual
+        residual = ""
+
+    cmd = {
+        "intent": chosen.get("intent", matched_phrase.replace(" ", "_")),
+        "args": args,
+        "source_text": text,
+        "phrase": matched_phrase,
+    }
+    return residual, cmd
+
+
+def _invalidate_voice_macros_cache() -> None:
+    with voice_macros_lock:
+        _voice_macros_cache["data"] = {
+            "sentinel": DEFAULT_VOICE_SENTINEL,
+            "intents": list(DEFAULT_VOICE_INTENTS),
+            "regex": None,
+        }
+        _voice_macros_cache["mtime"] = 0.0
+
+
 def _applies_to_character(entry: dict, character_id: str) -> bool:
     """Vocab entry's optional `characters` scope check (case-insensitive)."""
     chars = entry.get("characters") or []
@@ -2698,6 +2986,7 @@ def run_pipeline(text: str, mode: dict,
     # owned by the recorder; server emits the rest.
     _STEP_TO_STATE = {
         "hallucination_filter": "hallucination_check",
+        "command_dispatch": "command_dispatch",
         "vocab_correct": "vocab_correct",
         "disfluency_clean": "cleaning_disfluency",
         "grammar_clean": "cleaning_grammar",
@@ -2739,6 +3028,40 @@ def run_pipeline(text: str, mode: dict,
                 log.info("hallucination_filter: dropped utterance — %s", reason)
                 # Short-circuit: empty text signals the frontend to no-op.
                 return "", False, f"hallucination filter dropped: {reason}", ""
+            continue
+
+        if step == "command_dispatch":
+            # POL-1 — sentinel-prefixed voice command pre-pass.
+            # On match: broadcast a `dictation-command` SSE event and either
+            # short-circuit (pure intents) or keep the residual flowing as
+            # content (mixed intents like `append` / `replace`).
+            residual, cmd = command_dispatch(out)
+            if timing is not None:
+                timing[f"step_{step}"] = time.monotonic()
+            if cmd is None:
+                continue
+            try:
+                broadcast_event("dictation-command", {
+                    "requestId": request_id,
+                    "intent": cmd["intent"],
+                    "args": cmd.get("args", {}),
+                    "source_text": cmd.get("source_text", out),
+                    "residual": residual,
+                    "ts": time.time(),
+                })
+            except Exception as _e:  # pragma: no cover — best-effort SSE
+                log.debug("dictation-command emit failed: %s", _e)
+            log.info("command_dispatch: intent=%s residual=%r",
+                     cmd["intent"], residual[:60])
+            if cmd["intent"] in PURE_COMMAND_INTENTS:
+                # Pure command — drop the text; downstream pipeline is bypassed.
+                # Frontends consume the SSE event for the actual UI action.
+                return "", False, f"voice command: {cmd['intent']}", ""
+            # Mixed intent (append, replace, …) — keep residual as content.
+            out = residual
+            if not out:
+                # No content to flow through; skip remaining steps gracefully.
+                return "", False, f"voice command: {cmd['intent']} (empty residual)", ""
             continue
 
         if step == "vocab_correct":
@@ -7564,6 +7887,23 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 self.send_error_json("No speech detected", code="no_speech",
                                      status=200, retry_ok=True)
                 return
+
+            # POL-1 — backwards-compat ST `OOC:` convention. Detected here,
+            # BEFORE the pipeline runs, so it can flip the resolved mode to
+            # `grammar_clean` and strip the prefix from the text. No
+            # `dictation-command` event is emitted — OOC is a content marker,
+            # not a UI action. Agent 3 §3.
+            ooc_match = OOC_PREFIX_RE.match(raw_text)
+            if ooc_match:
+                raw_text = raw_text[ooc_match.end():].strip()
+                if not raw_text:
+                    self.send_error_json("No speech detected", code="no_speech",
+                                         status=200, retry_ok=True)
+                    return
+                ooc_mode = get_mode("grammar_clean")
+                if ooc_mode is not None:
+                    mode = ooc_mode
+                    log.info("OOC prefix detected — mode override -> grammar_clean")
 
             pipeline_steps = mode.get("pipeline", [])
             is_enhancement = any(s in pipeline_steps for s in ("rp_enhance", "persona_pov"))
