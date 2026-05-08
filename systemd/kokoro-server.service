@@ -1,0 +1,41 @@
+[Unit]
+Description=Kokoro-82M TTS server for Calliope dictation
+After=default.target
+
+[Service]
+Type=simple
+# Runs from the dedicated TTS venv at ~/.local/share/calliope-tts/.
+# kokoro-server.py is the bundled script copied from
+# <calliope-repo>/scripts/kokoro-server.py — see docs/tts-install.md.
+ExecStart=%h/.local/share/calliope-tts/venv/bin/python %h/.local/share/calliope-tts/kokoro-server.py
+Environment=KOKORO_HOST=127.0.0.1
+Environment=KOKORO_PORT=9002
+Environment=KOKORO_MODEL=%h/.local/share/calliope-tts/models/onnx/model_fp16.onnx
+Environment=KOKORO_VOICES=%h/.local/share/calliope-tts/models/voices-v1.0.bin
+Environment=KOKORO_LANG=en-us
+Restart=on-failure
+RestartSec=5
+
+# Idle-shutdown is driven by Calliope's dictation-server (mirrors the
+# whisper-server.service contract): when KOKORO_IDLE_SHUTDOWN_SECONDS of
+# inactivity pass, dictation-server runs `systemctl --user stop
+# kokoro-server`. Do not wire idle logic into this unit.
+
+# Sandboxing — CPU-only path is the default (kokoro-onnx CPU provider).
+# If the install upgrades to ROCm, swap ProtectHome=read-only to a
+# narrower ReadWritePaths set and add DeviceAllow= for /dev/kfd, /dev/dri
+# to mirror whisper-server.service.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/calliope-tts /tmp
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+LogLevelMax=warning
+
+[Install]
+WantedBy=default.target
