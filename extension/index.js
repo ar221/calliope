@@ -153,6 +153,42 @@ function currentContext() {
     return { chatId, personaId, characterId, lastAi, groupName: s?.name || '' };
 }
 
+/**
+ * POL-6: resolve full member name list for the current group.
+ * ST stores group.members as an array of avatar filenames; map each back
+ * to a human-readable character name via the global `characters[]` array.
+ */
+function resolveGroupMembers(group) {
+    if (!group || !Array.isArray(group.members)) return [];
+    const out = [];
+    for (const avatarFile of group.members) {
+        const ch = (characters || []).find(c => c?.avatar === avatarFile);
+        if (ch?.name) out.push(ch.name);
+        else if (typeof avatarFile === 'string') out.push(avatarFile.replace(/\.png$/i, ''));
+    }
+    return out;
+}
+
+/**
+ * POL-6: scan the chat tail (most recent first) for the last AI message
+ * (not user, not system) and return the speaking character name. Group
+ * chats stamp `name` onto each message; fall back to `original_avatar`
+ * lookup if needed.
+ */
+function resolveLastSpeaker() {
+    if (!Array.isArray(chat)) return '';
+    for (let i = chat.length - 1; i >= 0; i--) {
+        const m = chat[i];
+        if (!m || m.is_user || m.is_system) continue;
+        if (typeof m.name === 'string' && m.name.trim()) return m.name;
+        if (typeof m.original_avatar === 'string') {
+            const ch = (characters || []).find(c => c?.avatar === m.original_avatar);
+            if (ch?.name) return ch.name;
+        }
+    }
+    return '';
+}
+
 /** Build the /state payload the server expects. */
 function buildStatePayload() {
     const ctx = currentContext();
@@ -162,14 +198,29 @@ function buildStatePayload() {
     const characterName = selected_group
         ? (s?.name || '')
         : (characters?.[this_chid]?.name || '');
+
+    // POL-6: when the active chat is a group, expose the member roster +
+    // the last AI speaker so the server (and phone UI) can render the
+    // addressee picker. groupId is the ST UUID; groupMembers are full
+    // human-readable character names.
+    const isGroup = !!selected_group;
+    const groupId = isGroup ? String(selected_group) : '';
+    const groupMembers = isGroup ? resolveGroupMembers(s) : [];
+    const lastSpeaker = isGroup ? resolveLastSpeaker() : '';
+
     return {
         chatId: ctx.chatId,
-        chatType: selected_group ? 'group' : 'solo',
+        chatType: isGroup ? 'group' : 'solo',
         characterId: ctx.characterId,
         characterName,
         personaId: ctx.personaId,
         lastAiMessage: ctx.lastAi,
         sourceDevice: 'st-desktop',
+        // POL-6 additions — server treats them as optional.
+        groupId,
+        groupName: s?.name || '',
+        groupMembers,
+        lastSpeaker,
     };
 }
 
@@ -422,6 +473,103 @@ function handleDictationStateEvent(data) {
     } else {
         showStateBar();
     }
+}
+
+// ─── POL-6: group-chat addressee picker (extension side) ──────────────────
+// When chatType === 'group', render a chip row in the settings panel:
+// member chips with the last-speaker highlighted, plus an "All members"
+// joint-context chip. Click = persist the choice to the server's
+// /state/mode-memory, keyed by `<groupId>:<characterName>` so the next
+// dictation request can resolve the addressee server-side. The phone UI
+// renders an equivalent picker via the /state contract.
+
+let activeAddressee = null; // { groupId, characterName | '*all' }
+
+async function persistAddresseeChoice(groupId, characterName) {
+    if (!groupId) return;
+    const cfg = settings();
+    const url = `${cfg.serverUrl.replace(/\/+$/, '')}/state/mode-memory`;
+    const key = `${groupId}:${characterName || ''}`;
+    try {
+        await fetch(url, {
+            method: 'POST',
+            mode: 'cors',
+            cache: 'no-store',
+            headers: { 'Content-Type': 'application/json', ...authHeaders() },
+            body: JSON.stringify({
+                key,
+                groupId,
+                addressee: characterName || '',
+                jointContext: characterName === '*all',
+                ts: Date.now(),
+            }),
+        });
+    } catch (e) {
+        WARN('persistAddresseeChoice failed', e?.message || e);
+    }
+}
+
+function renderAddresseePicker() {
+    const host = document.getElementById('dictation_bridge_addressee');
+    if (!host) return;
+
+    if (!selected_group) {
+        host.style.display = 'none';
+        host.innerHTML = '';
+        return;
+    }
+
+    const group = groups?.find(g => g.id == selected_group) || null;
+    const members = resolveGroupMembers(group);
+    const lastSpeaker = resolveLastSpeaker();
+    const groupId = String(selected_group);
+
+    // Default selection: persisted choice if it matches, else last speaker,
+    // else nothing.
+    const cur = activeAddressee && activeAddressee.groupId === groupId
+        ? activeAddressee.characterName
+        : (lastSpeaker || '');
+
+    if (members.length === 0) {
+        host.style.display = 'block';
+        host.innerHTML = `<div style="font-size:12px;color:#98876F;padding:6px 0">Group has no resolved members yet.</div>`;
+        return;
+    }
+
+    const chipBase = 'padding:3px 10px;border-radius:2px;cursor:pointer;font-size:12px;font-family:inherit;background:transparent';
+    const chips = members.map(name => {
+        const isLast = lastSpeaker && name === lastSpeaker;
+        const isSelected = name === cur;
+        const border = isSelected
+            ? '1px solid #FFB648'
+            : (isLast ? '1px solid rgba(255, 182, 72, 0.55)' : '1px solid rgba(201, 178, 139, 0.35)');
+        const color = isSelected ? '#FFB648' : (isLast ? '#FFB648' : '#C9B28B');
+        const tag = isLast ? `<span style="margin-left:6px;font-size:10px;color:#FFB648;opacity:0.8">last</span>` : '';
+        return `<button type="button" class="dbb-addr-chip" data-name="${escapeHtml(name)}" style="${chipBase};border:${border};color:${color}">${escapeHtml(name)}${tag}</button>`;
+    }).join('');
+
+    const allSelected = cur === '*all';
+    const allBorder = allSelected ? '1px solid #FFB648' : '1px dashed rgba(201, 178, 139, 0.35)';
+    const allColor = allSelected ? '#FFB648' : '#98876F';
+    const allChip = `<button type="button" class="dbb-addr-chip" data-name="*all" style="${chipBase};border:${allBorder};color:${allColor}">All members (joint)</button>`;
+
+    host.style.display = 'block';
+    host.innerHTML = `
+        <div style="font-size:12px;color:#98876F;margin:6px 0 4px 0;display:flex;justify-content:space-between;align-items:center">
+            <span>Talking to <strong style="color:#C9B28B">${escapeHtml(group?.name || 'group')}</strong></span>
+            ${lastSpeaker ? `<span style="font-size:11px;color:#98876F">last spoke: <strong style="color:#C9B28B">${escapeHtml(lastSpeaker)}</strong></span>` : ''}
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px">${chips}${allChip}</div>
+    `;
+
+    host.querySelectorAll('.dbb-addr-chip').forEach(chip => {
+        chip.addEventListener('click', () => {
+            const name = chip.getAttribute('data-name') || '';
+            activeAddressee = { groupId, characterName: name };
+            persistAddresseeChoice(groupId, name);
+            renderAddresseePicker(); // repaint with the new selection.
+        });
+    });
 }
 
 // ─── POL-3: low-confidence "did you mean?" banner ─────────────────────────
@@ -1686,6 +1834,9 @@ function buildSettingsPanel() {
                         <span id="dictation_bridge_sse_label">SSE: disconnected</span>
                     </div>
 
+                    <!-- POL-6: addressee picker (group chats only). Hidden on solo. -->
+                    <div id="dictation_bridge_addressee" style="display:none;margin:6px 0 4px 0"></div>
+
                     <small class="notes">
                         The dictation server must be running and reachable.
                         Self-signed cert: visit the URL once in a browser tab and accept the warning before using the mic button.
@@ -1779,6 +1930,10 @@ function buildSettingsPanel() {
         });
     }
 
+    // POL-6: paint addressee picker now (in case ST is already in a group
+    // chat when the panel mounts) and on every state-payload event.
+    renderAddresseePicker();
+
     // MVP-23: privacy badge → audit-log peek modal.
     const privacyBadge = host.querySelector('#dictation_bridge_privacy_badge');
     if (privacyBadge) {
@@ -1832,7 +1987,12 @@ export async function init() {
         event_types.APP_READY,
     ];
     for (const evt of stateEvents) {
-        if (evt) eventSource.on(evt, () => postState(evt));
+        if (evt) eventSource.on(evt, () => {
+            postState(evt);
+            // POL-6: chat/character switches may flip group status — repaint
+            // the addressee picker (no-op when not in a group).
+            try { renderAddresseePicker(); } catch (e) { WARN('addressee repaint failed', e?.message || e); }
+        });
     }
     startStateHeartbeat();
     // Initial push in case we loaded mid-chat.
