@@ -2121,6 +2121,104 @@ async function fetchTts(text, voice) {
     return await res.blob();
 }
 
+function currentChatTitle() {
+    try {
+        const ctx = currentContext();
+        return ctx.chatId || characters?.[this_chid]?.name || 'calliope-chat';
+    } catch {
+        return 'calliope-chat';
+    }
+}
+
+function buildAudiobookPayload() {
+    const s = settings();
+    const voiceMap = { ...(s.ttsVoiceProfiles || {}) };
+    const narratorVoice = s.ttsVoice || 'af_heart';
+    const messages = [];
+    if (Array.isArray(chat)) {
+        for (const m of chat) {
+            if (!m || m.is_system) continue;
+            const text = stripMarkdownForTts(String(m.mes || ''));
+            if (!text) continue;
+            const name = String(m.name || '').trim();
+            const voice = voiceMap[normalizeVoiceProfileKey(name)] || '';
+            messages.push({ name, text, is_user: !!m.is_user, voice });
+        }
+    }
+    return {
+        title: currentChatTitle(),
+        narratorVoice,
+        voiceMap,
+        messages,
+    };
+}
+
+async function fetchAudiobookExport(payload) {
+    const cfg = settings();
+    const url = `${cfg.serverUrl.replace(/\/+$/, '')}/tts/audiobook`;
+    const res = await fetch(url, {
+        method: 'POST',
+        mode: 'cors',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+        let detail = '';
+        try { detail = (await res.json())?.error || ''; } catch {}
+        const err = new Error(detail || `audiobook_http_${res.status}`);
+        err.status = res.status;
+        throw err;
+    }
+    return await res.blob();
+}
+
+function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function exportCurrentChatAudiobook(btn) {
+    const payload = buildAudiobookPayload();
+    if (!payload.messages.length) {
+        toast('warning', 'No chat messages to export');
+        return;
+    }
+    const prev = btn?.textContent || '';
+    if (btn) {
+        btn.textContent = 'Exporting...';
+        btn.setAttribute('disabled', 'disabled');
+    }
+    try {
+        const blob = await fetchAudiobookExport(payload);
+        ttsBackendAvailable = true;
+        const safeTitle = String(payload.title || 'calliope-audiobook')
+            .replace(/[^A-Za-z0-9._-]+/g, '-')
+            .replace(/^-+|-+$/g, '') || 'calliope-audiobook';
+        downloadBlob(blob, `${safeTitle}.wav`);
+        toast('success', `Exported ${payload.messages.length} messages to WAV`);
+    } catch (e) {
+        const status = e?.status || 0;
+        if (status === 404 || status === 501 || status === 503 || status === 0) {
+            notifyTtsMissing(e?.message || `status_${status}`);
+        } else {
+            WARN('audiobook export failed', e?.message || e);
+            toast('error', `Audiobook export failed: ${e?.message || 'unknown'}`);
+        }
+    } finally {
+        if (btn) {
+            btn.textContent = prev;
+            btn.removeAttribute('disabled');
+        }
+    }
+}
+
 function notifyTtsMissing(reason) {
     ttsBackendAvailable = false;
     if (ttsBackendNotifiedMissing) return;
@@ -2578,6 +2676,11 @@ function buildSettingsPanel() {
                             <button id="dictation_bridge_tts_test" type="button" class="menu_button" style="padding:3px 10px;font-size:12px;border:1px solid rgba(201, 178, 139, 0.45);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Test voice</button>
                             <small class="notes" style="margin:0 0 0 4px">Plays a short sample with the selected voice.</small>
                         </div>
+
+                        <div style="display:flex;gap:6px;align-items:center;margin:6px 0 0 0">
+                            <button id="dictation_bridge_audiobook_export" type="button" class="menu_button" style="padding:3px 10px;font-size:12px;border:1px solid rgba(201, 178, 139, 0.45);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Export chat WAV</button>
+                            <small class="notes" style="margin:0 0 0 4px">Uses narrator fallback plus saved character voice profiles.</small>
+                        </div>
                     </div>
 
                     <small class="notes">
@@ -2678,6 +2781,7 @@ function buildSettingsPanel() {
     const ttsStreamEl = host.querySelector('#dictation_bridge_tts_stream_partials');
     const ttsVoiceEl = host.querySelector('#dictation_bridge_tts_voice');
     const ttsTestEl = host.querySelector('#dictation_bridge_tts_test');
+    const audiobookExportEl = host.querySelector('#dictation_bridge_audiobook_export');
     const ttsProfileHintEl = host.querySelector('#dictation_bridge_tts_profile_hint');
 
     const paintTtsProfileHint = () => {
@@ -2786,6 +2890,12 @@ function buildSettingsPanel() {
                 ttsTestEl.textContent = prev;
                 ttsTestEl.removeAttribute('disabled');
             }
+        });
+    }
+
+    if (audiobookExportEl) {
+        audiobookExportEl.addEventListener('click', () => {
+            exportCurrentChatAudiobook(audiobookExportEl).catch(e => WARN('export audiobook', e?.message || e));
         });
     }
 

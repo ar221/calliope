@@ -19,6 +19,7 @@ import io
 import json
 import pathlib
 import urllib.error
+import wave
 from importlib.machinery import SourceFileLoader
 from unittest.mock import patch, MagicMock
 
@@ -121,6 +122,16 @@ def _fake_response(body: bytes, content_type: str = "audio/wav", status: int = 2
     resp.__enter__ = lambda self: self
     resp.__exit__ = lambda self, *a: False
     return resp
+
+
+def _wav_bytes(frames: bytes, *, channels: int = 1, sample_width: int = 2, rate: int = 24000) -> bytes:
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wav:
+        wav.setnchannels(channels)
+        wav.setsampwidth(sample_width)
+        wav.setframerate(rate)
+        wav.writeframes(frames)
+    return out.getvalue()
 
 
 def test_synthesize_returns_audio_bytes(mod):
@@ -253,3 +264,58 @@ def test_mark_tts_activity_updates_timestamp(mod, monkeypatch):
     mod._mark_tts_activity()
     with mod._last_tts_lock:
         assert mod._last_tts_ts > 0.0
+
+
+# ─── Audiobook export helpers ───────────────────────────────
+
+
+def test_validate_audiobook_request_normalizes_voice_map(mod):
+    messages, narrator, voice_map, title, err = mod._validate_audiobook_request({
+        "title": "Night Session",
+        "narratorVoice": "af_heart",
+        "voiceMap": {"Camilla": "af_bella"},
+        "messages": [
+            {"name": "Camilla", "text": "Hello there."},
+            {"name": "Ayaz", "text": "  I answer.  ", "is_user": True},
+            {"name": "Blank", "text": "   "},
+        ],
+    })
+    assert err is None
+    assert title == "Night Session"
+    assert narrator == "af_heart"
+    assert voice_map == {"camilla": "af_bella"}
+    assert messages == [
+        {"name": "Camilla", "text": "Hello there.", "is_user": False, "voice": ""},
+        {"name": "Ayaz", "text": "I answer.", "is_user": True, "voice": ""},
+    ]
+
+
+def test_voice_for_audiobook_message_prefers_explicit_then_profile_then_narrator(mod):
+    voice_map = {"camilla": "af_bella"}
+    assert mod._voice_for_audiobook_message(
+        {"name": "Camilla", "voice": ""}, "af_heart", voice_map,
+    ) == "af_bella"
+    assert mod._voice_for_audiobook_message(
+        {"name": "Unknown", "voice": "af_nova"}, "af_heart", voice_map,
+    ) == "af_nova"
+    assert mod._voice_for_audiobook_message(
+        {"name": "Unknown", "voice": ""}, "af_heart", voice_map,
+    ) == "af_heart"
+
+
+def test_combine_wav_segments_inserts_silence(mod):
+    first = _wav_bytes(b"\x01\x00" * 10, rate=1000)
+    second = _wav_bytes(b"\x02\x00" * 10, rate=1000)
+    combined = mod._combine_wav_segments([first, second], silence_ms=10)
+    with wave.open(io.BytesIO(combined), "rb") as wav:
+        assert wav.getnchannels() == 1
+        assert wav.getsampwidth() == 2
+        assert wav.getframerate() == 1000
+        assert wav.getnframes() == 30  # 10 + 10ms silence at 1000Hz + 10
+
+
+def test_combine_wav_segments_rejects_incompatible_formats(mod):
+    first = _wav_bytes(b"\x01\x00" * 10, rate=24000)
+    second = _wav_bytes(b"\x02\x00" * 10, rate=16000)
+    with pytest.raises(ValueError, match="incompatible"):
+        mod._combine_wav_segments([first, second])
