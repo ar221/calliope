@@ -1053,6 +1053,24 @@ function handleDictationCommand(data) {
             }
             break;
         }
+        case 'read last':
+        case 'read_last':
+        case 'read': {
+            const ok = readLastAiMessage();
+            if (ok) toast('success', 'Reading last AI message');
+            // readLastAiMessage already toasts on no-message-found.
+            break;
+        }
+        case 'read all':
+        case 'read_all':
+        case 'toggle read':
+        case 'toggle_read':
+        case 'auto read':
+        case 'auto_read': {
+            toggleAutoReadAi();
+            // toggleAutoReadAi already toasts current state.
+            break;
+        }
         default:
             WARN(`unknown voice command intent: ${intent}`);
             break;
@@ -1733,7 +1751,9 @@ const CHEATSHEET_ROWS = [
     { phrase: '"clear"', action: 'Empty the textarea (3-second undo toast).' },
     { phrase: '"computer: …"', action: 'Sentinel prefix that flags the rest of the utterance as a voice command rather than RP content.' },
     { phrase: '"new paragraph" / "scene break"', action: 'Insert formatting markers without typing them.' },
-    { phrase: '"stop" / "cancel"', action: 'Discard the in-flight utterance.' },
+    { phrase: '"stop" / "cancel"', action: 'Discard the in-flight utterance — also halts any active TTS playback.' },
+    { phrase: '"computer: read last"', action: 'TTS-read the most recent AI message via Calliope (Kokoro).' },
+    { phrase: '"computer: read all"', action: 'Toggle auto-read mode — every new AI message gets voiced.' },
 ];
 
 function openCheatsheet() {
