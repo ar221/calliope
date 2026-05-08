@@ -126,6 +126,21 @@ VOCAB_FUZZY_CUTOFF = 0.84  # was 0.75 — see ADR-10 / Agent 3 §6
 VOCAB_FUZZY_MIN_LEN = 4    # was 3 — kills 'yaz'/'Ayaz' (3-char tokens skipped)
 VOCAB_FUZZY_MAX_HITS_PER_UTT = 2
 
+# Phase 5 / POL-3 — "Did you mean?" word-confidence overlay (Agent 6 §3.3).
+# Words with logprob below this threshold get tagged in the /transcribe
+# response; the phone PWA + ST extension render them as tap-to-correct chips.
+# -0.7 matches whisper-cli's existing --logprob-thold; tunable via env so
+# the threshold can be lifted/lowered per-deployment without a rebuild.
+WORD_CONFIDENCE_THRESHOLD = float(
+    os.environ.get("DICTATION_LOW_CONFIDENCE_THRESHOLD", "-0.7"),
+)
+# Max number of low-confidence words flagged per utterance. Avoids flooding
+# the UI on degraded audio; the rest pass through silently.
+WORD_CONFIDENCE_MAX_SPANS = 12
+# Min word length before flagging. Skips articles / prepositions where
+# whisper logprobs are noisy and a "?" chip is more annoying than helpful.
+WORD_CONFIDENCE_MIN_LEN = 3
+
 # ─── Config ──────────────────────────────────────────────
 DEFAULT_PORT = 8384
 DEFAULT_HOST = os.environ.get("DICTATION_BIND_HOST", "127.0.0.1")
@@ -1239,19 +1254,30 @@ def _transcribe_whisper_server(audio_path: Path, *, prompt: str = "",
 
 
 def extract_word_confidences(response_json: dict) -> list[dict]:
-    """Pull per-word/-token confidence (logprob) data from whisper-server's
-    response, when available.
+    """Pull per-word/-token confidence data from whisper-server's response.
 
-    Returns a list of {word, confidence} dicts. Empty list when the server
-    didn't emit token-level data (e.g. `response_format=text`). Phase 4
-    "Did you mean?" UI consumes this; for now it is stubbed and pass-through.
+    Returns a list of {word, confidence, logprob} dicts. `confidence` is
+    the linear probability (0.0–1.0); `logprob` is `math.log(confidence)`,
+    which is what whisper.cpp natively threshold-checks. POL-3 uses the
+    logprob form so the user-tunable threshold (-0.7 default) maps directly
+    to whisper-cli's `--logprob-thold`. Empty list when the server didn't
+    emit token-level data (e.g. `response_format=text`).
     """
+    import math
     out: list[dict] = []
     if not isinstance(response_json, dict):
         return out
     segments = response_json.get("segments")
     if not isinstance(segments, list):
         return out
+
+    def _attach_logprob(prob: float) -> float:
+        """Linear prob → logprob, with a stable floor for prob<=0 to keep
+        downstream comparisons well-defined."""
+        if prob is None or prob <= 0.0:
+            return -20.0
+        return math.log(prob)
+
     for seg in segments:
         if not isinstance(seg, dict):
             continue
@@ -1260,18 +1286,22 @@ def extract_word_confidences(response_json: dict) -> list[dict]:
         if isinstance(words, list):
             for w in words:
                 if isinstance(w, dict) and "word" in w:
+                    prob = float(w.get("probability", w.get("p", 0.0)) or 0.0)
                     out.append({
                         "word": str(w.get("word", "")),
-                        "confidence": float(w.get("probability", w.get("p", 0.0)) or 0.0),
+                        "confidence": prob,
+                        "logprob": _attach_logprob(prob),
                     })
             continue
         tokens = seg.get("tokens")
         if isinstance(tokens, list):
             for t in tokens:
                 if isinstance(t, dict):
+                    prob = float(t.get("p", t.get("prob", 0.0)) or 0.0)
                     out.append({
                         "word": str(t.get("text", t.get("token", ""))),
-                        "confidence": float(t.get("p", t.get("prob", 0.0)) or 0.0),
+                        "confidence": prob,
+                        "logprob": _attach_logprob(prob),
                     })
     return out
 
@@ -2906,6 +2936,130 @@ def vocab_correct(text: str, character_id: str = "") -> str:
     # Token = contiguous word chars plus apostrophe (so "Kael'thas" stays whole)
     text = re.sub(r"[A-Za-z][A-Za-z'\-]*", _sub_token, text)
     return text
+
+
+def _vocab_correct_forms(character_id: str = "") -> list[str]:
+    """Return the list of `correct` forms applicable to `character_id`.
+
+    Helper shared by `vocab_correct` (for fuzzy candidates) and the POL-3
+    "did you mean?" alternatives generator. Single-word forms only —
+    multi-word entries can't be drop-in word replacements.
+    """
+    entries = load_vocab()
+    applicable = [e for e in entries if _applies_to_character(e, character_id)]
+    return [e["correct"] for e in applicable if " " not in e["correct"]]
+
+
+def compute_low_confidence_spans(
+    text: str,
+    word_confidences: list[dict],
+    character_id: str = "",
+    threshold: float | None = None,
+) -> list[dict]:
+    """Tag words with logprob below threshold and attach vocab alternatives.
+
+    POL-3 / Agent 6 §3.3 — "Did you mean?" overlay. Threshold defaults to
+    `WORD_CONFIDENCE_THRESHOLD` (env-tunable). Returns a list of
+    `{word, start_idx, end_idx, confidence, logprob, alternatives}` dicts
+    suitable for embedding in the /transcribe JSON response.
+
+    `start_idx`/`end_idx` are character offsets into `text`. Indexes are
+    best-effort: whisper word boundaries don't always survive vocab
+    rewrites, so we resolve via case-insensitive search starting from the
+    last-matched offset. Words we can't locate get `start_idx == -1` and
+    a `text_only` flag so the UI can skip the highlight overlay but still
+    surface alternatives in a list view.
+
+    Alternatives are pulled from the user vocab (cheap fuzzy match,
+    `difflib.get_close_matches(cutoff=0.5, n=3)`). LLM-repair tier is
+    future work — see /word-alternatives endpoint for the public surface.
+    """
+    if not text or not word_confidences:
+        return []
+    thr = WORD_CONFIDENCE_THRESHOLD if threshold is None else threshold
+    vocab_forms = _vocab_correct_forms(character_id)
+    spans: list[dict] = []
+    cursor = 0
+    text_lower = text.lower()
+    for entry in word_confidences:
+        if len(spans) >= WORD_CONFIDENCE_MAX_SPANS:
+            break
+        if not isinstance(entry, dict):
+            continue
+        word = str(entry.get("word", "")).strip()
+        if not word:
+            continue
+        # Strip whisper's leading-space convention before length-gating.
+        clean_word = word.strip(" \t\n.,;:!?'\"")
+        if len(clean_word) < WORD_CONFIDENCE_MIN_LEN:
+            continue
+        logprob = entry.get("logprob")
+        if logprob is None:
+            confidence = float(entry.get("confidence", 0.0) or 0.0)
+            if confidence <= 0.0:
+                continue
+            import math
+            logprob = math.log(confidence)
+        try:
+            logprob = float(logprob)
+        except (TypeError, ValueError):
+            continue
+        if logprob >= thr:
+            continue
+        # Locate the word in `text` from the running cursor; fall back to
+        # absolute search if the cursored attempt misses (vocab rewrites
+        # can shift offsets between whisper's output and `text`).
+        idx = text_lower.find(clean_word.lower(), cursor)
+        if idx < 0:
+            idx = text_lower.find(clean_word.lower())
+        start_idx = idx
+        end_idx = idx + len(clean_word) if idx >= 0 else -1
+        if idx >= 0:
+            cursor = end_idx
+        alternatives = []
+        if vocab_forms:
+            alternatives = difflib.get_close_matches(
+                clean_word, vocab_forms, n=3, cutoff=0.5,
+            )
+        span: dict = {
+            "word": clean_word,
+            "start_idx": start_idx,
+            "end_idx": end_idx,
+            "confidence": float(entry.get("confidence", 0.0) or 0.0),
+            "logprob": logprob,
+            "alternatives": list(alternatives),
+        }
+        if start_idx < 0:
+            span["text_only"] = True
+        spans.append(span)
+    return spans
+
+
+def word_alternatives(
+    word: str,
+    context: str = "",
+    character_id: str = "",
+    n: int = 3,
+    cutoff: float = 0.5,
+) -> list[dict]:
+    """Cheap "did you mean?" alternative generator (POL-3 v1).
+
+    v1 implementation: vocab fallback only. Each alternative carries
+    `{text, score, source}` where `source` is `"vocab"`. Future tiers
+    (re-decode candidates, LLM repair) attach `source: "context"` /
+    `source: "llm"` and merge into the same list.
+    """
+    if not word:
+        return []
+    vocab_forms = _vocab_correct_forms(character_id)
+    if not vocab_forms:
+        return []
+    matches = difflib.get_close_matches(word, vocab_forms, n=n, cutoff=cutoff)
+    out: list[dict] = []
+    for m in matches:
+        score = difflib.SequenceMatcher(None, word.lower(), m.lower()).ratio()
+        out.append({"text": m, "score": round(score, 3), "source": "vocab"})
+    return out
 
 
 def build_whisper_prompt(character_id: str = "") -> str:
@@ -7420,6 +7574,37 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             self._handle_reformat(params)
         elif path == "/vocab":
             self._handle_vocab_add()
+        elif path == "/word-alternatives":
+            # POL-3 — "did you mean?" alternative generator (v1: vocab tier).
+            # Body: {word: str, context?: str, character_id?: str}.
+            # Subject to require_auth (gated above).
+            try:
+                body = self.read_json_body()
+            except Exception:
+                self.send_error_json("Invalid JSON", code="bad_json", status=400)
+                return
+            if not isinstance(body, dict):
+                self.send_error_json("Expected a JSON object",
+                                     code="bad_input", status=400)
+                return
+            word = str(body.get("word", "")).strip()
+            if not word:
+                self.send_error_json("Missing 'word'",
+                                     code="missing_param", status=400)
+                return
+            ctx = str(body.get("context", "") or "")
+            char = str(body.get("character_id", "") or body.get("character", "") or "")
+            try:
+                alts = word_alternatives(word, context=ctx, character_id=char)
+            except Exception as e:
+                log.exception("word_alternatives failed for %r", word)
+                self.send_error_json(f"Server error: {e}",
+                                     code="server_error", status=500)
+                return
+            self.send_json({
+                "word": word,
+                "alternatives": alts,
+            })
         elif path == "/state":
             # Phase 3 — ST extension (or any client) pushes current state.
             # Expected body: partial or full state payload; missing fields are preserved.
@@ -7996,6 +8181,23 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             # `dictation-result` SSE event).
             self._emit_dictation_state(request_id, "done")
 
+            # POL-3 — low-confidence spans for the "did you mean?" overlay.
+            # We anchor offsets into the post-pipeline `output_text` when one
+            # exists (so the phone chips line up with what the user sees);
+            # for pure-pipeline modes that emit empty text (voice command
+            # short-circuit), spans are skipped entirely.
+            anchor_text = output_text or raw_text
+            low_confidence_spans: list[dict] = []
+            if anchor_text:
+                try:
+                    low_confidence_spans = compute_low_confidence_spans(
+                        anchor_text, word_confidences,
+                        character_id=character_id,
+                    )
+                except Exception as _e:  # pragma: no cover — best-effort overlay
+                    log.debug("compute_low_confidence_spans failed: %s", _e)
+                    low_confidence_spans = []
+
             self.send_json({
                 "text": output_text,
                 "raw": raw_text,
@@ -8010,6 +8212,11 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 # Empty when subprocess fallback ran or response carried no
                 # token-level data. Phase 4 UI consumer not yet wired.
                 "word_confidences": word_confidences,
+                # POL-3: words flagged as low-confidence + vocab alternatives.
+                # Empty list when whisper didn't emit token-level data, when
+                # all words clear the threshold, or when the pipeline emitted
+                # no canonical text (voice-command short-circuit).
+                "low_confidence_spans": low_confidence_spans,
                 # MVP-13: client correlates streamed deltas to canonical text.
                 "request_id": request_id,
             })
