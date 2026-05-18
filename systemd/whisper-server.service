@@ -22,7 +22,6 @@ ExecStart=%h/.local/bin/whisper-server \
     --no-speech-thold 0.80 \
     --logprob-thold -0.7 \
     --entropy-thold 2.4 \
-    --temperature 0.0 \
     --beam-size 5 \
     --best-of 5 \
     --flash-attn

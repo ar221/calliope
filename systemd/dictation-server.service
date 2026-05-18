@@ -9,6 +9,7 @@ ExecStart=%h/.local/bin/dictation-server
 Restart=on-failure
 RestartSec=5
 Environment=WHISPER_BIN=whisper-cli
+Environment=WHISPER_IDLE_SHUTDOWN_DISABLED=1
 Environment=DICTATION_FORMATTER_PROVIDER=openai
 Environment=DICTATION_OPENAI_PROXY_URL=http://127.0.0.1:10531/v1
 Environment=DICTATION_OPENAI_RP_MODEL=gpt-5.4

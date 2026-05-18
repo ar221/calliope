@@ -3,7 +3,7 @@
 # Calliope — local-first voice dictation server for SillyTavern.
 #
 # Repo layout (post-extract):
-#   <repo>/
+#   repo-root/
 #     LICENSE
 #     README.md
 #     PRIVACY.md
