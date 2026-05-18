@@ -12,6 +12,7 @@ failure modes (Agent 3 §4 / ADR-12):
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import pathlib
 from importlib.machinery import SourceFileLoader
@@ -177,6 +178,263 @@ def test_update_state_strips_tracker_template_noise(mod):
     })
     assert snap["sceneContinuity"] == "scene: Location: apartment. Camilla: on sofa."
     mod.update_state({"sceneContinuity": ""})
+
+
+# ─── POL-17 repair trace ─────────────────────────────────────────────
+
+
+def test_repair_trace_exposes_raw_cleaned_final_without_persistence(mod):
+    trace = mod.build_repair_trace(
+        raw="um suzie steps closer",
+        cleaned="Suzie steps closer.",
+        final="*Suzy steps closer.*",
+    )
+
+    assert trace == {
+        "raw": "um suzie steps closer",
+        "cleaned": "Suzie steps closer.",
+        "final": "*Suzy steps closer.*",
+        "stages": ["raw", "cleaned", "final"],
+        "has_changes": True,
+        "persistence": "in_ram_only",
+    }
+
+
+def test_repair_trace_drops_duplicate_empty_stages(mod):
+    trace = mod.build_repair_trace(raw="hello", cleaned="", final="hello")
+
+    assert trace["cleaned"] == ""
+    assert trace["stages"] == ["raw"]
+    assert trace["has_changes"] is False
+    assert trace["persistence"] == "in_ram_only"
+
+
+def test_reformat_endpoint_returns_repair_trace_without_storing_trace(monkeypatch, mod):
+    sent = {}
+    original_transcript = list(mod.session_transcript)
+    original_vocab_cache = dict(mod._vocab_cache)
+
+    class DummyHandler:
+        def read_json_body(self):
+            return {"text": "um suzie steps closer", "mode": "grammar_clean"}
+
+        def send_json(self, data, status=200):
+            sent["status"] = status
+            sent["data"] = data
+
+        def send_error_json(self, message, **kwargs):  # pragma: no cover - failure path
+            raise AssertionError((message, kwargs))
+
+        def _build_chat_context(self, chat_source):  # pragma: no cover - unused here
+            raise AssertionError("chat context should not be requested")
+
+    def fake_run_pipeline(text, mode, **kwargs):
+        assert text == "um suzie steps closer"
+        assert mode["id"] == "grammar_clean"
+        return "Suzie steps closer.", False, "", "Suzie steps closer."
+
+    monkeypatch.setattr(mod, "run_pipeline", fake_run_pipeline)
+    try:
+        mod.session_transcript[:] = []
+        mod.DictationHandler._handle_reformat(DummyHandler(), {})
+    finally:
+        mod.session_transcript[:] = original_transcript
+        mod._vocab_cache.clear()
+        mod._vocab_cache.update(original_vocab_cache)
+
+    payload = sent["data"]
+    assert sent["status"] == 200
+    assert payload["raw"] == "um suzie steps closer"
+    assert payload["cleaned"] == "Suzie steps closer."
+    assert payload["repair_trace"] == {
+        "raw": "um suzie steps closer",
+        "cleaned": "Suzie steps closer.",
+        "final": "Suzie steps closer.",
+        "stages": ["raw", "cleaned"],
+        "has_changes": True,
+        "persistence": "in_ram_only",
+    }
+    assert mod.session_transcript == []
+    assert "repair_trace" not in json.dumps(mod.session_transcript)
+    assert mod._vocab_cache == original_vocab_cache
+
+
+def test_repair_trace_ui_escapes_html_and_does_not_post_full_trace():
+    source = SRC.read_text()
+    render_start = source.index("function renderRepairTrace()")
+    render_end = source.index("async function acceptRepairAsVocab()")
+    render_src = source[render_start:render_end]
+    show_start = source.index("function showResult(text, meta)")
+    show_end = source.index("function clearResult()", show_start)
+    show_src = source[show_start:show_end]
+
+    assert "escapeHtml(value)" in render_src
+    assert "escapeHtml(repairStageLabel(stage))" in render_src
+    assert "innerHTML = trace.stages.map" in render_src
+    assert "postToEmbedParent" not in show_src
+    assert "postMessage(payload, embedParentOrigin)" in source
+    assert "postMessage({ type: 'dictation-ready' }, '*')" not in source
+
+
+def test_embed_postmessage_target_is_derived_from_referrer_not_query(mod):
+    html = mod.DictationHandler._render_html_with_embed(
+        object(),
+        {"embed": ["1"], "parent_origin": ["https://evil.example"]},
+    )
+
+    assert '"parentOrigin"' not in html
+    assert "new URL(document.referrer).origin" in html
+    assert "postMessage(payload, embedParentOrigin)" in html
+
+
+def test_transcribe_sse_result_source_includes_repair_trace():
+    source = SRC.read_text()
+    marker = "# MVP-13: emit canonical `dictation-result` after streaming."
+    start = source.index(marker)
+    end = source.index("# MVP-16 — pipeline finished.", start)
+    block = source[start:end]
+
+    assert "broadcast_event(\"dictation-result\"" in block
+    assert "\"has_repair_trace\": repair_trace.get(\"has_changes\", False)" in block
+    assert "\"raw\": raw_text" not in block
+    assert "\"cleaned\": cleaned_text" not in block
+    assert "\"repair_trace\": repair_trace" not in block
+    assert "repair_trace = build_repair_trace(raw_text, cleaned_text, output_text)" in source[:start]
+
+
+def test_transcribe_endpoint_keeps_repair_trace_out_of_sse_and_persistence(monkeypatch, mod):
+    sent = {}
+    events = []
+    original_transcript = list(mod.session_transcript)
+    original_vocab_cache = dict(mod._vocab_cache)
+
+    class DummyHandler:
+        headers = {"Content-Length": "4", "Content-Type": "audio/wav"}
+        rfile = io.BytesIO(b"RIFF")
+
+        def send_json(self, data, status=200):
+            sent["status"] = status
+            sent["data"] = data
+
+        def send_error_json(self, message, **kwargs):  # pragma: no cover - failure path
+            raise AssertionError((message, kwargs))
+
+        def _build_chat_context(self, chat_source):  # pragma: no cover - unused here
+            raise AssertionError("chat context should not be requested")
+
+        def _emit_dictation_state(self, *args, **kwargs):
+            pass
+
+        def _emit_dictation_transcript(self, *args, **kwargs):
+            pass
+
+    def fake_transcribe(path, **kwargs):
+        assert pathlib.Path(path).exists()
+        return "um suzie steps closer", []
+
+    def fake_run_pipeline(text, mode, **kwargs):
+        assert text == "um suzie steps closer"
+        assert mode["id"] == "rp_enhance"
+        return "*Suzy steps closer.*", False, "", "Suzie steps closer."
+
+    def fake_broadcast(event, payload):
+        events.append((event, payload))
+        return 1
+
+    monkeypatch.setattr(mod, "transcribe_with_confidence", fake_transcribe)
+    monkeypatch.setattr(mod, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(mod, "broadcast_event", fake_broadcast)
+    try:
+        mod.session_transcript[:] = []
+        mod.DictationHandler._handle_transcribe(
+            DummyHandler(),
+            {"mode": ["rp_enhance"], "provider": ["local"], "use_state": ["0"]},
+        )
+    finally:
+        mod.session_transcript[:] = original_transcript
+        mod._vocab_cache.clear()
+        mod._vocab_cache.update(original_vocab_cache)
+
+    payload = sent["data"]
+    assert sent["status"] == 200
+    assert payload["repair_trace"]["persistence"] == "in_ram_only"
+    assert payload["repair_trace"]["stages"] == ["raw", "cleaned", "final"]
+
+    result_events = [payload for event, payload in events if event == "dictation-result"]
+    assert len(result_events) == 1
+    sse_payload = result_events[0]
+    assert sse_payload["text"] == "*Suzy steps closer.*"
+    assert sse_payload["has_repair_trace"] is True
+    assert "raw" not in sse_payload
+    assert "cleaned" not in sse_payload
+    assert "repair_trace" not in sse_payload
+    assert "repair_trace" not in json.dumps(mod.session_transcript)
+    assert mod._vocab_cache == original_vocab_cache
+
+
+def test_dictation_transcript_sse_omits_raw_text(monkeypatch, mod):
+    events = []
+    monkeypatch.setattr(mod, "broadcast_event", lambda event, payload: events.append((event, payload)))
+
+    mod.DictationHandler._emit_dictation_transcript(object(), "req1", "final", "raw secret text", latency_ms=12)
+
+    assert events == [("dictation-transcript", {
+        "requestId": "req1",
+        "phase": "final",
+        "has_text": True,
+        "source": "whisper",
+        "ts": events[0][1]["ts"],
+        "latency_ms": 12,
+    })]
+    assert "text" not in events[0][1]
+    assert "raw secret text" not in json.dumps(events[0][1])
+
+
+def test_extension_ignores_dictation_transcript_text_preview():
+    source = (SRC.parents[1] / "extension" / "index.js").read_text()
+    start = source.index("sseSource.addEventListener('dictation-transcript'")
+    end = source.index("sseSource.addEventListener('dictation-result'", start)
+    block = source[start:end]
+
+    assert "data.text" not in block
+    assert "const preview = 'speech'" in block
+
+
+def test_vocab_accept_path_persists_alias_only_without_repair_trace(monkeypatch, mod):
+    sent = {}
+    writes = []
+
+    class DummyHandler:
+        def read_json_body(self):
+            return {"correct": "*Suzy steps closer.*", "aliases": ["um suzie steps closer"]}
+
+        def send_json(self, data, status=200):
+            sent["status"] = status
+            sent["data"] = data
+
+        def send_error_json(self, message, **kwargs):  # pragma: no cover - failure path
+            raise AssertionError((message, kwargs))
+
+    def fake_atomic_write(path, data):
+        writes.append((path, data))
+
+    monkeypatch.setattr(mod, "load_vocab", lambda: [])
+    monkeypatch.setattr(mod, "_atomic_write", fake_atomic_write)
+    monkeypatch.setattr(mod, "_invalidate_vocab_cache", lambda: None)
+
+    mod.DictationHandler._handle_vocab_add(DummyHandler())
+
+    assert sent["status"] == 200
+    assert sent["data"]["added"] == {
+        "correct": "*Suzy steps closer.*",
+        "aliases": ["um suzie steps closer"],
+    }
+    assert len(writes) == 1
+    persisted = writes[0][1].decode("utf-8")
+    assert "*Suzy steps closer.*" in persisted
+    assert "um suzie steps closer" in persisted
+    assert "repair_trace" not in persisted
+    assert "in_ram_only" not in persisted
 
 
 def test_rp_enhance_payload_includes_scene_continuity(monkeypatch, mod):

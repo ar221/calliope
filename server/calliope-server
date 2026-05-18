@@ -3871,6 +3871,35 @@ def _build_persona_pov_prompt(persona: dict, character: dict, chat_context: str,
     return system_prompt, ""
 
 
+def build_repair_trace(raw: str, cleaned: str = "", final: str = "") -> dict:
+    """POL-17: expose raw→cleaned→final repair state without persistence.
+
+    The returned object is intentionally safe to ship to transient clients and
+    SSE consumers. It is not appended to `session_transcript`, not written to
+    vocab, and carries an explicit persistence marker so UI code can distinguish
+    in-RAM repair review from user-accepted vocabulary.
+    """
+    raw = str(raw or "")
+    cleaned = str(cleaned or "")
+    final = str(final or "")
+    stages: list[str] = []
+    if raw:
+        stages.append("raw")
+    if cleaned and cleaned != raw:
+        stages.append("cleaned")
+    baseline = cleaned or raw
+    if final and final != baseline:
+        stages.append("final")
+    return {
+        "raw": raw,
+        "cleaned": cleaned,
+        "final": final,
+        "stages": stages,
+        "has_changes": bool((cleaned and cleaned != raw) or (final and final != baseline)),
+        "persistence": "in_ram_only",
+    }
+
+
 def run_pipeline(text: str, mode: dict,
                  context: str = "",
                  persona_id: str = "",
@@ -5587,6 +5616,13 @@ WEB_UI = r"""<!DOCTYPE html>
         <div class="result-row-body" id="rowCleanedBody"></div>
       </div>
     </div>
+    <div class="repair-card" id="repairCard" style="display:none;margin:8px 0;padding:10px;border:1px solid var(--surface-high);border-radius:var(--radius-sm);background:rgba(255,255,255,0.03)">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px">
+        <span style="font-size:12px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">Repair trace</span>
+        <span style="font-size:11px;color:var(--text-dim)">RAM only · vocab persists only on Accept</span>
+      </div>
+      <div id="repairStages" style="display:flex;flex-direction:column;gap:6px"></div>
+    </div>
     <textarea class="result-box" id="resultText" rows="6" spellcheck="true" placeholder="Transcription appears here. Edit it, then copy."></textarea>
     <div class="result-actions">
       <button class="btn" onclick="clearResult()">
@@ -5782,12 +5818,22 @@ let autoSendToST = localStorage.getItem('dictation.autoSend') === '1';
 const PILL_TTL_MS = 60_000;
 const PILL_PREVIEW_MAX = 60;
 let lastResult = null;         // { text, raw, cleaned, mode, expiresAt }
+let lastRepairTrace = null;    // POL-17: in-RAM raw→cleaned→final review state
 let pillTimer = null;
 let pillTickTimer = null;
 
 // Embed mode (ST extension iframe)
 const isEmbed = document.querySelector('meta[name="dictation-embed"]')?.content === '1';
 const embedConfig = window.DICTATION_EMBED_CONFIG || {};
+const embedParentOrigin = (() => {
+  try { return new URL(document.referrer).origin || ''; }
+  catch { return ''; }
+})();
+
+function postToEmbedParent(payload) {
+  if (!isEmbed || !embedParentOrigin) return;
+  try { window.parent.postMessage(payload, embedParentOrigin); } catch {}
+}
 
 // VAD / level meter
 let audioContext = null;
@@ -5888,9 +5934,7 @@ async function loadModes() {
   setMode(initial, { persist: false });
 
   // Signal readiness to parent window (if embedded).
-  if (isEmbed) {
-    try { window.parent.postMessage({ type: 'dictation-ready' }, '*'); } catch {}
-  }
+  postToEmbedParent({ type: 'dictation-ready' });
 }
 
 function renderModeChips() {
@@ -6633,6 +6677,7 @@ async function sendAudio() {
       // Backend echoes the resolved mode id; fall back if missing.
       lastUsedMode = data.mode || currentMode;
       showResult(data.text, { raw: lastRawText, cleaned: data.cleaned || '',
+                              repair_trace: data.repair_trace || null,
                               mode: lastUsedMode,
                               formatting_skipped: !!data.formatting_skipped,
                               formatting_reason: data.formatting_reason || '' });
@@ -6699,7 +6744,9 @@ async function regenerate() {
     } else {
       const resolvedMode = data.mode || regenMode;
       lastUsedMode = resolvedMode;
-      showResult(data.text, { raw: lastRawText, mode: resolvedMode,
+      showResult(data.text, { raw: lastRawText, cleaned: data.cleaned || '',
+                              repair_trace: data.repair_trace || null,
+                              mode: resolvedMode,
                               formatting_skipped: !!data.formatting_skipped,
                               formatting_reason: data.formatting_reason || '' });
       if (data.formatting_skipped) {
@@ -6725,6 +6772,8 @@ function showResult(text, meta) {
   resultText.value = text;
   resultArea.classList.add('visible');
   label.textContent = 'Tap to record';
+  lastRepairTrace = (meta && meta.repair_trace && meta.repair_trace.persistence === 'in_ram_only')
+    ? meta.repair_trace : null;
 
   // Phase 1: populate Raw / Cleaned accordion rows when different from formatted text.
   const rows = document.getElementById('resultRows');
@@ -6749,6 +6798,8 @@ function showResult(text, meta) {
     }
   }
 
+  renderRepairTrace();
+
   // Phase 2.5C: start the last-result pill (lives 60s independently of result area).
   showLastResultPill(text, meta);
 
@@ -6757,19 +6808,9 @@ function showResult(text, meta) {
     .then(() => showToast('Copied to clipboard'))
     .catch(() => showToast('Tap Copy to copy'));
 
-  // Emit to parent window if embedded.
-  if (isEmbed && meta) {
-    try {
-      window.parent.postMessage({
-        type: 'dictation-result',
-        text: text,
-        raw: meta.raw || '',
-        mode: meta.mode || currentMode,
-        formatting_skipped: !!meta.formatting_skipped,
-        formatting_reason: meta.formatting_reason || '',
-      }, '*');
-    } catch {}
-  }
+  // POL-17: do not post final dictation text through iframe parent messaging.
+  // The ST extension receives canonical text via authed SSE; parent messaging
+  // is reserved for non-sensitive readiness only.
 
   // Autofocus the textarea on desktop (pointer:fine), never on touch.
   try {
@@ -6808,6 +6849,73 @@ function clearResult() {
   lastRawText = '';
   const rows = document.getElementById('resultRows');
   if (rows) rows.style.display = 'none';
+  lastRepairTrace = null;
+  renderRepairTrace();
+}
+
+function escapeHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+function repairStageLabel(stage) {
+  return stage === 'raw' ? 'Raw ASR'
+    : stage === 'cleaned' ? 'Cleaned'
+    : stage === 'final' ? 'Final'
+    : stage;
+}
+
+function renderRepairTrace() {
+  const card = document.getElementById('repairCard');
+  const stagesEl = document.getElementById('repairStages');
+  if (!card || !stagesEl) return;
+  const trace = lastRepairTrace;
+  if (!trace || !trace.has_changes || !Array.isArray(trace.stages) || !trace.stages.length) {
+    card.style.display = 'none';
+    stagesEl.innerHTML = '';
+    return;
+  }
+  card.style.display = '';
+  const finalText = String(resultText.value || trace.final || '');
+  const rawText = String(trace.raw || '');
+  stagesEl.innerHTML = trace.stages.map(stage => {
+    const value = String(trace[stage] || '');
+    const isFinal = stage === 'final';
+    const accept = isFinal && finalText && rawText && rawText !== finalText
+      ? `<button class="btn" style="padding:5px 8px;font-size:12px" onclick="acceptRepairAsVocab()">Accept as vocab</button>` : '';
+    return `<div style="display:grid;grid-template-columns:70px 1fr auto;gap:8px;align-items:start">
+      <span style="font-size:12px;color:var(--text-dim);padding-top:4px">${escapeHtml(repairStageLabel(stage))}</span>
+      <span style="font-size:13px;line-height:1.35;white-space:pre-wrap">${escapeHtml(value)}</span>
+      ${accept}
+    </div>`;
+  }).join('');
+}
+
+async function acceptRepairAsVocab() {
+  if (!lastRepairTrace) return;
+  const raw = String(lastRepairTrace.raw || '').trim();
+  const finalText = String(resultText.value || lastRepairTrace.final || '').trim();
+  if (!raw || !finalText || raw === finalText) {
+    showToast('No repair to save');
+    return;
+  }
+  try {
+    const resp = await fetch('/vocab', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ correct: finalText, aliases: [raw] }),
+    });
+    const data = await resp.json();
+    if (!resp.ok || data.error) {
+      showToast('⚠ ' + (data.error || 'Failed to save vocab'), 4000);
+      return;
+    }
+    renderVocab(data.vocab || []);
+    showToast('Saved explicit vocab repair');
+  } catch (err) {
+    showToast('Network error');
+  }
 }
 
 // ─── Session log ──────────────────────────────────────
@@ -8015,19 +8123,19 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
 
     def _emit_dictation_transcript(self, request_id: str, phase: str, text: str,
                                    **details) -> None:
-        """Best-effort raw-ASR transcript SSE event.
+        """Best-effort transcript-progress SSE event.
 
         Whisper Flow's useful pattern is the partial/final event contract, not
-        its model loop. Our first low-risk steal emits the Whisper final as a
-        separate preview event before formatter/pipeline work; canonical
-        `dictation-result` remains the source of truth for insertion.
+        its model loop. For POL-17 privacy, this event deliberately omits raw
+        ASR text and only reports that a transcript phase exists; the HTTP
+        response remains the phone-local review surface.
         """
         if not request_id or not text:
             return
         payload = {
             "requestId": request_id,
             "phase": phase,
-            "text": text,
+            "has_text": True,
             "source": "whisper",
             "ts": time.time(),
         }
@@ -8231,6 +8339,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         persona = query.get("persona", [""])[0]
         character = query.get("character", [""])[0]
         mode = query.get("mode", [""])[0]
+
 
         if not embed and not (chat or persona or character or mode):
             return WEB_UI
@@ -9008,10 +9117,12 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                     result_entry_id = new_entry["id"]
             transcript_count = len(session_transcript)
 
+        repair_trace = build_repair_trace(text, cleaned_text, formatted)
         self.send_json({
             "text": formatted,
             "raw": text,
             "cleaned": cleaned_text,
+            "repair_trace": repair_trace,
             "mode": mode.get("id"),
             "provider": provider,
             "transcript_count": transcript_count,
@@ -9246,6 +9357,8 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             with transcript_lock:
                 transcript_count = len(session_transcript)
 
+            repair_trace = build_repair_trace(raw_text, cleaned_text, output_text)
+
             # MVP-13: emit canonical `dictation-result` after streaming. The
             # ST extension overwrites whatever it accumulated from
             # `dictation-token` deltas with this — guarantees no drift between
@@ -9255,8 +9368,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 broadcast_event("dictation-result", {
                     "requestId": request_id,
                     "text": output_text,
-                    "raw": raw_text,
-                    "cleaned": cleaned_text,
+                    "has_repair_trace": repair_trace.get("has_changes", False),
                     "mode": mode.get("id", ""),
                     "provider": provider,
                     "formatting_skipped": formatting_skipped,
@@ -9308,6 +9420,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 "text": output_text,
                 "raw": raw_text,
                 "cleaned": cleaned_text,
+                "repair_trace": repair_trace,
                 "mode": mode.get("id"),
                 "provider": provider,
                 "transcript_count": transcript_count,

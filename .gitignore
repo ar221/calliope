@@ -8,3 +8,6 @@ node_modules/
 # Local runtime/cache
 .cache/
 *.log
+
+# Agent scratch/reports
+.agents/

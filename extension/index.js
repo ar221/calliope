@@ -9,8 +9,9 @@
 // phase 2e) — both sides must agree:
 //   server -> extension:
 //     { type: 'dictation-ready' }
-//     SSE dictation-transcript { requestId, phase, text, source, latency_ms? } // raw ASR preview
-//     { type: 'dictation-result', text, raw?, mode?, formatting_skipped?, formatting_reason? }
+//     SSE dictation-transcript { requestId, phase, has_text, source, latency_ms? } // no raw ASR text over SSE
+//     SSE dictation-result { text, has_repair_trace?, mode?, formatting_skipped?, formatting_reason? }
+//     postMessage dictation-ready only; dictation text flows through authed SSE, not iframe parent messaging
 //     { type: 'dictation-edit', text }        // optional live mirror
 //   extension -> server:
 //     { type: 'dictation-set-context', context: string }
@@ -1397,11 +1398,11 @@ function connectSSE() {
         catch { WARN('SSE dictation-transcript: bad JSON'); return; }
         const requestId = String(data.requestId || '');
         const phase = String(data.phase || '');
-        const text = String(data.text || '').trim();
-        if (!requestId || !text) return;
+        if (!requestId) return;
         const label = phase === 'final' ? 'Heard' : 'Hearing';
+        const preview = 'speech';
         const latency = Number.isFinite(Number(data.latency_ms)) ? ` · ${Math.round(Number(data.latency_ms))}ms` : '';
-        paintStateBar('transcribing', `${label}: ${text}${latency}`);
+        paintStateBar('transcribing', `${label}: ${preview}${latency}`);
         showStateBar();
     });
 
@@ -1459,7 +1460,10 @@ function connectSSE() {
             const reason = data.formatting_reason ? `: ${data.formatting_reason}` : '';
             window.toastr.warning(`RP formatting skipped${reason}. Raw transcript used.`, 'Dictation Bridge');
         } else if (window.toastr) {
-            window.toastr.success('Received from phone', 'Dictation Bridge', { timeOut: 1500 });
+            const repair = data.has_repair_trace === true
+                ? ' · repair trace available on phone'
+                : '';
+            window.toastr.success(`Received from phone${repair}`, 'Dictation Bridge', { timeOut: 1500 });
         }
 
         // POL-3: render low-confidence "did you mean?" banner if the server
@@ -1522,6 +1526,7 @@ function buildPairedPhoneUrl({ embed = true } = {}) {
     const base = cfg.serverUrl.replace(/\/+$/, '');
     const qp = new URLSearchParams();
     if (embed) qp.set('embed', '1');
+
     if (ctx.chatId) qp.set('chat', String(ctx.chatId));
     if (ctx.personaId) qp.set('persona', String(ctx.personaId));
     if (ctx.characterId) qp.set('character', String(ctx.characterId));

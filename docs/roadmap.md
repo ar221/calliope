@@ -17,6 +17,7 @@ Status date: 2026-05-18.
 - Group-chat state payloads: group id, group members, and last speaker.
 - TTS controls: Kokoro voices, voice profiles, test button, auto-read toggles, audiobook/export endpoints.
 - Hardened user units and CORS override support.
+- POL-17 first slice: in-RAM Raw → Cleaned → Final repair trace in phone UI and result payloads; explicit “Accept as vocab” is the only persistence path.
 
 ## Release-hardening queue
 
