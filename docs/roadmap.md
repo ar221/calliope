@@ -18,6 +18,8 @@ Status date: 2026-05-18.
 - TTS controls: Kokoro voices, voice profiles, test button, auto-read toggles, audiobook/export endpoints.
 - Hardened user units and CORS override support.
 - POL-17 first slice: in-RAM Raw → Cleaned → Final repair trace in phone UI and result payloads; explicit “Accept as vocab” is the only persistence path.
+- MVP-26 first slice: request-scoped in-memory scene contract injected into RP+ and Persona POV prompts; no persistent scene DB.
+- MVP-27 first slice: deterministic local RP eval harness with synthetic fixtures for intent/addressee/privacy/expansion checks.
 
 ## Release-hardening queue
 

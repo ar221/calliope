@@ -1,0 +1,20 @@
+[
+  {
+    "id": "intent-addressee-fast",
+    "raw": "I step closer and tell Elara I missed her",
+    "output": "*I step closer.* \"Elara, I missed you.\"",
+    "required_terms": ["Elara", "missed"],
+    "forbidden_terms": ["Elara:"],
+    "addressee": "Elara",
+    "latency_ms": 900,
+    "privacy_path": "synthetic"
+  },
+  {
+    "id": "over-expansion-fixture",
+    "raw": "I nod",
+    "output": "*I nod slowly, thinking about the entire history of the room, the storm outside, and three new characters entering.*",
+    "forbidden_terms": ["three new characters"],
+    "max_expansion_ratio": 2.0,
+    "privacy_path": "synthetic"
+  }
+]

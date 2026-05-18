@@ -2574,6 +2574,79 @@ def sanitize_scene_continuity(value: object) -> str:
     return "\n".join(lines)[:2000]
 
 
+def build_scene_contract(state: dict | None = None, *,
+                         persona_id: str = "",
+                         character_id: str = "",
+                         chat_context: str = "",
+                         scene_continuity: str = "") -> dict:
+    """MVP-26: build an in-memory scene contract for formatter prompts.
+
+    This is deliberately request-scoped: it normalizes the current ST snapshot
+    and prompt inputs into compact guidance, but does not persist memory or
+    create a database-backed scene layer.
+    """
+    src = dict(state or {})
+    persona = (persona_id or src.get("personaId") or "").strip()
+    character = (character_id or src.get("characterId") or "").strip()
+    chat_type = (src.get("chatType") or "").strip().lower()
+    if chat_type == "individual":
+        chat_type = "solo"
+    continuity = sanitize_scene_continuity(scene_continuity or src.get("sceneContinuity") or "")
+    addressee = (src.get("characterName") or character or "").strip()
+    members = src.get("groupMembers") if isinstance(src.get("groupMembers"), list) else []
+    last_speaker = (src.get("lastSpeaker") or "").strip()
+    facts: list[str] = []
+    if persona:
+        facts.append(f"persona: {persona}")
+    if addressee:
+        label = "group" if chat_type == "group" else "addressee"
+        facts.append(f"{label}: {addressee}")
+    if chat_type:
+        facts.append(f"chat_type: {chat_type}")
+    if last_speaker:
+        facts.append(f"last_speaker: {last_speaker}")
+    if members:
+        names = []
+        for item in members[:8]:
+            if isinstance(item, dict):
+                name = str(item.get("name") or item.get("id") or "").strip()
+            else:
+                name = str(item or "").strip()
+            if name:
+                names.append(name)
+        if names:
+            facts.append("group_members: " + ", ".join(names))
+    if continuity:
+        facts.append("scene_continuity: " + continuity[:1200])
+    if chat_context:
+        facts.append("recent_chat_available: true")
+    rules = [
+        "Rewrite only the dictated input; do not continue the scene.",
+        "Preserve the dictated speaker, intent, POV, addressee, and intensity.",
+        "Do not invent new scene facts, locations, clothing, or other-character dialogue.",
+    ]
+    if chat_type == "group":
+        rules.append("In group chat, do not assume the last speaker is the addressee unless dictated.")
+    return {
+        "persistence": "in_memory_only",
+        "persona_id": persona,
+        "character_id": character,
+        "chat_type": chat_type,
+        "addressee": addressee,
+        "facts": facts,
+        "rules": rules,
+        "prompt": "\n".join(["[SCENE CONTRACT — request-scoped, do not persist]"] + facts + ["rules:"] + [f"- {r}" for r in rules]),
+    }
+
+
+def scene_contract_prompt(contract: dict | None) -> str:
+    """Return compact scene-contract prompt text, or empty string."""
+    if not isinstance(contract, dict):
+        return ""
+    prompt = str(contract.get("prompt") or "").strip()
+    return prompt[:2000]
+
+
 def update_state(payload: dict) -> dict:
     """Merge incoming ST state payload. Returns snapshot after merge."""
     allowed_keys = {
@@ -2791,6 +2864,7 @@ def format_rp(text: str, mode: int = 1, context: str = "",
                prose_format: bool = False, character_id: str = "",
                chat_context: str = "",
                scene_continuity: str = "",
+               scene_contract: dict | None = None,
                system_prompt_override: str = "",
                endpoint_override: str = "",
                skip_persona_character: bool = False,
@@ -2807,6 +2881,7 @@ def format_rp(text: str, mode: int = 1, context: str = "",
     caller (persona_pov step) can build its own framing.
     user_content_override bypasses the default user-content assembly entirely.
     scene_continuity is compact visual/spatial state from ST extensions.
+    scene_contract is request-scoped MVP-26 guidance; it is never persisted.
 
     request_id: when non-empty, request `stream: true` from the proxy and emit
     `dictation-token` SSE events with {requestId, delta, done} as tokens
@@ -2837,6 +2912,10 @@ def format_rp(text: str, mode: int = 1, context: str = "",
     if mode == 2 and prose_format:
         system_prompt = system_prompt.replace(RP_FMT_ASTERISKS.strip(), RP_FMT_PROSE.strip())
 
+    contract_prompt = scene_contract_prompt(scene_contract)
+    if mode == 2 and contract_prompt:
+        system_prompt += "\n\n" + contract_prompt
+
     # Append impersonation rules if enabled
     if mode == 2 and use_rules:
         system_prompt += "\n\n" + RP_RULES_CONDENSED
@@ -2865,7 +2944,9 @@ def format_rp(text: str, mode: int = 1, context: str = "",
     else:
         user_content = ""
 
-        if mode == 2 and scene_continuity.strip():
+        if mode == 2 and contract_prompt:
+            user_content += contract_prompt + "\n\n"
+        elif mode == 2 and scene_continuity.strip():
             user_content += (
                 "[SCENE CONTINUITY from SillyTavern tracker — respect these current visual/spatial facts; "
                 "do NOT narrate them unless relevant to the dictated line:]\n"
@@ -3830,7 +3911,8 @@ def build_whisper_prompt(character_id: str = "") -> str:
 
 # ─── Phase 2: Pipeline runner ────────────────────────────
 def _build_persona_pov_prompt(persona: dict, character: dict, chat_context: str,
-                              scene_continuity: str = "") -> tuple[str, str]:
+                              scene_continuity: str = "",
+                              scene_contract: dict | None = None) -> tuple[str, str]:
     """Build the (system_prompt, user_content) pair for persona_pov mode."""
     persona_name = persona.get("name", "the persona")
     character_name = character.get("name", "the character")
@@ -3844,7 +3926,10 @@ def _build_persona_pov_prompt(persona: dict, character: dict, chat_context: str,
     char_card = (character.get("card") or "").strip()
     if char_card:
         sections.append(char_card)
-    if scene_continuity.strip():
+    contract_prompt = scene_contract_prompt(scene_contract)
+    if contract_prompt:
+        sections.append(contract_prompt)
+    elif scene_continuity.strip():
         sections.append(
             "Current scene continuity from SillyTavern tracker:\n"
             + scene_continuity.strip()[:2000]
@@ -3906,6 +3991,7 @@ def run_pipeline(text: str, mode: dict,
                  character_id: str = "",
                  chat_context: str = "",
                  scene_continuity: str = "",
+                 scene_contract: dict | None = None,
                  use_rules: bool = False,
                  prose_format: bool = False,
                  provider: str = DEFAULT_FORMATTER_PROVIDER,
@@ -3961,6 +4047,14 @@ def run_pipeline(text: str, mode: dict,
 
     out = text
     provider = normalize_formatter_provider(provider)
+    if scene_contract is None:
+        scene_contract = build_scene_contract(
+            snapshot_state(),
+            persona_id=persona_id,
+            character_id=character_id,
+            chat_context=chat_context,
+            scene_continuity=scene_continuity,
+        )
     cleaned_text = ""
     formatting_skipped = False
     formatting_reason = ""
@@ -4057,6 +4151,7 @@ def run_pipeline(text: str, mode: dict,
                 character_id=character_id if mode.get("use_character") else "",
                 chat_context=chat_context if mode.get("use_chat_context") else "",
                 scene_continuity=scene_continuity,
+                scene_contract=scene_contract,
                 system_prompt_override=system,
                 endpoint_override="/v1/messages",
                 temperature=mode.get("temperature"),
@@ -4080,6 +4175,7 @@ def run_pipeline(text: str, mode: dict,
                 character_id=character_id if mode.get("use_character") else "",
                 chat_context=chat_context if mode.get("use_chat_context") else "",
                 scene_continuity=scene_continuity,
+                scene_contract=scene_contract,
                 system_prompt_override=system,
                 endpoint_override=endpoint,
                 temperature=mode.get("temperature"),
@@ -4108,6 +4204,7 @@ def run_pipeline(text: str, mode: dict,
                     character_id=character_id,
                     chat_context=chat_context,
                     scene_continuity=scene_continuity,
+                    scene_contract=scene_contract,
                     temperature=mode.get("temperature"),
                     provider=provider,
                     request_id=request_id,  # MVP-13
@@ -4125,7 +4222,7 @@ def run_pipeline(text: str, mode: dict,
 
             character = {"name": char_name, "card": char_card_text}
             system_prompt, _unused_user_override = _build_persona_pov_prompt(
-                persona, character, chat_context, scene_continuity,
+                persona, character, chat_context, scene_continuity, scene_contract,
             )
             user_content = f"The dictated line:\n{out}"
             endpoint = "/v1/pyrite/messages" if mode.get("preset") == "pyrite" else "/v1/messages"

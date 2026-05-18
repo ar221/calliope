@@ -468,3 +468,84 @@ def test_rp_enhance_payload_includes_scene_continuity(monkeypatch, mod):
     user_content = json.dumps(captured["payload"])
     assert "SCENE CONTINUITY" in user_content
     assert "location: hallway" in user_content
+
+
+def test_build_scene_contract_is_in_memory_and_prompt_ready(mod):
+    contract = mod.build_scene_contract(
+        {
+            "personaId": "lord-rashid",
+            "characterId": "elara",
+            "characterName": "Elara",
+            "chatType": "individual",
+            "sceneContinuity": "location: library; clothing: black dress",
+        },
+        chat_context="Elara smiled.",
+    )
+
+    assert contract["persistence"] == "in_memory_only"
+    assert contract["chat_type"] == "solo"
+    assert contract["addressee"] == "Elara"
+    assert "location: library" in contract["prompt"]
+    assert "do not persist" in contract["prompt"]
+    assert "Do not invent new scene facts" in contract["prompt"]
+
+
+def test_rp_enhance_payload_uses_scene_contract(monkeypatch, mod):
+    captured = {}
+
+    class FakeResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps({"content": "formatted"}).encode()
+
+    def fake_urlopen(req, timeout=None):
+        captured["payload"] = json.loads(req.data.decode())
+        return FakeResponse()
+
+    contract = mod.build_scene_contract({
+        "personaId": "lord-rashid",
+        "characterId": "elara",
+        "characterName": "Elara",
+        "chatType": "group",
+        "lastSpeaker": "Mira",
+    })
+    monkeypatch.setattr(mod, "probe_formatter", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+
+    out, skipped, reason = mod.format_rp(
+        "I step closer.", mode=2, scene_contract=contract,
+    )
+
+    assert out == "formatted"
+    assert not skipped
+    assert reason == ""
+    payload = json.dumps(captured["payload"])
+    assert "SCENE CONTRACT" in payload
+    assert "last_speaker: Mira" in payload
+    assert "do not persist" in payload
+
+
+def test_persona_pov_prompt_accepts_scene_contract(mod):
+    contract = mod.build_scene_contract({
+        "personaId": "lord-rashid",
+        "characterId": "elara",
+        "characterName": "Elara",
+        "chatType": "individual",
+    })
+    system, _ = mod._build_persona_pov_prompt(
+        {"name": "Ayaz", "description": "Direct."},
+        {"name": "Elara", "card": "A careful listener."},
+        "",
+        scene_contract=contract,
+    )
+
+    assert "SCENE CONTRACT" in system
+    assert "Preserve the dictated speaker" in system
+    assert "Do not invent new scene facts" in system
