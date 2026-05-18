@@ -1222,6 +1222,19 @@ def get_token() -> str:
     return ensure_token()
 
 
+def _redact_sensitive_url_params(text: str) -> str:
+    """Redact bearer-like query parameters before request lines reach the journal."""
+    # BaseHTTPRequestHandler log lines include the raw request target, so
+    # EventSource/pairing URLs such as /events?token=... otherwise persist the
+    # bearer token in journalctl. Keep the path useful while removing secrets.
+    return re.sub(
+        r"([?&](?:token|access_token|auth|authorization)=)([^\s&]+)",
+        r"\1[REDACTED]",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+
 def regenerate_token() -> str:
     """Rotate the bearer token unconditionally (wizard --force / rotation)."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -3344,7 +3357,7 @@ def hallucination_filter(text: str) -> tuple[str, bool, str]:
 #      `_handle_transcribe` BEFORE the pipeline runs (because it forces a
 #      mode override to `grammar_clean`). See `OOC_PREFIX_RE` below.
 #
-# Reference: ADR-11, Agent 3 §3, vds-roadmap §4 Phase 5 (POL-1).
+# Reference: ADR-11, Agent 3 §3, docs/roadmap.md (POL-1).
 
 # Hardcoded fallback sentinel + intent grammar. User override via
 # voice_macros.yaml is hot-reloadable (mtime cache, mirrors load_modes).
@@ -5411,15 +5424,14 @@ WEB_UI = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<!-- POL-15: voice-command cheatsheet modal. Static affordance — voice
-     grammar is Phase 5, this surfaces the v1 commitment so users learn
-     the verbs before they're live. -->
+<!-- POL-15: voice-command cheatsheet modal. Voice grammar is live when
+     voiceCommandsEnabled is on; this lists the current v1 command set. -->
 <div class="modal-backdrop" id="cheatsheetBackdrop"
      onclick="if(event.target===this)closeCheatsheetModal()"
      role="dialog" aria-modal="true" aria-labelledby="cheatsheetTitle">
   <div class="modal-card cheatsheet">
     <div class="modal-head">
-      <span id="cheatsheetTitle">Voice commands <span class="coming-soon">soon</span></span>
+      <span id="cheatsheetTitle">Voice commands <span class="coming-soon">live</span></span>
       <button class="modal-close" type="button" onclick="closeCheatsheetModal()" aria-label="Close">&times;</button>
     </div>
     <div class="modal-body">
@@ -5433,8 +5445,8 @@ WEB_UI = r"""<!DOCTYPE html>
         Tap mic = toggle (tap again to send).
       </div>
       <div class="note" style="margin-top:14px;color:var(--warning)">
-        Voice grammar isn&rsquo;t shipped yet; the affordances above are
-        the v1 commitment. Track progress via Phase 5 in the roadmap.
+        Voice grammar is live when enabled in SillyTavern settings. Commands
+        are dispatched through the ST extension that is subscribed to SSE.
       </div>
     </div>
   </div>
@@ -5681,10 +5693,25 @@ WEB_UI = r"""<!DOCTYPE html>
 // API calls. Loopback clients bypass auth server-side; this is for LAN
 // access (phone, ST popup at LAN IP).
 (function () {
-  const url_tok = new URLSearchParams(location.search).get('token') || '';
+  const params = new URLSearchParams(location.search);
+  const url_tok = params.get('token') || '';
   const stored = sessionStorage.getItem('dictationToken') || '';
   const TOKEN = url_tok || stored;
-  if (url_tok) sessionStorage.setItem('dictationToken', url_tok);
+  window.calliopeAuthStatus = {
+    hasToken: !!TOKEN,
+    tokenSource: url_tok ? 'url' : (stored ? 'session' : 'missing'),
+    unauthorized: false,
+    lastStatus: 0,
+    lastError: '',
+  };
+  if (url_tok) {
+    sessionStorage.setItem('dictationToken', url_tok);
+    try {
+      params.delete('token');
+      const clean = location.pathname + (params.toString() ? '?' + params.toString() : '') + location.hash;
+      history.replaceState(null, '', clean);
+    } catch (e) { /* best-effort URL scrub */ }
+  }
   if (!TOKEN) return;
   const _origFetch = window.fetch.bind(window);
   window.fetch = function (input, init) {
@@ -5692,7 +5719,15 @@ WEB_UI = r"""<!DOCTYPE html>
     const headers = new Headers(init.headers || {});
     if (!headers.has('Authorization')) headers.set('Authorization', 'Bearer ' + TOKEN);
     init.headers = headers;
-    return _origFetch(input, init);
+    return _origFetch(input, init).then((resp) => {
+      window.calliopeAuthStatus.lastStatus = resp.status;
+      if (resp.status === 401) {
+        window.calliopeAuthStatus.unauthorized = true;
+        window.calliopeAuthStatus.lastError = 'unauthorized';
+        try { sessionStorage.removeItem('dictationToken'); } catch (e) {}
+      }
+      return resp;
+    });
   };
   const _OrigES = window.EventSource;
   window.EventSource = function (url, opts) {
@@ -7293,6 +7328,34 @@ function ageHuman(seconds) {
   return `${Math.round(seconds/3600)}h ago`;
 }
 
+function formatStContext(s) {
+  if (!s) return '';
+  const parts = [];
+  const chatType = String(s.chatType || '').toLowerCase();
+  if (chatType === 'group') {
+    if (s.characterName) parts.push(`Group: ${s.characterName}`);
+    else if (s.groupId || s.chatId) parts.push(`Group: ${s.groupId || s.chatId}`);
+    if (s.lastSpeaker) parts.push(`Last speaker: ${s.lastSpeaker}`);
+  } else {
+    if (s.characterName) parts.push(`Character: ${s.characterName}`);
+    else if (s.characterId) parts.push(`Character: ${s.characterId}`);
+  }
+  if (s.personaId) parts.push(`Persona: ${String(s.personaId).split(/[\\/]/).pop()}`);
+  const modeId = currentMode || s.rememberedMode || s.mode;
+  if (modeId) {
+    const m = getMode(modeId);
+    parts.push(`Mode: ${m?.label || modeId}`);
+  }
+  return parts.join(' • ');
+}
+
+function authProblemText() {
+  const auth = window.calliopeAuthStatus || {};
+  if (auth.unauthorized) return 'Not paired — stale token. Reopen from SillyTavern.';
+  if (!auth.hasToken) return 'Not paired — open this page from SillyTavern.';
+  return '';
+}
+
 function renderFollowBanner() {
   // Keep Send-to-ST button enable state in sync with ST connection status.
   updateSendToStButton();
@@ -7305,40 +7368,39 @@ function renderFollowBanner() {
   el.style.display = '';
   el.classList.remove('fresh', 'stale', 'override');
 
+  const authText = authProblemText();
+  if (authText) {
+    el.classList.add('stale');
+    icon.textContent = '🔐';
+    text.textContent = authText;
+    resync.style.display = 'none';
+    return;
+  }
+
   if (!stState || !stState.lastUpdated) {
     el.classList.add('stale');
     icon.textContent = '⚠';
-    text.textContent = 'ST not connected — manual mode';
+    text.textContent = 'Paired — waiting for SillyTavern context. Reopen from the ST mic if this stays here.';
     resync.style.display = 'none';
     return;
   }
   if (!stFollow) {
     el.classList.add('override');
     icon.textContent = '✋';
-    const parts = [];
-    if (stState.characterName) parts.push(stState.characterName);
-    if (stState.mode || currentMode) parts.push(currentMode || stState.mode);
-    text.textContent = `Override — ${parts.join(' • ') || 'manual'}`;
+    text.textContent = `Manual override — ${formatStContext(stState) || 'no ST context selected'}`;
     resync.style.display = '';
-    resync.textContent = 'Re-sync';
+    resync.textContent = 'Follow ST';
     return;
   }
   if (stStateFresh) {
     el.classList.add('fresh');
     icon.textContent = '📡';
-    const parts = [];
-    if (stState.characterName) parts.push(stState.characterName);
-    else if (stState.characterId) parts.push(stState.characterId);
-    if (currentMode) {
-      const m = getMode(currentMode);
-      parts.push(m?.label || currentMode);
-    }
-    text.textContent = `Following ST — ${parts.join(' • ') || '…'}`;
+    text.textContent = `Paired + following ST — ${formatStContext(stState) || 'context live'}`;
     resync.style.display = 'none';
   } else {
     el.classList.add('stale');
     icon.textContent = '⚠';
-    text.textContent = `ST stale (${ageHuman(stState.ageSeconds)}) — manual mode`;
+    text.textContent = `Paired, ST context stale (${ageHuman(stState.ageSeconds)}) — reopen from SillyTavern.`;
     resync.style.display = '';
     resync.textContent = 'Re-check';
   }
@@ -7347,9 +7409,16 @@ function renderFollowBanner() {
 async function fetchState() {
   try {
     const r = await fetch('/state', { cache: 'no-store' });
+    if (window.calliopeAuthStatus) {
+      window.calliopeAuthStatus.lastStatus = r.status;
+      if (r.status === 401) window.calliopeAuthStatus.unauthorized = true;
+    }
     if (!r.ok) return null;
     return await r.json();
-  } catch { return null; }
+  } catch (e) {
+    if (window.calliopeAuthStatus) window.calliopeAuthStatus.lastError = e?.message || 'network';
+    return null;
+  }
 }
 
 async function applyStateIfFresh(snap, { force = false } = {}) {
@@ -7817,7 +7886,7 @@ def _is_icon_path(path: str) -> bool:
 
 class DictationHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        log.info(fmt % args)
+        log.info(_redact_sensitive_url_params(fmt % args))
 
     def handle_one_request(self):
         """Override to demote the benign mobile-browser TLS EOF spam.
@@ -7838,6 +7907,13 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 )
                 return
             raise
+        except (BrokenPipeError, ConnectionResetError) as e:
+            log.debug(
+                "Client disconnected before response completed (benign): %s (%s)",
+                self.client_address,
+                e.__class__.__name__,
+            )
+            return
 
     def _client_addr(self) -> str:
         try:
@@ -7934,6 +8010,31 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             payload["details"] = details
         try:
             broadcast_event("dictation-state", payload)
+        except Exception:
+            pass
+
+    def _emit_dictation_transcript(self, request_id: str, phase: str, text: str,
+                                   **details) -> None:
+        """Best-effort raw-ASR transcript SSE event.
+
+        Whisper Flow's useful pattern is the partial/final event contract, not
+        its model loop. Our first low-risk steal emits the Whisper final as a
+        separate preview event before formatter/pipeline work; canonical
+        `dictation-result` remains the source of truth for insertion.
+        """
+        if not request_id or not text:
+            return
+        payload = {
+            "requestId": request_id,
+            "phase": phase,
+            "text": text,
+            "source": "whisper",
+            "ts": time.time(),
+        }
+        if details:
+            payload.update(details)
+        try:
+            broadcast_event("dictation-transcript", payload)
         except Exception:
             pass
 
@@ -9084,6 +9185,15 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 if ooc_mode is not None:
                     mode = ooc_mode
                     log.info("OOC prefix detected — mode override -> grammar_clean")
+
+            self._emit_dictation_transcript(
+                request_id,
+                "final",
+                raw_text,
+                mode=mode.get("id", ""),
+                language=language,
+                latency_ms=round((timing["whisper"] - timing["recv"]) * 1000),
+            )
 
             pipeline_steps = mode.get("pipeline", [])
             is_enhancement = any(s in pipeline_steps for s in ("rp_enhance", "persona_pov"))
