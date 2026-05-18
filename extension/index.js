@@ -9,6 +9,7 @@
 // phase 2e) — both sides must agree:
 //   server -> extension:
 //     { type: 'dictation-ready' }
+//     SSE dictation-transcript { requestId, phase, text, source, latency_ms? } // raw ASR preview
 //     { type: 'dictation-result', text, raw?, mode?, formatting_skipped?, formatting_reason? }
 //     { type: 'dictation-edit', text }        // optional live mirror
 //   extension -> server:
@@ -1216,6 +1217,30 @@ let sseReconnectDelay = 1000;
 const SSE_RECONNECT_CAP = 30_000;
 let sseReconnectTimer = null;
 let sseStatus = { state: 'disconnected', lastEventAt: 0, lastError: '' };
+let serverAuthStatus = { health: 'unknown', token: 'unknown', lastCheckedAt: 0, lastError: '' };
+
+function currentContextLabel() {
+    const ctx = currentContext();
+    const parts = [];
+    if (selected_group) {
+        const group = groups?.find(g => g.id == selected_group) || null;
+        if (group?.name) parts.push(`Group: ${group.name}`);
+        else if (ctx.chatId) parts.push(`Group: ${ctx.chatId}`);
+        const lastSpeaker = resolveLastSpeaker();
+        if (lastSpeaker) parts.push(`Last speaker: ${lastSpeaker}`);
+    } else {
+        const characterName = characters?.[this_chid]?.name || '';
+        if (characterName) parts.push(`Character: ${characterName}`);
+        else if (ctx.characterId) parts.push(`Character: ${ctx.characterId}`);
+    }
+    if (ctx.personaId) parts.push(`Persona: ${String(ctx.personaId).split(/[\\/]/).pop()}`);
+    return parts.join(' • ');
+}
+
+function tokenStatusLabel() {
+    if (!(settings().serverToken || '').trim()) return 'missing';
+    return serverAuthStatus.token || 'unknown';
+}
 
 function updateSseStatusIndicator() {
     const dot = document.getElementById('dictation_bridge_sse_dot');
@@ -1361,6 +1386,25 @@ function connectSSE() {
         }
     });
 
+    // Whisper-Flow steal: raw ASR final preview before formatter/pipeline work.
+    // It is intentionally separate from dictation-token/dictation-result so raw
+    // transcripts never write into #send_textarea or duplicate canonical output.
+    sseSource.addEventListener('dictation-transcript', (e) => {
+        sseStatus.lastEventAt = Date.now();
+        updateSseStatusIndicator();
+        let data;
+        try { data = JSON.parse(e.data); }
+        catch { WARN('SSE dictation-transcript: bad JSON'); return; }
+        const requestId = String(data.requestId || '');
+        const phase = String(data.phase || '');
+        const text = String(data.text || '').trim();
+        if (!requestId || !text) return;
+        const label = phase === 'final' ? 'Heard' : 'Hearing';
+        const latency = Number.isFinite(Number(data.latency_ms)) ? ` · ${Math.round(Number(data.latency_ms))}ms` : '';
+        paintStateBar('transcribing', `${label}: ${text}${latency}`);
+        showStateBar();
+    });
+
     sseSource.addEventListener('dictation-result', (e) => {
         sseStatus.lastEventAt = Date.now();
         updateSseStatusIndicator();
@@ -1472,20 +1516,41 @@ function disconnectSSE() {
     endStreamingSession();
 }
 
-function buildEmbedUrl() {
+function buildPairedPhoneUrl({ embed = true } = {}) {
     const cfg = settings();
     const ctx = currentContext();
     const base = cfg.serverUrl.replace(/\/+$/, '');
-    const qp = new URLSearchParams({ embed: '1' });
+    const qp = new URLSearchParams();
+    if (embed) qp.set('embed', '1');
     if (ctx.chatId) qp.set('chat', String(ctx.chatId));
     if (ctx.personaId) qp.set('persona', String(ctx.personaId));
     if (ctx.characterId) qp.set('character', String(ctx.characterId));
-    // Pass bearer token via query so the embedded UI can stash it in
-    // sessionStorage and attach to its own fetch + EventSource calls.
-    // Server-side / is auth-exempt; child API calls remain gated.
+    // Pass bearer token via query so the phone UI can stash it in
+    // sessionStorage and attach to its own fetch + EventSource calls. The
+    // server scrubs ?token= from browser history on load and redacts request
+    // logs, but users should still avoid screenshots of the copied URL.
     const token = (cfg.serverToken || '').trim();
     if (token) qp.set('token', token);
     return `${base}/?${qp.toString()}`;
+}
+
+function buildEmbedUrl() {
+    return buildPairedPhoneUrl({ embed: true });
+}
+
+async function copyPairedPhoneUrl() {
+    const url = buildPairedPhoneUrl({ embed: false });
+    try {
+        await navigator.clipboard.writeText(url);
+        toast('success', 'Paired phone URL copied. Treat it like a password.');
+    } catch (e) {
+        window.prompt('Copy paired phone URL (contains bearer token):', url);
+    }
+}
+
+function openPairedPhoneUrl() {
+    const url = buildPairedPhoneUrl({ embed: false });
+    window.open(url, 'calliope_pair_phone', 'width=500,height=900,menubar=no,toolbar=no,location=yes,status=no,scrollbars=yes,resizable=yes');
 }
 
 /** Ping the server's /health to give an early failure before opening UI. */
@@ -1501,10 +1566,56 @@ async function probeServer() {
             cache: 'no-store',
             headers: { ...authHeaders() },
         });
+        serverAuthStatus.health = res.ok ? 'reachable' : 'error';
+        serverAuthStatus.lastCheckedAt = Date.now();
+        serverAuthStatus.lastError = res.ok ? '' : `health_http_${res.status}`;
+        paintQuickLaunchStatus();
         return res.ok;
     } catch (e) {
         // Self-signed cert will trip this on first visit. Caller decides how to react.
         WARN('server probe failed', e?.message || e);
+        serverAuthStatus.health = 'unreachable';
+        serverAuthStatus.lastCheckedAt = Date.now();
+        serverAuthStatus.lastError = e?.message || 'network';
+        paintQuickLaunchStatus();
+        return false;
+    }
+}
+
+/** Check a protected endpoint so health does not get misread as pairing/auth. */
+async function probeServerAuth() {
+    const cfg = settings();
+    const token = (cfg.serverToken || '').trim();
+    if (!token) {
+        serverAuthStatus.token = 'missing';
+        serverAuthStatus.lastCheckedAt = Date.now();
+        paintQuickLaunchStatus();
+        return false;
+    }
+    const url = `${cfg.serverUrl.replace(/\/+$/, '')}/state`;
+    try {
+        const res = await fetch(url, {
+            method: 'GET',
+            mode: 'cors',
+            cache: 'no-store',
+            headers: { ...authHeaders() },
+        });
+        serverAuthStatus.lastCheckedAt = Date.now();
+        if (res.status === 401) {
+            serverAuthStatus.token = 'invalid';
+            serverAuthStatus.lastError = 'unauthorized';
+            paintQuickLaunchStatus();
+            return false;
+        }
+        serverAuthStatus.token = res.ok ? 'valid' : 'error';
+        serverAuthStatus.lastError = res.ok ? '' : `state_http_${res.status}`;
+        paintQuickLaunchStatus();
+        return res.ok;
+    } catch (e) {
+        serverAuthStatus.token = 'unknown';
+        serverAuthStatus.lastCheckedAt = Date.now();
+        serverAuthStatus.lastError = e?.message || 'network';
+        paintQuickLaunchStatus();
         return false;
     }
 }
@@ -1558,6 +1669,18 @@ async function onMicClick() {
     if (!ok) {
         const toast = window.toastr;
         const msg = 'Dictation server unreachable. Check serverUrl, accept the self-signed cert in a new tab, then retry.';
+        if (toast?.error) toast.error(msg, 'Dictation Bridge');
+        else alert(msg);
+        return;
+    }
+
+    const authed = await probeServerAuth();
+    if (!authed) {
+        const toast = window.toastr;
+        const tokenState = tokenStatusLabel();
+        const msg = tokenState === 'missing'
+            ? 'Dictation server reachable, but no bearer token is configured. Paste the server token in Dictation Bridge settings.'
+            : 'Dictation server reachable, but the bearer token is invalid/stale. Re-pair or sync the token before opening the phone page.';
         if (toast?.error) toast.error(msg, 'Dictation Bridge');
         else alert(msg);
         return;
@@ -1872,8 +1995,8 @@ function closePrivacyPeek() {
 
 // ─── POL-15: voice-edit cheatsheet overlay ────────────────────────────────
 // A '?' chip in the settings panel opens a static help modal listing the
-// voice commands the dictation pipeline will recognise once Phase 5 lands.
-// Even before the grammar ships, printing the affordance signals that voice
+// voice commands the dictation pipeline recognises. The server strips
+// command prefixes and dispatches actions through SSE when enabled.
 // is the primary surface — Wispr Flow / Superwhisper take the same approach.
 const CHEATSHEET_ID = 'dictation_bridge_cheatsheet';
 
@@ -2656,27 +2779,32 @@ function paintQuickLaunchStatus() {
     const sseState = sseStatus?.state || 'disconnected';
 
     let color = '#7a7a9a';   // grey — disconnected
-    let label = 'Disconnected';
+    let label = 'SSE disconnected';
     if (sseState === 'connected') {
         if (ageMs <= QUICK_LAUNCH_AGO_FRESH_MS) {
             color = '#A8C97B';   // sage — fresh
-            label = 'Connected';
+            label = 'SSE connected';
         } else if (ageMs <= QUICK_LAUNCH_AGO_STALE_MS) {
             color = '#FFB648';   // amber — stale
-            label = 'Stale';
+            label = 'SSE quiet';
         } else {
             color = '#FFB648';
-            label = 'Idle';
+            label = 'SSE idle';
         }
     } else if (sseState === 'connecting') {
         color = '#FFB648';
-        label = 'Connecting';
+        label = 'SSE connecting';
     } else if (sseState === 'error') {
         color = '#FF5A4E';   // ember
-        label = 'Error';
+        label = 'SSE error';
     }
+    const tokenState = tokenStatusLabel();
+    if (tokenState === 'invalid' || tokenState === 'missing') color = '#FF5A4E';
     dot.style.background = color;
-    txt.textContent = `Status: ${label}`;
+    const bits = [`Server: ${serverAuthStatus.health}`, `Token: ${tokenState}`, label];
+    const context = currentContextLabel();
+    if (context) bits.push(context);
+    txt.textContent = bits.join(' · ');
 
     // Mode label — last successful dictation mode is the closest signal.
     if (modeEl) {
@@ -2728,6 +2856,11 @@ function buildSettingsPanel() {
                     <label for="dictation_bridge_token">Server bearer token</label>
                     <input id="dictation_bridge_token" type="password" class="text_pole" placeholder="paste from server startup log" autocomplete="off" />
                     <small class="notes" style="margin-top:0">Found in <code>~/.local/share/dictation-server/token</code> on the dictation server.</small>
+                    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:4px 0 8px 0">
+                        <button id="dictation_bridge_pair_open" type="button" class="menu_button" title="Open a fresh paired phone page for this active ST chat" style="padding:3px 10px;font-size:12px;border:1px solid rgba(255,182,72,0.55);background:rgba(255,182,72,0.08);color:#FFB648;border-radius:2px;cursor:pointer">Re-pair this phone</button>
+                        <button id="dictation_bridge_pair_copy" type="button" class="menu_button" title="Copy a tokenized pairing URL; use it as a QR source if pairing another device" style="padding:3px 10px;font-size:12px;border:1px solid rgba(201,178,139,0.45);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Copy pairing URL</button>
+                        <small class="notes" style="margin:0 0 0 4px">URL contains bearer token; avoid screenshots/logs.</small>
+                    </div>
 
                     <label for="dictation_bridge_open_style">Open style</label>
                     <select id="dictation_bridge_open_style" class="text_pole" title="Iframe mode is desktop-only — phones use popup automatically (parent ST page does not delegate microphone permissions).">
@@ -2838,6 +2971,8 @@ function buildSettingsPanel() {
 
     const urlEl = host.querySelector('#dictation_bridge_url');
     const tokenEl = host.querySelector('#dictation_bridge_token');
+    const pairOpenEl = host.querySelector('#dictation_bridge_pair_open');
+    const pairCopyEl = host.querySelector('#dictation_bridge_pair_copy');
     const openEl = host.querySelector('#dictation_bridge_open_style');
     const appendEl = host.querySelector('#dictation_bridge_append_mode');
     const autoEl = host.querySelector('#dictation_bridge_autosend');
@@ -2875,19 +3010,26 @@ function buildSettingsPanel() {
     sseEl.checked = !!s.sseEnabled;
     if (voiceCmdEl) voiceCmdEl.checked = !!s.voiceCommandsEnabled;
     updateSseStatusIndicator(); // paint initial dot color
+    probeServer().then((ok) => { if (ok) return probeServerAuth(); }).catch(() => {});
 
     urlEl.addEventListener('change', () => {
         s.serverUrl = urlEl.value.trim() || DEFAULTS.serverUrl;
+        serverAuthStatus = { health: 'unknown', token: 'unknown', lastCheckedAt: 0, lastError: '' };
         saveSettings();
+        probeServer().then((ok) => { if (ok) return probeServerAuth(); }).catch(() => {});
         // URL changed — if SSE is on, reconnect to the new host.
         if (s.sseEnabled) connectSSE();
     });
     tokenEl.addEventListener('change', () => {
         s.serverToken = tokenEl.value.trim();
+        serverAuthStatus.token = 'unknown';
         saveSettings();
+        probeServerAuth().catch(() => {});
         // Token changed — bounce SSE so the new query-string token takes effect.
         if (s.sseEnabled) connectSSE();
     });
+    if (pairOpenEl) pairOpenEl.addEventListener('click', openPairedPhoneUrl);
+    if (pairCopyEl) pairCopyEl.addEventListener('click', () => copyPairedPhoneUrl().catch(() => {}));
     openEl.addEventListener('change', () => { s.openStyle = openEl.value; saveSettings(); });
     appendEl.addEventListener('change', () => { s.appendMode = appendEl.value; saveSettings(); });
     autoEl.addEventListener('change', () => { s.autoSend = !!autoEl.checked; saveSettings(); });

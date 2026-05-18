@@ -10,9 +10,14 @@ Tapping a mic button in the chat send bar opens the dictation server's web
 UI (popup window by default, modal iframe optional) with the active chat,
 persona, and character IDs passed as query parameters. The server uses
 those IDs to pull live ST context and format the dictated line in-persona.
-When the user hits "Insert" on the server UI, the formatted text is sent
-back to this extension via `window.postMessage` and dropped straight into
-`#send_textarea` — optionally firing the Send button automatically.
+When dictation completes, the server now has two delivery paths:
+
+- primary live path: `dictation-result` over `/events` SSE, which lets the
+  extension write directly into `#send_textarea` even when the phone page is
+  standalone; and
+- embed fallback: `window.postMessage` from the popup/iframe to this extension.
+
+Both paths can optionally fire the Send button automatically.
 
 This closes the loop on Ayaz's primary dictation flow: dictate on the phone
 at `https://<pc-ip>:8384`, format/enhance in-persona on the PC, land in ST
@@ -20,19 +25,15 @@ with one click — no clipboard round-trip.
 
 ## Install
 
-Third-party extensions live under
-`SillyTavern/public/scripts/extensions/third-party/`. This extension is
-intended to be placed at:
+Third-party extensions live under SillyTavern's user extension tree. The
+current deployment target is:
 
 ```
-<ST-root>/public/scripts/extensions/third-party/dictation-bridge/
+<ST-root>/data/default-user/extensions/third-party/dictation-bridge/
 ```
 
-On this system the ST install lives at `/mnt/hdd/AI/SillyTavern/`, so the
-full path is
-`/mnt/hdd/AI/SillyTavern/public/scripts/extensions/third-party/dictation-bridge/`.
-If `third-party/` doesn't exist, create it first, or place the directory
-directly under `extensions/` and update the URL paths accordingly.
+Symlink or copy this `extension/` directory there, then hard-refresh
+SillyTavern. Avoid tokenized URLs in screenshots or docs.
 
 After the files are in place, reload SillyTavern (hard refresh the page).
 The extension will load automatically; no install flow is needed because
@@ -45,6 +46,8 @@ All settings live under ST's Extensions drawer → "Dictation Bridge":
 | Setting | Default | Meaning |
 |---|---|---|
 | Server URL | `https://<current ST host>:8384` | Dictation server URL. Defaults to the same hostname used for SillyTavern, with port `8384`, so LAN/mobile ST sessions follow IP changes automatically. |
+| Server bearer token | blank | Paste the server token from `~/.local/share/dictation-server/token`; the status chip distinguishes missing, valid, invalid/stale, and unknown tokens. |
+| Re-pair this phone / Copy pairing URL | n/a | Opens or copies a fresh tokenized phone URL for the active ST chat/persona/character. Use copy as the source for a QR handoff; treat it like a password. |
 | Open style | Popup | Popup spawns a small window next to the chat; iframe overlays a modal inside ST. Popup is recommended for the phone workflow since you're typically holding the phone separately. |
 | Text handling | Replace | `Replace` overwrites the current textarea, `Append` adds to whatever's already there. |
 | Auto-send after dictation | off | If on, the formatted result both fills the textarea and clicks the Send button. |
@@ -53,11 +56,12 @@ All settings live under ST's Extensions drawer → "Dictation Bridge":
 
 ### Phone workflow
 
-From the phone browser, hit `https://<pc-ip>:8384` directly. The server
-responds the same way whether opened standalone or in embed mode; embed
-mode just pre-populates the context inputs and returns the result via
-`postMessage` instead of clipboard. This extension is the PC-side
-consumer.
+From the phone browser, open a fresh paired page from the ST mic button or
+from Extensions → Dictation Bridge → **Re-pair this phone**. **Copy pairing
+URL** copies the same tokenized URL for QR/phone handoff. The server scrubs
+`?token=` from browser history after load, but copied pairing URLs should be
+treated like passwords. Standalone phone pages receive results back to ST via
+SSE; embed mode additionally uses `postMessage` as a local fallback.
 
 ### Self-signed cert
 
@@ -69,6 +73,7 @@ fails (cert rejection or server down).
 
 ## Limitations / known issues
 
+- **Pairing state** — a page can be token-valid but not following the current SillyTavern chat if it was opened from an old bookmark/tab. Open from the refreshed ST mic button when the phone says stale/not paired.
 - **Self-signed cert** — one-time trust prompt on every browser profile.
   Some browsers will silently block cross-origin `fetch` to an untrusted
   cert; the probe will fail cleanly and instruct the user.
@@ -77,9 +82,7 @@ fails (cert rejection or server down).
 - **Mixed content** — the server is HTTPS, so ST at `http://` would
   normally be fine. If ST is behind HTTPS with strict CSP, the iframe
   may be blocked; the popup window bypasses page-level CSP.
-- **Grouped chats** — `character` query param is set to the group ID
-  rather than a specific member avatar. The server's persona card logic
-  may need to handle group IDs separately.
+- **Grouped chats** — current builds send group id, members, and last speaker; use the addressee picker when you need a specific group member voice. Edge cases should be treated as group-QA bugs, not a missing core feature.
 - **Third-party loading** — if ST's extension loader doesn't find the
   `third-party/` subdirectory convention, move the folder one level up
   into `extensions/` and reload.
