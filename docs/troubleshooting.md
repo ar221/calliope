@@ -1,8 +1,7 @@
 # Troubleshooting
 
 The top 10 failure modes Calliope users hit, with concrete fixes. If
-yours isn't here, file an issue at `<repo>` (placeholder pending Phase 5
-extraction) — and read the relevant sub-doc:
+yours isn't here, report it locally until the repository is published — and read the relevant sub-doc:
 [`architecture.md`](architecture.md), [`cert-trust.md`](cert-trust.md),
 [`tailscale.md`](tailscale.md), [`desktop-hotkey.md`](desktop-hotkey.md).
 
@@ -183,29 +182,32 @@ systemctl --user enable --now pipewire pipewire-pulse wireplumber
 
 ---
 
-## 6. Group chat persona resolution wrong / blank
+## 6. Group chat addressee/context looks wrong
 
-**Symptom:** in an ST group chat, dictation comes through with no
-character context — `rp_enhance` produces generic prose instead of
-voice-matched dialogue. The persona / addressee is unset.
+**Symptom:** in an ST group chat, dictation comes through with weak or
+wrong character context — `rp_enhance` sounds generic, or it follows the
+wrong speaker.
 
-**Cause:** the `dictation-bridge` extension passes `selected_group`
-(a UUID) to the server's `character` query param. The server's
-`load_character_card()` looks for `<id>.png` in the characters dir,
-doesn't find it, and silently returns an empty context. Pipeline runs
-on, just generic.
+**Cause:** group chat state is richer than one-on-one state. The bridge
+now sends the group id, member list, and last speaker, and the server can
+filter addressee choices for that group. You still need to pick the
+specific addressee when the last-speaker default is not the voice you
+want.
 
-**Status:** known limitation. The fix (POL-6: addressee picker chips,
-last-speaker default) is on the Phase 5 roadmap and not yet shipped.
+**Status:** POL-6 is shipped at the wiring level: addressee picker,
+group members, last-speaker default, and mode memory exist. Treat remaining
+failures as group-QA bugs.
 
-**Workaround:**
+**Fix / check:**
 
-1. Set the addressee explicitly via the phone UI's character search —
-   pick the specific group member you want to address before recording.
-2. Or pass `?character=<card-name>` via the URL bar on the phone PWA.
-   The server's `/state/mode-memory` will remember it.
-3. For desktop, run `dictate --rp+ --character "Hana Nakamura" toggle`
-   (the `--character` flag overrides the `/state` snapshot).
+1. Open the phone page from the current ST group chat, not an old bookmark.
+2. Confirm the follow banner says `Paired + following ST` and shows group
+   context.
+3. Pick the intended addressee in the phone UI before recording if the
+   last speaker is not the target voice.
+4. If the addressee list is blank, refresh SillyTavern and reopen from the
+   ST mic button so `/state` repopulates the group payload.
+5. Desktop fallback: `dictate --rp+ --character "Hana Nakamura" toggle`.
 
 ---
 
@@ -335,8 +337,8 @@ If you still see >30s hangs:
 1. Confirm `whisper-server` is the daemon you're using:
    ```bash
    systemctl --user status whisper-server
-   ss -tnlp | grep 8123
-   curl http://127.0.0.1:8123/  # whisper-server has its own status page
+   ss -tnlp | grep 9001
+   curl http://127.0.0.1:9001/  # whisper-server has its own status page
    ```
 2. Look at the timing JSON:
    ```bash

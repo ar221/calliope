@@ -93,11 +93,11 @@ curl -L -o ~/.local/share/whisper/ggml-large-v3-turbo.bin \
 single-file server onto your PATH:
 
 ```bash
-install -m 755 scripts/dictation-server ~/.local/bin/dictation-server
+install -m 755 server/calliope-server ~/.local/bin/dictation-server
 ```
 
 (AUR `calliope-git` and `pipx install calliope` are tracked in
-[Appendix C of the roadmap](https://github.com/<repo>/blob/main/docs/roadmap.md).)
+[the roadmap](docs/roadmap.md).)
 
 **5. Run the wizard.** It probes audio, picks a model size from your VRAM,
 generates a self-signed cert + bearer token, installs the systemd unit, and
@@ -137,7 +137,7 @@ it, install as PWA. Test recording.
                                         │ ▼
 [ST tab + dictation-bridge ext] ◀─ /events SSE ─[Calliope server :8384]
                                         │  │
-                                        │  ├── shell ──▶ [whisper-server :8123]
+                                        │  ├── shell ──▶ [whisper-server :9001]
                                         │  │                   (whisper.cpp / GPU)
                                         │  │
                                         │  ├── HTTPS ──▶ [claude-code-proxy :42069]
@@ -163,8 +163,7 @@ Runtime data and config live under `~/.local/share/dictation-server/`:
 
 - `cert.pem` / `key.pem` — self-signed TLS cert (90-day rotation,
   auto-renewed at startup).
-- `token` — 32-byte bearer token, mode 0600. Re-mint via
-  `dictation-server --rotate-token`.
+- `token` — 32-byte bearer token, mode 0600. To rotate it today, stop the user service, replace the token file with a new 32-byte secret, sync the ST extension setting, then restart the service. Public `--rotate-token` CLI is still tracked in [`docs/roadmap.md`](docs/roadmap.md).
 - `cert.fingerprint` — SHA-256, also printed at startup.
 - `vocab.yaml` — character/term biasing for whisper `--prompt`.
 - `modes.yaml` — pipeline mode definitions.
@@ -174,15 +173,13 @@ Environment-variable overrides (set in `~/.config/systemd/user/dictation-server.
 
 - `DICTATION_BIND_HOST` — defaults to `127.0.0.1`. Set `0.0.0.0` to expose
   on LAN (token auth still required).
-- `DICTATION_PORT` — defaults to `8384`.
-- `DICTATION_CERT_FILE`, `DICTATION_KEY_FILE` — point at an external cert
-  (mkcert, Tailscale, Let's Encrypt). See
-  [`docs/tailscale.md`](docs/tailscale.md).
+- Port is currently a CLI option: set `ExecStart=.../dictation-server --port 8385` in the user unit override if you need a non-default port.
+- TLS cert/key live under `~/.local/share/dictation-server/`; Tailscale/mkcert flows should write `cert.pem` and `key.pem` there. See [`docs/tailscale.md`](docs/tailscale.md).
 - `WHISPER_BIN`, `WHISPER_SERVER_BIN`, `WHISPER_MODEL` — override binary
   and model paths.
-- `CLAUDE_RP_MODEL`, `CLAUDE_RP_PROVIDER` — formatter routing.
+- `DICTATION_FORMATTER_PROVIDER`, `DICTATION_CLAUDE_RP_MODEL`, `DICTATION_RP_MODEL`, `DICTATION_OPENAI_RP_MODEL`, `DICTATION_OPENAI_CLEAN_MODEL` — formatter routing.
 
-Full reference: `docs/config.md` (forthcoming).
+Full reference: [`docs/config.md`](docs/config.md).
 
 ## Privacy
 
@@ -205,11 +202,9 @@ claude-code-proxy, Monaspace, Literata, system tools).
 
 ## Support
 
-- **Bugs:** GitHub Issues at `<repo>` — _placeholder, repo extraction
-  pending Phase 5._
-- **Discussion:** GitHub Discussions at the same repo.
-- **Live help:** Matrix room — _placeholder, link in the wiki once the
-  room is created._
+- **Bugs:** file an issue in the repository when it is public. Until then, report locally to the maintainer/operator.
+- **Security:** see [`SECURITY.md`](SECURITY.md); never attach audio or tokenized URLs.
+- **Discussion:** use the project discussion space once published.
 
 When filing an issue: do not attach audio. The issue template defaults the
 "audio attached?" checkbox to NO and reminds you on submit.
@@ -220,6 +215,4 @@ Phases 1–3 shipped: bearer-auth, loopback default, sandboxed systemd unit,
 in-RAM transcripts, monkey-patched outbound audit, persistent `whisper-server`
 (MVP-8), streaming SSE partials (MVP-13), Apollo phone-UI re-skin (POL-5),
 privacy badge + audit modal (MVP-23), state-machine bar in the bridge
-extension (MVP-16), voice-edit cheatsheet overlay (POL-15). Phase 4 is the
-release-readiness pass — wizard (`dictation-server --setup`), README,
-PRIVACY, AUR/pipx packaging.
+extension (MVP-16), voice-edit cheatsheet overlay (POL-15). Current build is MVP+ / release-hardening: core phone→ST bridge, pairing, privacy audit, ST state following, group addressee support, TTS controls, and service hardening exist. Remaining release work is tracked in [`docs/roadmap.md`](docs/roadmap.md).

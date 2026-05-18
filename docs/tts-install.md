@@ -2,8 +2,14 @@
 
 Calliope's read-back UX is powered by [Kokoro-82M](https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX),
 an open-weight TTS model (~82M params, MIT-licensed) running on a
-loopback HTTP daemon. The dictation-server proxies its `POST /tts` and
-`GET /tts/voices` endpoints through to the daemon, with on-demand boot
+loopback HTTP daemon. The dictation-server also exposes:
+
+- `POST /tts` — synthesize a single utterance.
+- `GET /tts/voices` — list available voices.
+- `POST /tts/voices/suggest` — suggest a voice for a character/addressee.
+- `POST /tts/audiobook` — render a bounded multi-message audiobook/readback.
+
+All are proxied through the loopback Kokoro daemon, with on-demand boot
 and idle-shutdown — Kokoro stays out of memory between read-backs.
 
 This is an **optional** install. The phone UI degrades gracefully when
@@ -25,7 +31,7 @@ The TTS install lives at `~/.local/share/calliope-tts/`:
 ```
 ~/.local/share/calliope-tts/
 ├── venv/                    # dedicated venv — only kokoro-onnx, onnxruntime, numpy
-├── kokoro-server.py         # bundled from <repo>/scripts/kokoro-server.py
+├── kokoro-server.py         # bundled from scripts/kokoro-server.py
 └── models/
     ├── onnx/
     │   ├── model.onnx       # full precision (~330 MB)
@@ -97,7 +103,7 @@ curl -s http://127.0.0.1:9002/voices | head -c 200
 End-to-end against Calliope (substitute your bearer token):
 
 ```sh
-TOKEN=$(cat ~/.local/share/calliope/token.txt)
+TOKEN=$(cat ~/.local/share/dictation-server/token)
 curl -k -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"text":"Hello Lord Rashid.","voice":"af_heart"}' \
@@ -134,6 +140,10 @@ or in Calliope's environment for the proxy side:
 | `KOKORO_DEFAULT_VOICE` | `af_heart` | calliope | Voice when request omits `voice`. |
 | `KOKORO_IDLE_SHUTDOWN_SECONDS` | `600` | calliope | Idle threshold before stopping the unit. |
 | `KOKORO_IDLE_SHUTDOWN_DISABLED` | unset | calliope | Set to anything to keep Kokoro warm. |
+| `KOKORO_REQUEST_TIMEOUT` | `10` | calliope | Proxy request timeout. |
+| `TTS_AUDIOBOOK_MAX_MESSAGES` | `50` | calliope | Maximum messages per audiobook export. |
+| `TTS_AUDIOBOOK_MAX_TOTAL_CHARS` | `12000` | calliope | Maximum total text in an audiobook export. |
+| `TTS_AUDIOBOOK_SILENCE_MS` | `350` | calliope | Gap between audiobook clips. |
 
 ## Sandboxing
 

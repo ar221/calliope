@@ -6,7 +6,7 @@ Calliope is built on a simple promise: **your audio never leaves your
 device, and your transcripts never persist longer than you want them to.**
 
 This document is a verifiable claim. Every statement here can be
-cross-checked against the source at `scripts/dictation-server` in this
+cross-checked against the source at `server/calliope-server` in this
 repository. If you find a divergence between this doc and the code, the
 code wins — please open an issue.
 
@@ -204,8 +204,8 @@ text behind a tap.
 
 ## Reporting issues
 
-Open an issue at `<repo>` — _placeholder, repo URL pending Phase 5
-extraction._
+Report locally to the maintainer/operator until the repository is published.
+Do not attach audio, full settings dumps, bearer tokens, or tokenized URLs.
 
 **Do not include audio in bug reports.** If you need to share a transcript
 snippet to reproduce a bug, redact character names and any explicit

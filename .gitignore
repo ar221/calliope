@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Node/package scratch
+node_modules/
+
+# Local runtime/cache
+.cache/
+*.log

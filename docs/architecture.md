@@ -3,7 +3,7 @@
 Calliope is a single-file Python server that orchestrates four moving
 parts: the phone PWA, the SillyTavern `dictation-bridge` extension,
 `whisper-server` (whisper.cpp HTTP daemon), and an LLM proxy. The
-canonical source is `scripts/dictation-server` (≈5,900 lines, Python
+canonical source is `server/calliope-server` (large lines, Python
 stdlib + optional PyYAML).
 
 ## Diagram
@@ -19,7 +19,7 @@ stdlib + optional PyYAML).
                                              │ POST /send-to-st  (commit)
                                              │
 ┌────────────────────────────────────────────▼────────────────────────────────────┐
-│  Calliope server  ·  scripts/dictation-server  ·  ThreadingHTTPServer + ssl     │
+│  Calliope server  ·  server/calliope-server  ·  ThreadingHTTPServer + ssl     │
 │  bind 127.0.0.1:8384 (default) · self-signed cert (90d) · bearer-token auth     │
 │                                                                                  │
 │  ┌──────────────┐    ┌─────────────────┐    ┌────────────────────────────────┐  │
@@ -30,7 +30,7 @@ stdlib + optional PyYAML).
 │  │ /audit/net   │    │  rp_enhance     │                                        │
 │  │ /personas    │    │  persona_pov    │    ┌────────────────────────────────┐  │
 │  │ /characters  │    └─────────────────┘    │  whisper_server_request()      │  │
-│  │ /chat-context│             │             │   POST http://127.0.0.1:8123   │  │
+│  │ /chat-context│             │             │   POST http://127.0.0.1:9001   │  │
 │  │ /state       │             ▼             │     /inference (multipart)     │  │
 │  └──────────────┘    ┌─────────────────┐    └────────────────────────────────┘  │
 │                      │  ChatReader     │                                        │
@@ -47,7 +47,7 @@ stdlib + optional PyYAML).
 │  ST tab + dictation-bridge ext │         │  whisper-server (whisper.  │
 │  manifest.json · index.js      │         │  cpp HTTP daemon, GPU)     │
 │  state-machine bar             │         │  large-v3-turbo · HIP/ROCm │
-│  voice-edit cheatsheet         │         │  127.0.0.1:8123 · idle-    │
+│  voice-edit cheatsheet         │         │  127.0.0.1:9001 · idle-    │
 │  privacy badge · audit peek    │         │  shutdown after N seconds  │
 │  EventSource → /events         │         └────────────────────────────┘
 └────────────────────────────────┘
@@ -94,7 +94,7 @@ Reads the bearer token from ST settings; sends on every fetch and as
 `Authorization` query param when opening EventSource (since browsers
 won't set headers on EventSource constructor).
 
-### Calliope server (`scripts/dictation-server`)
+### Calliope server (`server/calliope-server`)
 
 Single Python file. Stdlib `ThreadingHTTPServer` + `ssl.SSLContext` over
 self-signed cert (90-day validity, auto-renew at startup, fingerprint
@@ -130,7 +130,7 @@ printed). One `DictationHandler` class dispatches by path.
 ### `whisper-server` (whisper.cpp HTTP daemon)
 
 Persistent daemon, replaced subprocess-per-request in MVP-8 (Phase 2).
-Binds `127.0.0.1:8123`, idle-shutdown after configurable seconds. Loaded
+Binds `127.0.0.1:9001`, idle-shutdown after configurable seconds. Loaded
 model: `large-v3-turbo` (1.6 GB). GPU backend: HIP/ROCm (verified via
 `ldd`: `libggml-hip.so.0`, `libhipblas.so.3`, `librocblas.so.5`,
 `libamdhip64.so.7`).
@@ -193,11 +193,12 @@ producer.
 
 | Event name | Payload | Producer |
 |---|---|---|
-| `dictation-state` | `{state: idle\|listening\|transcribing\|cleaning\|done, mode, ts}` | `run_pipeline()` transitions (MVP-16) |
-| `dictation-token` | `{token, partial: bool}` | streaming formatter output (MVP-13) |
-| `dictation-result` | `{final, transcriptId, mode, timing}` | end of `run_pipeline` |
-| `dictation-edit` | `{prevValue, newValue}` | phone "Send to ST" button → fan-out |
-| `dictation-command` | `{cmd: undo\|redo\|send\|...}` | voice-edit grammar (POL-15) |
+| `dictation-state` | `{state: idle\|listening\|transcribing\|cleaning\|done, mode, ts}` | pipeline transitions |
+| `dictation-transcript` | `{requestId, phase, text, source, latency_ms?}` | raw Whisper preview before formatter work |
+| `dictation-token` | `{requestId, delta, done}` | streaming formatter output (MVP-13) |
+| `dictation-result` | `{requestId, text, raw, cleaned, mode, timing, formatting_skipped?}` | completed dictation payload |
+| `dictation-edit` | `{text, auto_send?}` | phone "Send to ST" button → fan-out |
+| `dictation-command` | `{cmd, args, raw}` | voice-edit grammar (POL-15) |
 
 ### `POST /send-to-st` (phone → extension fan-out)
 
@@ -208,7 +209,7 @@ fans out.
 
 ## Performance characteristics
 
-(See `vds-roadmap.md` ADR-1, ADR-9 for the full latency budget.)
+(See `docs/roadmap.md` ADR-1, ADR-9 for the full latency budget.)
 
 | Stage | Median (rp_enhance mode) | Notes |
 |---|---|---|
