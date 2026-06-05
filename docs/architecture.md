@@ -64,9 +64,10 @@ stdlib + optional PyYAML).
 
 ### Phone PWA (origin: `https://<host>:8384/`)
 
-Single-document HTML+CSS+JS embedded in the server source (lines ~1800
-through ~4920). Apollo-themed (POL-5 shipped 2026-04). No third-party JS,
-no CDN, no external assets.
+Single-document HTML+CSS+JS embedded in the server source as `WEB_UI`.
+Apollo-themed (POL-5 shipped 2026-04). No third-party JS, no CDN, no
+external assets. Keep the single-file server model intact; the embedded
+`<script>` is extracted only by `scripts/check-web-ui-js` for `node --check`.
 
 - **Capture:** `navigator.mediaDevices.getUserMedia({audio: true})` →
   `MediaRecorder` with `audio/webm;codecs=opus`.
@@ -76,6 +77,10 @@ no CDN, no external assets.
 - **State machine:** `idle → listening → transcribing → cleaning → done`.
   States surfaced via the bar above the textarea (MVP-16) and via SSE
   events emitted at pipeline transitions.
+- **ST-follow freshness:** when opened from ST, the PWA refreshes `/state`
+  on foreground lifecycle events, once before recording starts, and again
+  before audio is submitted so mobile tab freezing does not leave the phone
+  formatting against an old chat/persona snapshot.
 - **Privacy badge:** chip in the header expands to an audit peek
   (last-50 outbound calls). Pulls from `GET /audit/network`. (MVP-23.)
 
@@ -87,7 +92,8 @@ under `<ST install>/data/default-user/extensions/third-party/`. Three files:
 - `manifest.json` — ST extension manifest, `auto_update: false`.
 - `index.js` — mic button injected into `#send_form`, popup or iframe
   to phone UI, SSE subscriber via `EventSource('/events')`, undo stack
-  (cap 8), state-machine bar wiring, voice-edit overlay, privacy peek.
+  (cap 8), state-machine bar wiring, voice-edit overlay, privacy peek,
+  and ST-state broadcasts on chat/lifecycle/mic-open events.
 - `style.css` — Apollo-matched theming for the bar and overlay.
 
 Reads the bearer token from ST settings; sends on every fetch and as

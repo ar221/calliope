@@ -182,7 +182,26 @@ systemctl --user enable --now pipewire pipewire-pulse wireplumber
 
 ---
 
-## 6. Group chat addressee/context looks wrong
+## 6. Phone uses an old SillyTavern context after switching tabs
+
+**Symptom:** the phone page is paired, but a recording uses the previous
+chat/persona/group after you foreground the standalone phone tab or reopen
+from a stale bookmark.
+
+**Cause:** mobile browsers freeze background tabs aggressively. The ST tab
+may not get a normal heartbeat after the phone tab takes focus, so the
+phone can briefly hold an older `/state` snapshot.
+
+**Fix / check:** open the phone page from the current ST mic button when
+possible. Current builds push ST state on mic-open and browser lifecycle
+events, and the phone PWA force-refreshes `/state` before recording and
+before sending audio. If the follow banner still looks stale, hard-refresh
+SillyTavern and reopen the phone page; no server restart is required for
+this symptom unless you are deploying new server code.
+
+---
+
+## 7. Group chat addressee/context looks wrong
 
 **Symptom:** in an ST group chat, dictation comes through with weak or
 wrong character context — `rp_enhance` sounds generic, or it follows the
@@ -211,7 +230,7 @@ failures as group-QA bugs.
 
 ---
 
-## 7. `getUserMedia` rejected: "no audio device" on phone
+## 8. `getUserMedia` rejected: "no audio device" on phone
 
 **Symptom:** the phone PWA's mic button fails to start recording. Browser
 console shows `NotAllowedError` or `NotFoundError` from `getUserMedia`.
@@ -238,7 +257,7 @@ context (`getUserMedia` requires a secure context — `https://` or
 
 ---
 
-## 8. Server fails to bind: address in use
+## 9. Server fails to bind: address in use
 
 **Symptom:** `systemctl --user status dictation-server` shows:
 
@@ -277,7 +296,7 @@ Update phone bookmarks + ST extension settings to the new port.
 
 ---
 
-## 9. RP-enhance returns empty / falls through to raw
+## 10. RP-enhance returns empty / falls through to raw
 
 **Symptom:** dictation produces only the raw whisper transcript — no
 asterisks, no enhanced phrasing — even when you've selected
@@ -318,7 +337,7 @@ Same drill for the OpenAI-shape proxy at `127.0.0.1:10531`, used for
 
 ---
 
-## 10. Transcribe hangs >2 min (cold model load)
+## 11. Transcribe hangs >2 min (cold model load)
 
 **Symptom:** the first `/transcribe` after server boot takes 30+ seconds,
 sometimes hits the 120-second whisper timeout. Subsequent calls are

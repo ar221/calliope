@@ -15,6 +15,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check extension JS syntax
+        run: node --check extension/index.js
+      - name: Check embedded phone UI JS syntax
+        run: scripts/check-web-ui-js
       - uses: astral-sh/setup-uv@v3
       - name: Install ruff
         run: uv tool install ruff

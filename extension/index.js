@@ -93,6 +93,7 @@ function authHeaders() {
 const STATE_HEARTBEAT_MS = 30_000;
 let stateHeartbeatTimer = null;
 let lastStatePayload = null; // for dedupe — avoid firing on duplicate events
+let mobileLifecycleStatePushBound = false;
 
 /** Active connection (popup window or iframe element). */
 let activeTarget = null;
@@ -396,6 +397,21 @@ function startStateHeartbeat() {
 
 function stopStateHeartbeat() {
     if (stateHeartbeatTimer) { clearInterval(stateHeartbeatTimer); stateHeartbeatTimer = null; }
+}
+
+function setupMobileLifecycleStatePush() {
+    if (mobileLifecycleStatePushBound) return;
+    mobileLifecycleStatePushBound = true;
+    const push = (reason) => { try { postState(reason); } catch {} };
+    // Mobile browsers aggressively freeze background tabs. Push a final fresh
+    // snapshot before ST is hidden and another when it is foregrounded again so
+    // the standalone phone tab does not need a manual refresh to catch up.
+    document.addEventListener('visibilitychange', () => {
+        push(document.hidden ? 'visibility-hidden' : 'visibility-visible');
+    });
+    window.addEventListener('pagehide', () => push('pagehide'));
+    window.addEventListener('pageshow', () => push('pageshow'));
+    window.addEventListener('focus', () => push('focus'));
 }
 
 // ─── MVP-13: streaming formatter partials ──────────────────────────────────
@@ -1690,6 +1706,11 @@ async function onMicClick() {
         else alert(msg);
         return;
     }
+
+    // Make the launch itself a context handoff. This matters on Android/Chrome:
+    // once the dictation tab is foregrounded, the ST tab can be frozen before
+    // the normal 30s heartbeat gets another chance to run.
+    await postState('mic-open');
 
     const url = buildEmbedUrl();
     if (settings().openStyle === 'iframe') {
@@ -3339,6 +3360,7 @@ export async function init() {
         });
     }
     startStateHeartbeat();
+    setupMobileLifecycleStatePush();
     // Initial push in case we loaded mid-chat.
     setTimeout(() => postState('init'), 1500);
 
