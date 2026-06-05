@@ -39,8 +39,8 @@ Status date: 2026-05-18.
    - If deferred: keep the toggle disabled and document it as non-shipped.
 
 4. **Token rotation UX**
-   - Add a real `dictation-server --rotate-token` command or a settings-panel re-pair flow.
-   - Until then, manual rotation is: stop service, replace `~/.local/share/dictation-server/token`, sync ST setting, restart.
+   - Done: `dictation-server --rotate-token` rotates the bearer token with mode 0600 and prints only the token path plus live-service next steps.
+   - Live sequence: stop service, rotate, update ST bridge token setting, restart, hard-refresh ST, re-pair phone.
 
 5. **Packaging**
    - Prepare AUR `calliope-git` once repo paths/docs are public-safe.

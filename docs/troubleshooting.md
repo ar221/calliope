@@ -201,7 +201,30 @@ this symptom unless you are deploying new server code.
 
 ---
 
-## 7. Group chat addressee/context looks wrong
+## 7. Phone says stale token / 401 after rotation
+
+**Symptom:** the phone page says the token is stale, `/state` returns 401,
+or the ST bridge shows server reachable but auth invalid after you rotated the
+runtime token.
+
+**Cause:** the running server keeps the old token in memory until restart, and
+SillyTavern/phone sessions keep using the old token until the bridge setting
+and browser session are refreshed.
+
+**Fix:** use the live rotation sequence in this order:
+
+1. Stop `dictation-server`.
+2. Run `dictation-server --rotate-token`. It prints the token file path and
+   next steps, not the token value.
+3. Update the ST Dictation Bridge token setting from the token file. Do not
+   paste the token or a tokenized URL into logs, issues, or chat.
+4. Restart `dictation-server`.
+5. Hard-refresh SillyTavern so the extension reloads its settings.
+6. Re-pair the phone from the current ST mic button.
+
+---
+
+## 8. Group chat addressee/context looks wrong
 
 **Symptom:** in an ST group chat, dictation comes through with weak or
 wrong character context — `rp_enhance` sounds generic, or it follows the
@@ -230,7 +253,7 @@ failures as group-QA bugs.
 
 ---
 
-## 8. `getUserMedia` rejected: "no audio device" on phone
+## 9. `getUserMedia` rejected: "no audio device" on phone
 
 **Symptom:** the phone PWA's mic button fails to start recording. Browser
 console shows `NotAllowedError` or `NotFoundError` from `getUserMedia`.
@@ -257,7 +280,7 @@ context (`getUserMedia` requires a secure context — `https://` or
 
 ---
 
-## 9. Server fails to bind: address in use
+## 10. Server fails to bind: address in use
 
 **Symptom:** `systemctl --user status dictation-server` shows:
 
@@ -296,7 +319,7 @@ Update phone bookmarks + ST extension settings to the new port.
 
 ---
 
-## 10. RP-enhance returns empty / falls through to raw
+## 11. RP-enhance returns empty / falls through to raw
 
 **Symptom:** dictation produces only the raw whisper transcript — no
 asterisks, no enhanced phrasing — even when you've selected
@@ -337,7 +360,7 @@ Same drill for the OpenAI-shape proxy at `127.0.0.1:10531`, used for
 
 ---
 
-## 11. Transcribe hangs >2 min (cold model load)
+## 12. Transcribe hangs >2 min (cold model load)
 
 **Symptom:** the first `/transcribe` after server boot takes 30+ seconds,
 sometimes hits the 120-second whisper timeout. Subsequent calls are

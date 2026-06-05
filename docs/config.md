@@ -17,6 +17,7 @@ Current server flags:
 - `--no-ssl` — development-only cleartext HTTP.
 - `--setup` — run the setup/wizard path.
 - `--tailscale-cert` — use/write Tailscale cert material into the runtime cert path.
+- `--rotate-token` — rotate the bearer token and exit; prints the token path and live-rotation next steps, not the token value.
 - `--force` — force wizard/setup regeneration paths where supported.
 - `--install-systemd` / `--no-install-systemd` — opt into/out of user-unit installation.
 - `--skip-stage-N` — setup self-test escape hatch for known-bad local stages.
@@ -63,7 +64,8 @@ Current server flags:
 
 ## Runtime files
 
-Under `~/.local/share/dictation-server/`:
+Under `~/.local/share/dictation-server/` by default. Set `CALLIOPE_DATA_DIR` for tests or non-standard runtime state; production units should keep this private and local.
+
 
 - `cert.pem` / `key.pem` — TLS material. Tailscale/mkcert flows should write here.
 - `cert.fingerprint` — SHA-256 fingerprint shown during pairing.

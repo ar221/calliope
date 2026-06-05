@@ -165,7 +165,7 @@ Runtime data and config live under `~/.local/share/dictation-server/`:
 
 - `cert.pem` / `key.pem` — self-signed TLS cert (90-day rotation,
   auto-renewed at startup).
-- `token` — 32-byte bearer token, mode 0600. To rotate it today, stop the user service, replace the token file with a new 32-byte secret, sync the ST extension setting, then restart the service. Public `--rotate-token` CLI is still tracked in [`docs/roadmap.md`](docs/roadmap.md).
+- `token` — 32-byte bearer token, mode 0600. Rotate with `dictation-server --rotate-token`; the command prints the token path and live-service next steps, not the token value. Live rotation sequence: stop the user service, rotate, update the ST bridge token setting from the token file, restart the service, hard-refresh SillyTavern, then re-pair the phone.
 - `cert.fingerprint` — SHA-256, also printed at startup.
 - `vocab.yaml` — character/term biasing for whisper `--prompt`.
 - `modes.yaml` — pipeline mode definitions.

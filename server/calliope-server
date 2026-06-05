@@ -7,6 +7,7 @@ Optionally formats as RP via claude-code-proxy.
 
 Usage:
     dictation-server [--port PORT] [--host HOST] [--no-ssl]
+    dictation-server --rotate-token
 """
 
 import argparse
@@ -147,7 +148,12 @@ WORD_CONFIDENCE_MIN_LEN = 3
 DEFAULT_PORT = 8384
 DEFAULT_HOST = os.environ.get("DICTATION_BIND_HOST", "127.0.0.1")
 MODEL_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "whisper"
-DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "dictation-server"
+DATA_DIR = Path(
+    os.environ.get(
+        "CALLIOPE_DATA_DIR",
+        Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "dictation-server",
+    )
+)
 CERT_FILE = DATA_DIR / "cert.pem"
 KEY_FILE = DATA_DIR / "key.pem"
 TOKEN_FILE = DATA_DIR / "token"
@@ -1191,8 +1197,18 @@ if not CORS_ALLOW_WILDCARD and _CORS_RAW:
 _token_cache: dict = {"value": "", "loaded": False}
 
 
-def ensure_token() -> str:
-    """Mint or load the bearer token. First-run: log it once for pairing."""
+def _write_token_file(tok: str) -> None:
+    """Persist the bearer token with owner-only permissions from creation."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(tok)
+        f.write("\n")
+    os.chmod(TOKEN_FILE, 0o600)
+
+
+def ensure_token(*, log_new_token: bool = True) -> str:
+    """Mint or load the bearer token. First-run: optionally log it once for pairing."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if TOKEN_FILE.exists():
         try:
@@ -1205,11 +1221,11 @@ def ensure_token() -> str:
             log.warning(f"Could not read existing token file: {e}")
     tok = secrets.token_urlsafe(32)
     try:
-        TOKEN_FILE.write_text(tok, encoding="utf-8")
-        os.chmod(TOKEN_FILE, 0o600)
+        _write_token_file(tok)
     except Exception as e:
         log.error(f"Failed to persist bearer token: {e}")
-    log.info(f"Bearer token: {tok}")
+    if log_new_token:
+        log.info(f"Bearer token: {tok}")
     log.info(f"Token saved to {TOKEN_FILE} (mode 0600)")
     _token_cache["value"] = tok
     _token_cache["loaded"] = True
@@ -1235,7 +1251,7 @@ def _redact_sensitive_url_params(text: str) -> str:
     )
 
 
-def regenerate_token() -> str:
+def regenerate_token(*, log_new_token: bool = True) -> str:
     """Rotate the bearer token unconditionally (wizard --force / rotation)."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     try:
@@ -1244,7 +1260,7 @@ def regenerate_token() -> str:
         log.warning(f"Could not remove existing token file: {e}")
     _token_cache["value"] = ""
     _token_cache["loaded"] = False
-    return ensure_token()
+    return ensure_token(log_new_token=log_new_token)
 
 
 def _is_loopback_address(addr: str) -> bool:
@@ -10528,6 +10544,8 @@ def main():
     # MVP-24 — Tailscale-issued Let's Encrypt cert (ADR-7 Tier 3).
     parser.add_argument("--tailscale-cert", action="store_true",
                         help="Issue a Tailscale (Let's Encrypt via MagicDNS) cert for this node and exit (MVP-24).")
+    parser.add_argument("--rotate-token", action="store_true",
+                        help="Rotate the bearer token and exit; prints the token path, not the secret value.")
     parser.add_argument("--force", action="store_true",
                         help="Re-run wizard stages even when artifacts exist (rotates cert+token, re-downloads model).")
     parser.add_argument("--install-systemd", dest="install_systemd",
@@ -10549,6 +10567,17 @@ def main():
         return run_setup_wizard(args)
     if args.tailscale_cert:
         return run_tailscale_cert(args)
+    if args.rotate_token:
+        regenerate_token(log_new_token=False)
+        print("Bearer token rotated.")
+        print(f"Token file: {TOKEN_FILE} (mode 0600)")
+        print("Token value was not printed; treat the file contents as a password.")
+        print(
+            "Live rotation sequence: stop dictation-server; rotate the token; "
+            "update the ST bridge token setting; restart dictation-server; "
+            "hard-refresh SillyTavern; re-pair the phone."
+        )
+        return 0
 
     # Verify dependencies
     if not shutil.which(WHISPER_BIN):

@@ -57,7 +57,8 @@ Stored in `~/.local/share/dictation-server/`:
 - `cert.pem` (mode 0644), `key.pem` (mode 0600) — self-signed TLS cert,
   90-day validity, auto-renewed at startup.
 - `token` (mode 0600) — 32-byte bearer token. Required on every endpoint
-  except `/health`.
+  except `/health`. `dictation-server --rotate-token` rotates it without
+  printing the new value by default; treat the file contents as a password.
 - `cert.fingerprint` — SHA-256, also printed at server startup.
 
 Treat this directory like `~/.ssh/`. Exclude it from cloud backups (Google
