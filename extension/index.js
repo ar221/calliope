@@ -72,7 +72,7 @@ const DEFAULTS = {
     // ─── TTS read-back (Calliope Kokoro backend) ───────────────────────────
     ttsAutoReadAi: false,        // auto-fire TTS on every new AI message
     ttsAutoReadPersonaQuoted: true, // auto-fire TTS on new user messages, quoted dialogue only
-    ttsReadStreamingPartials: false, // stream partial TTS — needs server streaming (deferred)
+    ttsReadStreamingPartials: false, // deferred: server streaming partial TTS is not shipped
     ttsVoice: 'af_heart',        // Kokoro default voice id
     ttsVoiceProfiles: {},        // WOW-2: character/addressee name -> Kokoro voice id
 };
@@ -111,6 +111,13 @@ function settings() {
         }
         if (shouldMigrateServerUrl(extension_settings[MODULE].serverUrl)) {
             extension_settings[MODULE].serverUrl = defaultServerUrl();
+            try { saveSettings(); } catch {}
+        }
+        // Phase 4: schema key retained for future compatibility, but
+        // streaming partial TTS is explicitly deferred until the server ships
+        // chunked audio support. Never let stale ST settings imply it is live.
+        if (extension_settings[MODULE].ttsReadStreamingPartials !== false) {
+            extension_settings[MODULE].ttsReadStreamingPartials = false;
             try { saveSettings(); } catch {}
         }
     }
@@ -3033,9 +3040,9 @@ function buildSettingsPanel() {
                             <span>Auto-read my quoted dialogue</span>
                         </label>
 
-                        <label class="checkbox_label" title="Read streamed text as it arrives — needs server streaming support (deferred)">
-                            <input id="dictation_bridge_tts_stream_partials" type="checkbox" disabled />
-                            <span style="opacity:0.7">Read streaming partials (server support pending)</span>
+                        <label class="checkbox_label" title="Deferred — server streaming partial TTS is not shipped">
+                            <input id="dictation_bridge_tts_stream_partials" type="checkbox" disabled aria-disabled="true" />
+                            <span style="opacity:0.7">Streaming partial TTS deferred — server streaming not shipped</span>
                         </label>
 
                         <label for="dictation_bridge_tts_voice">Voice</label>
@@ -3212,11 +3219,16 @@ function buildSettingsPanel() {
         });
     }
     if (ttsStreamEl) {
-        ttsStreamEl.checked = !!s.ttsReadStreamingPartials;
-        // TODO: wire when server streaming TTS lands. For now keep disabled
-        // but mirror the persisted value so toggling default in code works.
+        s.ttsReadStreamingPartials = false;
+        ttsStreamEl.checked = false;
+        ttsStreamEl.disabled = true;
+        ttsStreamEl.setAttribute('aria-disabled', 'true');
+        ttsStreamEl.title = 'Deferred — server streaming partial TTS is not shipped';
+        // Defensive only: disabled controls should not fire, but stale browser
+        // or script changes must still collapse back to the non-streaming path.
         ttsStreamEl.addEventListener('change', () => {
-            s.ttsReadStreamingPartials = !!ttsStreamEl.checked;
+            s.ttsReadStreamingPartials = false;
+            ttsStreamEl.checked = false;
             saveSettings();
         });
     }

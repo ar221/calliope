@@ -1,6 +1,6 @@
 # Calliope Roadmap
 
-Status date: 2026-05-18.
+Status date: 2026-06-05.
 
 ## Shipped / working MVP+
 
@@ -38,9 +38,9 @@ Status date: 2026-05-18.
    - Pending: confirm remembered addressee/mode behavior in the same live smoke.
 
 3. **TTS completion**
-   - Decide whether streaming partial TTS is core or deferred.
-   - If core: implement server streaming and enable `ttsReadStreamingPartials`.
-   - If deferred: keep the toggle disabled and document it as non-shipped.
+   - Resolved as deferred: streaming partial TTS is not shipped in this queue.
+   - `ttsReadStreamingPartials` remains false and the ST settings toggle is disabled/annotated.
+   - Existing non-streaming Kokoro read-back, voice profiles, samples, and audiobook export remain the supported path.
 
 4. **Token rotation UX**
    - Done: `dictation-server --rotate-token` rotates the bearer token with mode 0600 and prints only the token path plus live-service next steps.

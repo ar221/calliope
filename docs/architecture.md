@@ -2,9 +2,9 @@
 
 Calliope is a single-file Python server that orchestrates four moving
 parts: the phone PWA, the SillyTavern `dictation-bridge` extension,
-`whisper-server` (whisper.cpp HTTP daemon), and an LLM proxy. The
-canonical source is `server/calliope-server` (large lines, Python
-stdlib + optional PyYAML).
+`whisper-server` (whisper.cpp HTTP daemon), and an LLM proxy, plus an
+optional Kokoro TTS read-back proxy. The canonical source is
+`server/calliope-server` (large lines, Python stdlib + optional PyYAML).
 
 ## Diagram
 
@@ -162,6 +162,19 @@ phone UI for low-confidence highlighting.
 Both routes go through `formatter_request(provider, ...)` which maintains
 the outbound-call ring buffer that `/audit/network` exposes.
 
+### Kokoro TTS read-back (optional)
+
+The ST extension can request non-streaming read-back through Calliope's
+Kokoro proxy:
+
+- `POST /tts` returns one complete WAV/audio response for the requested text.
+- `GET /tts/voices`, `POST /tts/voices/suggest`, and `POST /tts/audiobook`
+  support voice profiles, samples, suggestions, and bounded audiobook export.
+- `ttsReadStreamingPartials` is retained as a future schema key but is forced
+  false in the extension. Streaming partial TTS is deferred until a separate
+  server streaming contract, buffering/cancellation model, and synthetic-audio
+  test plan are approved.
+
 ## Data flows
 
 ### `POST /transcribe` (primary path)
@@ -204,7 +217,7 @@ producer.
 |---|---|---|
 | `dictation-state` | `{state: idle\|listening\|transcribing\|cleaning\|done, mode, ts}` | pipeline transitions |
 | `dictation-transcript` | `{requestId, phase, text, source, latency_ms?}` | raw Whisper preview before formatter work |
-| `dictation-token` | `{requestId, delta, done}` | streaming formatter output (MVP-13) |
+| `dictation-token` | `{requestId, delta, done}` | streaming formatter output (MVP-13), not TTS audio |
 | `dictation-result` | `{requestId, text, raw, cleaned, mode, timing, formatting_skipped?}` | completed dictation payload |
 | `dictation-edit` | `{text, auto_send?}` | phone "Send to ST" button → fan-out |
 | `dictation-command` | `{cmd, args, raw}` | voice-edit grammar (POL-15) |
