@@ -25,7 +25,9 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-SRC = pathlib.Path(__file__).resolve().parents[1] / "server" / "calliope-server"
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+SRC = ROOT / "server" / "calliope-server"
+EXT = ROOT / "extension" / "index.js"
 
 
 @pytest.fixture(scope="module")
@@ -43,6 +45,25 @@ def _clear_voices_cache(mod):
     mod._invalidate_kokoro_voices_cache()
     yield
     mod._invalidate_kokoro_voices_cache()
+
+
+# ─── Deferred streaming-partials contract ───────────────────
+
+
+def test_extension_streaming_partials_setting_is_deferred_off():
+    src = EXT.read_text(encoding="utf-8")
+    assert "ttsReadStreamingPartials: false" in src
+    assert 'id="dictation_bridge_tts_stream_partials" type="checkbox" disabled aria-disabled="true"' in src
+    assert "Streaming partial TTS deferred — server streaming not shipped" in src
+    assert "s.ttsReadStreamingPartials = !!ttsStreamEl.checked" not in src
+    assert "ttsStreamEl.checked = false" in src
+
+
+def test_no_streaming_tts_endpoint_or_client_path_shipped():
+    server_src = SRC.read_text(encoding="utf-8")
+    ext_src = EXT.read_text(encoding="utf-8")
+    assert '"/tts/stream' not in server_src
+    assert "'/tts/stream" not in ext_src
 
 
 # ─── _validate_tts_request ─────────────────────────────────

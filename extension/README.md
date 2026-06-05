@@ -47,7 +47,7 @@ All settings live under ST's Extensions drawer → "Dictation Bridge":
 |---|---|---|
 | Server URL | `https://<current ST host>:8384` | Dictation server URL. Defaults to the same hostname used for SillyTavern, with port `8384`, so LAN/mobile ST sessions follow IP changes automatically. |
 | Server bearer token | blank | Paste the server token from `~/.local/share/dictation-server/token`; the status chip distinguishes missing, valid, invalid/stale, and unknown tokens. |
-| Re-pair this phone / Copy pairing URL | n/a | Opens or copies a fresh tokenized phone URL for the active ST chat/persona/character. Use copy as the source for a QR handoff; treat it like a password. |
+| Re-pair this phone / Copy pairing URL / Show local QR | n/a | Opens, copies, or renders a fresh tokenized phone URL for the active ST chat/persona/character. The QR is generated locally in the browser with the vendored Nayuki MIT library; hide clears the canvas and removes the URL node. Treat it like a password. |
 | Open style | Popup | Popup spawns a small window next to the chat; iframe overlays a modal inside ST. Popup is recommended for the phone workflow since you're typically holding the phone separately. |
 | Text handling | Replace | `Replace` overwrites the current textarea, `Append` adds to whatever's already there. |
 | Auto-send after dictation | off | If on, the formatted result both fills the textarea and clicks the Send button. |
@@ -57,11 +57,14 @@ All settings live under ST's Extensions drawer → "Dictation Bridge":
 ### Phone workflow
 
 From the phone browser, open a fresh paired page from the ST mic button or
-from Extensions → Dictation Bridge → **Re-pair this phone**. **Copy pairing
-URL** copies the same tokenized URL for QR/phone handoff. The server scrubs
-`?token=` from browser history after load, but copied pairing URLs should be
-treated like passwords. Standalone phone pages receive results back to ST via
-SSE; embed mode additionally uses `postMessage` as a local fallback.
+from Extensions → Dictation Bridge → **Re-pair this phone**. **Show local QR**
+renders the same tokenized URL to a Canvas in the ST settings panel without a
+server round-trip, CDN, or third-party QR service. **Copy pairing URL** remains
+the fallback when QR rendering or scanning is unavailable. The server scrubs
+`?token=` from browser history after load, but copied/scanned pairing URLs and
+QR screenshots should be treated like passwords. Standalone phone pages receive
+results back to ST via SSE; embed mode additionally uses `postMessage` as a
+local fallback.
 
 ### Self-signed cert
 
@@ -82,7 +85,7 @@ fails (cert rejection or server down).
 - **Mixed content** — the server is HTTPS, so ST at `http://` would
   normally be fine. If ST is behind HTTPS with strict CSP, the iframe
   may be blocked; the popup window bypasses page-level CSP.
-- **Grouped chats** — current builds send group id, members, and last speaker; use the addressee picker when you need a specific group member voice. Edge cases should be treated as group-QA bugs, not a missing core feature.
+- **Grouped chats** — current builds send group id, members, and last speaker; use the addressee picker when you need a specific group member voice. Server-side synthetic regression tests cover the group payload shape; use the manual smoke checklist in `../docs/troubleshooting.md` for live ST validation without exposing private chat text.
 - **Third-party loading** — if ST's extension loader doesn't find the
   `third-party/` subdirectory convention, move the folder one level up
   into `extensions/` and reload.
@@ -144,8 +147,10 @@ from the other end.
 
 - `manifest.json` — extension manifest (ST loads this first)
 - `index.js` — main logic (ES module, no build step)
+- `qrcodegen.min.js` — vendored Nayuki QR Code generator (MIT), used only for local pairing QR Canvas rendering
 - `style.css` — mic button and modal styling
 - `README.md` — this file
 
-No dependencies. jQuery is available globally via ST but the extension
-avoids it where vanilla DOM is equivalent.
+The extension has one bundled browser dependency, `qrcodegen.min.js`, documented
+in `../THIRD_PARTY_NOTICES.md`. jQuery is available globally via ST but the
+extension avoids it where vanilla DOM is equivalent.

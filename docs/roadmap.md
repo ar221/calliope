@@ -1,6 +1,6 @@
 # Calliope Roadmap
 
-Status date: 2026-05-18.
+Status date: 2026-06-05.
 
 ## Shipped / working MVP+
 
@@ -25,31 +25,36 @@ Status date: 2026-05-18.
 
 1. **Pairing clarity**
    - Done: distinguish server health, token validity, SSE status, and ST-follow freshness.
-   - Done: ST settings panel can open a fresh paired phone page or copy a tokenized pairing URL for QR handoff.
-   - Next: optional fully local QR renderer in the settings panel, without sending the token to a third-party QR service.
+   - Done: ST settings panel can open a fresh paired phone page or copy a tokenized pairing URL.
+   - Done: local settings-panel QR renderer uses vendored Nayuki MIT browser JS and Canvas; no server round-trip or third-party QR service.
 
 2. **Group-chat QA**
-   - Live-test addressee picker in actual ST group chats.
-   - Confirm last-speaker default and remembered addressee/mode behavior.
-   - Add a small regression fixture if ST state payloads can be mocked.
+   - Partial: synthetic server pytest now covers avatar filename → character-name
+     resolution, missing-avatar stem fallback, latest non-user/non-system last
+     speaker, `*all` addressee round-trip, and group scene-contract identity.
+   - Pending: run the live ST group smoke in
+     [`docs/troubleshooting.md`](troubleshooting.md#11-manual-smoke-group-chat-addressee-qa)
+     without copying private chat text, cards, avatars, tokens, or tokenized URLs.
+   - Pending: confirm remembered addressee/mode behavior in the same live smoke.
 
 3. **TTS completion**
-   - Decide whether streaming partial TTS is core or deferred.
-   - If core: implement server streaming and enable `ttsReadStreamingPartials`.
-   - If deferred: keep the toggle disabled and document it as non-shipped.
+   - Resolved as deferred: streaming partial TTS is not shipped in this queue.
+   - `ttsReadStreamingPartials` remains false and the ST settings toggle is disabled/annotated.
+   - Existing non-streaming Kokoro read-back, voice profiles, samples, and audiobook export remain the supported path.
 
 4. **Token rotation UX**
-   - Add a real `dictation-server --rotate-token` command or a settings-panel re-pair flow.
-   - Until then, manual rotation is: stop service, replace `~/.local/share/dictation-server/token`, sync ST setting, restart.
+   - Done: `dictation-server --rotate-token` rotates the bearer token with mode 0600 and prints only the token path plus live-service next steps.
+   - Live sequence: stop service, rotate, update ST bridge token setting, restart, hard-refresh ST, re-pair phone.
 
 5. **Packaging**
-   - Prepare AUR `calliope-git` once repo paths/docs are public-safe.
-   - Prepare pipx/install script if the single-file server remains the distribution model.
+   - Done: AUR `calliope-git` packaging now follows the repo layout, installs the single-file server through package wrappers, includes the adjacent voice catalog, and keeps runtime state/certs/tokens/models out of the package.
+   - Done: pipx packaging remains a thin adapter around the single-file server source; Hatch copies `server/calliope-server` into the wheel as the `calliope-server` entry point without lifting out the embedded PWA.
+   - Pending: publish/tag/release steps remain blocked until Ayaz explicitly cuts a release.
 
 6. **Docs/publication hygiene**
-   - Keep public docs free of user-specific absolute paths.
-   - Keep `docs/config.md`, `docs/architecture.md`, and systemd unit examples synchronized with live defaults.
-   - Add issue templates that explicitly forbid attaching audio or tokenized URLs.
+   - Done: public-path scan completed; generic runtime paths stay as examples and Ayaz-local SillyTavern paths remain documented as local operational defaults.
+   - Done: CI mirrors local gates: pytest, ruff, Python syntax, extension JS syntax, embedded phone UI JS syntax, packaging shell syntax, and systemd unit verification.
+   - Done: `.github/ISSUE_TEMPLATE/` issue forms explicitly forbid audio attachments, tokenized URLs, bearer tokens, certs/keys, cookies, and private chat logs.
 
 ## Known intentional defaults
 

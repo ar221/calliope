@@ -96,8 +96,8 @@ single-file server onto your PATH:
 install -m 755 server/calliope-server ~/.local/bin/dictation-server
 ```
 
-(AUR `calliope-git` and `pipx install calliope` are tracked in
-[the roadmap](docs/roadmap.md).)
+(AUR `calliope-git` and pipx packaging via `calliope-dictation` are tracked in
+[the roadmap](docs/roadmap.md); neither channel is published yet.)
 
 **5. Run the wizard.** It probes audio, picks a model size from your VRAM,
 generates a self-signed cert + bearer token, installs the systemd unit, and
@@ -107,9 +107,9 @@ runs a 10-second self-test:
 dictation-server --setup
 ```
 
-The wizard prints the cert SHA-256 fingerprint and a QR code containing the
-URL + token + fingerprint. Save the fingerprint somewhere — you will match
-it on first phone connect.
+The wizard prints the cert SHA-256 fingerprint and stores the bearer token.
+Save the fingerprint somewhere — you will match it on first phone connect.
+Pair phones from the SillyTavern extension after it is installed.
 
 **6. Install the SillyTavern extension.** Drop `dictation-bridge/` under
 `<ST install>/data/default-user/extensions/third-party/` (or symlink from
@@ -123,10 +123,12 @@ Hard-refresh ST. A mic button appears in the send bar.
 Mod+Shift+M  { spawn "bash" "-c" "$HOME/.local/bin/dictate toggle"; }
 ```
 
-**8. First phone connection.** Scan the QR code from the wizard with your
-phone camera. Visit the resulting URL, trust the cert (one-time per
-browser profile, see [`docs/cert-trust.md`](docs/cert-trust.md)), bookmark
-it, install as PWA. Test recording.
+**8. First phone connection.** In ST, open Extensions → Dictation Bridge and
+use **Re-pair this phone**, **Show local QR**, or **Copy pairing URL**. The QR
+is rendered locally in the ST browser and contains the bearer-token pairing
+URL, so treat it like a password. Visit the URL, trust the cert (one-time per
+browser profile, see [`docs/cert-trust.md`](docs/cert-trust.md)), bookmark it,
+install as PWA, then test recording.
 
 ## Architecture
 
@@ -163,7 +165,7 @@ Runtime data and config live under `~/.local/share/dictation-server/`:
 
 - `cert.pem` / `key.pem` — self-signed TLS cert (90-day rotation,
   auto-renewed at startup).
-- `token` — 32-byte bearer token, mode 0600. To rotate it today, stop the user service, replace the token file with a new 32-byte secret, sync the ST extension setting, then restart the service. Public `--rotate-token` CLI is still tracked in [`docs/roadmap.md`](docs/roadmap.md).
+- `token` — 32-byte bearer token, mode 0600. Rotate with `dictation-server --rotate-token`; the command prints the token path and live-service next steps, not the token value. Live rotation sequence: stop the user service, rotate, update the ST bridge token setting from the token file, restart the service, hard-refresh SillyTavern, then re-pair the phone.
 - `cert.fingerprint` — SHA-256, also printed at startup.
 - `vocab.yaml` — character/term biasing for whisper `--prompt`.
 - `modes.yaml` — pipeline mode definitions.
@@ -203,11 +205,12 @@ claude-code-proxy, Monaspace, Literata, system tools).
 ## Support
 
 - **Bugs:** file an issue in the repository when it is public. Until then, report locally to the maintainer/operator.
-- **Security:** see [`SECURITY.md`](SECURITY.md); never attach audio or tokenized URLs.
+- **Security:** see [`SECURITY.md`](SECURITY.md); never attach audio, bearer tokens, tokenized URLs, certs/keys, or private chat logs.
 - **Discussion:** use the project discussion space once published.
 
-When filing an issue: do not attach audio. The issue template defaults the
-"audio attached?" checkbox to NO and reminds you on submit.
+When filing an issue, use the templates under `.github/ISSUE_TEMPLATE/`; they
+require confirmation that no audio, tokenized URL, cert/key, or private chat
+text is attached.
 
 ## Status
 

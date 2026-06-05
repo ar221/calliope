@@ -7,6 +7,7 @@ Optionally formats as RP via claude-code-proxy.
 
 Usage:
     dictation-server [--port PORT] [--host HOST] [--no-ssl]
+    dictation-server --rotate-token
 """
 
 import argparse
@@ -147,7 +148,12 @@ WORD_CONFIDENCE_MIN_LEN = 3
 DEFAULT_PORT = 8384
 DEFAULT_HOST = os.environ.get("DICTATION_BIND_HOST", "127.0.0.1")
 MODEL_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "whisper"
-DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "dictation-server"
+DATA_DIR = Path(
+    os.environ.get(
+        "CALLIOPE_DATA_DIR",
+        Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "dictation-server",
+    )
+)
 CERT_FILE = DATA_DIR / "cert.pem"
 KEY_FILE = DATA_DIR / "key.pem"
 TOKEN_FILE = DATA_DIR / "token"
@@ -863,9 +869,14 @@ class ChatReader:
             # Skip metadata line
             if "chat_metadata" in data:
                 continue
+            extra = data.get("extra") if isinstance(data.get("extra"), dict) else {}
             messages.append({
                 "name": data.get("name", "Unknown"),
                 "is_user": bool(data.get("is_user", False)),
+                "is_system": (
+                    bool(data.get("is_system", False))
+                    or str(extra.get("type", "")).lower() == "system"
+                ),
                 "text": data.get("mes", ""),
                 "send_date": data.get("send_date", ""),
             })
@@ -874,13 +885,38 @@ class ChatReader:
         return messages[-last_n:]
 
     @staticmethod
+    def _group_member_name_from_avatar(avatar: str) -> str:
+        """Resolve an ST group member avatar filename to display name.
+
+        Group defs store member avatar filenames. Prefer the character card's
+        declared name when the matching synthetic/real card exists; if the
+        avatar/card was deleted, fall back to the filename stem instead of
+        dropping the member or crashing.
+        """
+        stem = Path(str(avatar or "")).stem
+        if not stem:
+            return ""
+        try:
+            card = load_character_card(stem)
+        except Exception:  # pragma: no cover — defensive fallback only
+            card = {}
+        if isinstance(card, dict):
+            name = str(card.get("name") or "").strip()
+            if name:
+                return name
+        return stem
+
+    @staticmethod
     def get_group_members(group_name: str) -> list[str]:
-        """Return member names for a group chat."""
+        """Return member display names for a group chat."""
         for group in ChatReader._load_group_defs():
             if group.get("name", "") == group_name:
-                members = group.get("members", [])
-                # Members are stored as "CharName.png" — strip extension
-                return [m.replace(".png", "") for m in members]
+                names: list[str] = []
+                for member in group.get("members", []) or []:
+                    name = ChatReader._group_member_name_from_avatar(str(member))
+                    if name:
+                        names.append(name)
+                return names
         return []
 
     # ─── POL-6 — group-id helpers + last-speaker tracking ─────
@@ -926,8 +962,9 @@ class ChatReader:
         out: list[dict] = []
         for raw in group.get("members", []) or []:
             avatar = str(raw)
-            name = avatar[:-4] if avatar.lower().endswith(".png") else avatar
-            out.append({"name": name, "avatar": avatar})
+            name = ChatReader._group_member_name_from_avatar(avatar)
+            if name:
+                out.append({"name": name, "avatar": avatar})
         return out
 
     @staticmethod
@@ -965,10 +1002,10 @@ class ChatReader:
         )
         last_ai_name: str | None = None
         for msg in reversed(messages):
-            if msg.get("is_user"):
+            if msg.get("is_user") or msg.get("is_system"):
                 continue
             name = str(msg.get("name", "") or "").strip()
-            if name and name.lower() != "you":
+            if name and name.lower() not in {"you", "system"}:
                 last_ai_name = name
                 break
         with _group_last_speaker_lock:
@@ -1191,8 +1228,18 @@ if not CORS_ALLOW_WILDCARD and _CORS_RAW:
 _token_cache: dict = {"value": "", "loaded": False}
 
 
-def ensure_token() -> str:
-    """Mint or load the bearer token. First-run: log it once for pairing."""
+def _write_token_file(tok: str) -> None:
+    """Persist the bearer token with owner-only permissions from creation."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(tok)
+        f.write("\n")
+    os.chmod(TOKEN_FILE, 0o600)
+
+
+def ensure_token(*, log_new_token: bool = True) -> str:
+    """Mint or load the bearer token. First-run: optionally log it once for pairing."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if TOKEN_FILE.exists():
         try:
@@ -1205,11 +1252,11 @@ def ensure_token() -> str:
             log.warning(f"Could not read existing token file: {e}")
     tok = secrets.token_urlsafe(32)
     try:
-        TOKEN_FILE.write_text(tok, encoding="utf-8")
-        os.chmod(TOKEN_FILE, 0o600)
+        _write_token_file(tok)
     except Exception as e:
         log.error(f"Failed to persist bearer token: {e}")
-    log.info(f"Bearer token: {tok}")
+    if log_new_token:
+        log.info(f"Bearer token: {tok}")
     log.info(f"Token saved to {TOKEN_FILE} (mode 0600)")
     _token_cache["value"] = tok
     _token_cache["loaded"] = True
@@ -1235,7 +1282,7 @@ def _redact_sensitive_url_params(text: str) -> str:
     )
 
 
-def regenerate_token() -> str:
+def regenerate_token(*, log_new_token: bool = True) -> str:
     """Rotate the bearer token unconditionally (wizard --force / rotation)."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     try:
@@ -1244,7 +1291,7 @@ def regenerate_token() -> str:
         log.warning(f"Could not remove existing token file: {e}")
     _token_cache["value"] = ""
     _token_cache["loaded"] = False
-    return ensure_token()
+    return ensure_token(log_new_token=log_new_token)
 
 
 def _is_loopback_address(addr: str) -> bool:
@@ -5905,6 +5952,7 @@ let stStateFresh = false;      // whether ST state is currently fresh
 let stFollow = true;           // auto-adopt ST state; user override sets this false
 let statePollTimer = null;     // poll /state every STATE_POLL_MS when visible
 let statePollVisible = true;
+let statePollLifecycleBound = false;
 const STATE_POLL_MS = 10_000;
 const FOLLOW_ST_FROM_URL = new URLSearchParams(location.search).get('follow') !== '0';
 
@@ -6533,6 +6581,9 @@ function WARN_UI(...args) { try { console.warn('[dictation]', ...args); } catch 
 
 async function startRecording() {
   try {
+    // Mobile tab switching can leave the phone UI with a stale snapshot. Pull
+    // once at the moment of capture so context is current without manual refresh.
+    if (FOLLOW_ST_FROM_URL) await loadStateAndApply({ force: true });
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
     });
@@ -6735,6 +6786,9 @@ function startVuDraw() {
 }
 
 async function sendAudio() {
+  // Re-check right before formatting/transcription too; this covers hold-to-record
+  // and long recordings where ST context changed while the phone page was open.
+  if (FOLLOW_ST_FROM_URL) await loadStateAndApply({ force: true });
   const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType });
 
   const model = document.getElementById('modelSelect').value;
@@ -7856,20 +7910,31 @@ async function sendToST() {
   }
 }
 
+function refreshStateFromLifecycle() {
+  statePollVisible = !document.hidden;
+  if (statePollVisible) loadStateAndApply();
+}
+
 function startStatePolling() {
   stopStatePolling();
   if (!FOLLOW_ST_FROM_URL) return;
   statePollTimer = setInterval(() => {
     if (statePollVisible) loadStateAndApply();
   }, STATE_POLL_MS);
-  document.addEventListener('visibilitychange', () => {
-    statePollVisible = !document.hidden;
-    if (statePollVisible) loadStateAndApply();
-  });
+  document.addEventListener('visibilitychange', refreshStateFromLifecycle);
+  window.addEventListener('pageshow', refreshStateFromLifecycle);
+  window.addEventListener('focus', refreshStateFromLifecycle);
+  statePollLifecycleBound = true;
 }
 
 function stopStatePolling() {
   if (statePollTimer) { clearInterval(statePollTimer); statePollTimer = null; }
+  if (statePollLifecycleBound) {
+    document.removeEventListener('visibilitychange', refreshStateFromLifecycle);
+    window.removeEventListener('pageshow', refreshStateFromLifecycle);
+    window.removeEventListener('focus', refreshStateFromLifecycle);
+    statePollLifecycleBound = false;
+  }
 }
 
 async function persistCharMode(charId, modeId) {
@@ -9918,13 +9983,13 @@ def _wizard_stage_3(args) -> str:
 
     # --- Token ---
     if args.force or not TOKEN_FILE.exists():
-        token = regenerate_token() if args.force else ensure_token()
+        regenerate_token() if args.force else ensure_token()
         if args.force:
             _wizard_ok("rotated bearer token (--force)")
         else:
             _wizard_ok("minted bearer token")
     else:
-        token = ensure_token()
+        ensure_token()
         _wizard_skip(3, "token already exists (use --force to rotate)")
     # Save reference so other stages don't re-prompt.
     print(f"  Token saved at: {TOKEN_FILE}  (mode 0600)")
@@ -9973,7 +10038,7 @@ def _wizard_stage_3(args) -> str:
                 subprocess.run(cmd, check=True)
                 os.chmod(CERT_FILE, 0o644)
                 os.chmod(KEY_FILE, 0o600)
-                _wizard_ok(f"mkcert-issued cert installed; CA trusted in user store")
+                _wizard_ok("mkcert-issued cert installed; CA trusted in user store")
                 fp = cert_fingerprint_sha256() or fp
                 if fp:
                     CERT_FINGERPRINT_FILE.write_text(fp + "\n", encoding="utf-8")
@@ -10128,7 +10193,7 @@ def _wizard_stage_5(args) -> None:
         _wizard_warn("pw-record not on PATH — skipping self-test")
         return
 
-    print(f"  Read this phrase aloud after the prompt (5s):")
+    print("  Read this phrase aloud after the prompt (5s):")
     print(f'    "{WIZARD_GROUND_TRUTH}"')
     if not _wizard_confirm("  Ready?", default_yes=True):
         _wizard_skip(5, "user declined")
@@ -10292,8 +10357,8 @@ def _wizard_stage_6(args, fingerprint: str) -> None:
 def _wizard_stage_7(state: dict, fingerprint: str) -> None:
     _wizard_say(7, "summary")
     lan_ip = _wizard_lan_ip()
-    print(f"  ✓ You're set.")
-    print(f"    Hotkey:       Mod+Shift+M (configure in your WM)")
+    print("  ✓ You're set.")
+    print("    Hotkey:       Mod+Shift+M (configure in your WM)")
     print(f"    Phone URL:    https://{lan_ip}:{DEFAULT_PORT}")
     print(f"    Bearer token: {TOKEN_FILE}")
     print(f"    Cert FP:      {fingerprint or '(none)'}")
@@ -10466,9 +10531,9 @@ def run_tailscale_cert(args) -> int:
             except Exception as e:
                 log.warning(f"fingerprint persist failed: {e}")
 
-        print(f"  ✓ Got Let's Encrypt cert from Tailscale.")
+        print("  ✓ Got Let's Encrypt cert from Tailscale.")
         print(f"    Server reachable at https://{hostname}:{DEFAULT_PORT}")
-        print(f"    from any tailnet device, no cert warnings.")
+        print("    from any tailnet device, no cert warnings.")
         if fp:
             print(f"    Fingerprint (SHA-256): {fp}")
 
@@ -10510,6 +10575,8 @@ def main():
     # MVP-24 — Tailscale-issued Let's Encrypt cert (ADR-7 Tier 3).
     parser.add_argument("--tailscale-cert", action="store_true",
                         help="Issue a Tailscale (Let's Encrypt via MagicDNS) cert for this node and exit (MVP-24).")
+    parser.add_argument("--rotate-token", action="store_true",
+                        help="Rotate the bearer token and exit; prints the token path, not the secret value.")
     parser.add_argument("--force", action="store_true",
                         help="Re-run wizard stages even when artifacts exist (rotates cert+token, re-downloads model).")
     parser.add_argument("--install-systemd", dest="install_systemd",
@@ -10531,6 +10598,17 @@ def main():
         return run_setup_wizard(args)
     if args.tailscale_cert:
         return run_tailscale_cert(args)
+    if args.rotate_token:
+        regenerate_token(log_new_token=False)
+        print("Bearer token rotated.")
+        print(f"Token file: {TOKEN_FILE} (mode 0600)")
+        print("Token value was not printed; treat the file contents as a password.")
+        print(
+            "Live rotation sequence: stop dictation-server; rotate the token; "
+            "update the ST bridge token setting; restart dictation-server; "
+            "hard-refresh SillyTavern; re-pair the phone."
+        )
+        return 0
 
     # Verify dependencies
     if not shutil.which(WHISPER_BIN):
@@ -10606,7 +10684,7 @@ def main():
         local_ip = "127.0.0.1"
 
     log.info(f"Dictation server running at {proto}://{local_ip}:{args.port}")
-    log.info(f"Open this URL on your phone to start dictating")
+    log.info("Open this URL on your phone to start dictating")
     if not args.no_ssl:
         log.info("First visit: accept the self-signed certificate warning")
 

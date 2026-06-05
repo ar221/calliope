@@ -1,15 +1,13 @@
 # Calliope — pipx packaging definition.
 #
-# Current shape: the source is a single-file Python script at
-# `server/calliope-server` (no `.py` extension, no package layout). The
-# `[project.scripts]` and `[tool.hatch.build.targets.wheel]` entries below
-# assume a future restructure to `calliope_dictation/server.py` with a
-# package layout and a `main()` entry point.
+# Current shape: the canonical source remains the single-file Python script at
+# `server/calliope-server` (no `.py` extension, no runtime package layout).
+# Hatch copies that exact artifact into the wheel as `calliope_dictation/_server.py`
+# so `pipx install ./packaging` exposes the intended `calliope-server` command
+# without lifting the embedded PWA out of the single-file server source.
 #
-# TODO: land the package-layout restructure before publishing to PyPI.
-# Until then this file is a forward-looking definition, not a buildable
-# spec — `pipx install` against this tree will fail because the
-# `calliope_dictation` package doesn't yet exist.
+# Publication note: keep this as a packaging adapter only. Do not move WEB_UI or
+# other runtime assets into a separate browser bundle as part of pipx packaging.
 
 [build-system]
 requires = ["hatchling"]
@@ -44,7 +42,7 @@ vocab-quality = ["wordfreq>=3.0"]
 all = ["pyyaml>=6.0", "wordfreq>=3.0"]
 
 [project.scripts]
-calliope-server = "calliope_dictation.server:main"
+calliope-server = "calliope_dictation._server:main"
 
 [project.urls]
 Homepage = "https://github.com/ar221/calliope"
@@ -52,3 +50,7 @@ Issues = "https://github.com/ar221/calliope/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["calliope_dictation"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"../server/calliope-server" = "calliope_dictation/_server.py"
+"../server/voice_catalog.json" = "calliope_dictation/voice_catalog.json"

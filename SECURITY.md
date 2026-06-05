@@ -27,4 +27,5 @@ The supported local deployment is:
 - `/health` may be public; protected APIs require bearer auth except loopback exemptions.
 - Token-bearing query strings are redacted from server logs.
 - Phone pairing tokens are session-scoped in the browser and scrubbed from the visible URL after bootstrap.
+- Token rotation uses `dictation-server --rotate-token`; the safe default prints only the token path and operational next steps, not the token value.
 - External model/provider calls are surfaced through `/audit/network`.

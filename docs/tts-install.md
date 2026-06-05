@@ -9,6 +9,10 @@ loopback HTTP daemon. The dictation-server also exposes:
 - `POST /tts/voices/suggest` — suggest a voice for a character/addressee.
 - `POST /tts/audiobook` — render a bounded multi-message audiobook/readback.
 
+Streaming partial TTS is **deferred**. The SillyTavern bridge keeps
+`ttsReadStreamingPartials` false/disabled until a future server streaming
+contract ships; current read-back waits for one complete Kokoro WAV per request.
+
 All are proxied through the loopback Kokoro daemon, with on-demand boot
 and idle-shutdown — Kokoro stays out of memory between read-backs.
 

@@ -2,9 +2,9 @@
 
 Calliope is a single-file Python server that orchestrates four moving
 parts: the phone PWA, the SillyTavern `dictation-bridge` extension,
-`whisper-server` (whisper.cpp HTTP daemon), and an LLM proxy. The
-canonical source is `server/calliope-server` (large lines, Python
-stdlib + optional PyYAML).
+`whisper-server` (whisper.cpp HTTP daemon), and an LLM proxy, plus an
+optional Kokoro TTS read-back proxy. The canonical source is
+`server/calliope-server` (large lines, Python stdlib + optional PyYAML).
 
 ## Diagram
 
@@ -64,9 +64,10 @@ stdlib + optional PyYAML).
 
 ### Phone PWA (origin: `https://<host>:8384/`)
 
-Single-document HTML+CSS+JS embedded in the server source (lines ~1800
-through ~4920). Apollo-themed (POL-5 shipped 2026-04). No third-party JS,
-no CDN, no external assets.
+Single-document HTML+CSS+JS embedded in the server source as `WEB_UI`.
+Apollo-themed (POL-5 shipped 2026-04). No third-party JS, no CDN, no
+external assets. Keep the single-file server model intact; the embedded
+`<script>` is extracted only by `scripts/check-web-ui-js` for `node --check`.
 
 - **Capture:** `navigator.mediaDevices.getUserMedia({audio: true})` →
   `MediaRecorder` with `audio/webm;codecs=opus`.
@@ -76,6 +77,10 @@ no CDN, no external assets.
 - **State machine:** `idle → listening → transcribing → cleaning → done`.
   States surfaced via the bar above the textarea (MVP-16) and via SSE
   events emitted at pipeline transitions.
+- **ST-follow freshness:** when opened from ST, the PWA refreshes `/state`
+  on foreground lifecycle events, once before recording starts, and again
+  before audio is submitted so mobile tab freezing does not leave the phone
+  formatting against an old chat/persona snapshot.
 - **Privacy badge:** chip in the header expands to an audit peek
   (last-50 outbound calls). Pulls from `GET /audit/network`. (MVP-23.)
 
@@ -87,7 +92,11 @@ under `<ST install>/data/default-user/extensions/third-party/`. Three files:
 - `manifest.json` — ST extension manifest, `auto_update: false`.
 - `index.js` — mic button injected into `#send_form`, popup or iframe
   to phone UI, SSE subscriber via `EventSource('/events')`, undo stack
-  (cap 8), state-machine bar wiring, voice-edit overlay, privacy peek.
+  (cap 8), state-machine bar wiring, voice-edit overlay, privacy peek,
+  local pairing QR Canvas render, and ST-state broadcasts on
+  chat/lifecycle/mic-open events.
+- `qrcodegen.min.js` — vendored Nayuki MIT browser QR library used only in
+  the settings panel for local pairing QR generation.
 - `style.css` — Apollo-matched theming for the bar and overlay.
 
 Reads the bearer token from ST settings; sends on every fetch and as
@@ -153,6 +162,19 @@ phone UI for low-confidence highlighting.
 Both routes go through `formatter_request(provider, ...)` which maintains
 the outbound-call ring buffer that `/audit/network` exposes.
 
+### Kokoro TTS read-back (optional)
+
+The ST extension can request non-streaming read-back through Calliope's
+Kokoro proxy:
+
+- `POST /tts` returns one complete WAV/audio response for the requested text.
+- `GET /tts/voices`, `POST /tts/voices/suggest`, and `POST /tts/audiobook`
+  support voice profiles, samples, suggestions, and bounded audiobook export.
+- `ttsReadStreamingPartials` is retained as a future schema key but is forced
+  false in the extension. Streaming partial TTS is deferred until a separate
+  server streaming contract, buffering/cancellation model, and synthetic-audio
+  test plan are approved.
+
 ## Data flows
 
 ### `POST /transcribe` (primary path)
@@ -195,7 +217,7 @@ producer.
 |---|---|---|
 | `dictation-state` | `{state: idle\|listening\|transcribing\|cleaning\|done, mode, ts}` | pipeline transitions |
 | `dictation-transcript` | `{requestId, phase, text, source, latency_ms?}` | raw Whisper preview before formatter work |
-| `dictation-token` | `{requestId, delta, done}` | streaming formatter output (MVP-13) |
+| `dictation-token` | `{requestId, delta, done}` | streaming formatter output (MVP-13), not TTS audio |
 | `dictation-result` | `{requestId, text, raw, cleaned, mode, timing, formatting_skipped?}` | completed dictation payload |
 | `dictation-edit` | `{text, auto_send?}` | phone "Send to ST" button → fan-out |
 | `dictation-command` | `{cmd, args, raw}` | voice-edit grammar (POL-15) |
@@ -233,5 +255,7 @@ extracts a per-request stage breakdown.
   the server. Still useful for offline-only workflows.
 - Footswitch daemon (WOW-7, not yet shipped) — would be another
   push-to-talk client targeting `/transcribe`.
-- AUR / pipx packaging (MVP-25, in progress) — distribution-only, no
-  runtime architecture impact.
+- AUR / pipx packaging (MVP-25) — distribution-only, no runtime architecture
+  impact. Both package paths preserve `server/calliope-server` as the
+  canonical single-file source; package wrappers/adapters point at that
+  artifact instead of splitting the embedded PWA into a separate browser file.

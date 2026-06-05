@@ -40,6 +40,9 @@ This repo is not an unattended production factory. Treat it as live-service code
 Use the nearest relevant checks:
 
 ```bash
+node --check extension/index.js
+node --check extension/qrcodegen.min.js
+scripts/check-web-ui-js
 python -m py_compile server/calliope-server scripts/learn-vocab scripts/kokoro-server.py
 pytest -q
 HOME=/home/ayaz systemd-analyze --user verify systemd/dictation-server.service systemd/whisper-server.service systemd/kokoro-server.service systemd/learn-vocab-nightly.service

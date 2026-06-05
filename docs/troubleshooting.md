@@ -1,6 +1,6 @@
 # Troubleshooting
 
-The top 10 failure modes Calliope users hit, with concrete fixes. If
+Common failure modes Calliope users hit, with concrete fixes. If
 yours isn't here, report it locally until the repository is published — and read the relevant sub-doc:
 [`architecture.md`](architecture.md), [`cert-trust.md`](cert-trust.md),
 [`tailscale.md`](tailscale.md), [`desktop-hotkey.md`](desktop-hotkey.md).
@@ -182,7 +182,49 @@ systemctl --user enable --now pipewire pipewire-pulse wireplumber
 
 ---
 
-## 6. Group chat addressee/context looks wrong
+## 6. Phone uses an old SillyTavern context after switching tabs
+
+**Symptom:** the phone page is paired, but a recording uses the previous
+chat/persona/group after you foreground the standalone phone tab or reopen
+from a stale bookmark.
+
+**Cause:** mobile browsers freeze background tabs aggressively. The ST tab
+may not get a normal heartbeat after the phone tab takes focus, so the
+phone can briefly hold an older `/state` snapshot.
+
+**Fix / check:** open the phone page from the current ST mic button when
+possible. Current builds push ST state on mic-open and browser lifecycle
+events, and the phone PWA force-refreshes `/state` before recording and
+before sending audio. If the follow banner still looks stale, hard-refresh
+SillyTavern and reopen the phone page; no server restart is required for
+this symptom unless you are deploying new server code.
+
+---
+
+## 7. Phone says stale token / 401 after rotation
+
+**Symptom:** the phone page says the token is stale, `/state` returns 401,
+or the ST bridge shows server reachable but auth invalid after you rotated the
+runtime token.
+
+**Cause:** the running server keeps the old token in memory until restart, and
+SillyTavern/phone sessions keep using the old token until the bridge setting
+and browser session are refreshed.
+
+**Fix:** use the live rotation sequence in this order:
+
+1. Stop `dictation-server`.
+2. Run `dictation-server --rotate-token`. It prints the token file path and
+   next steps, not the token value.
+3. Update the ST Dictation Bridge token setting from the token file. Do not
+   paste the token or a tokenized URL into logs, issues, or chat.
+4. Restart `dictation-server`.
+5. Hard-refresh SillyTavern so the extension reloads its settings.
+6. Re-pair the phone from the current ST mic button.
+
+---
+
+## 8. Group chat addressee/context looks wrong
 
 **Symptom:** in an ST group chat, dictation comes through with weak or
 wrong character context — `rp_enhance` sounds generic, or it follows the
@@ -211,7 +253,7 @@ failures as group-QA bugs.
 
 ---
 
-## 7. `getUserMedia` rejected: "no audio device" on phone
+## 9. `getUserMedia` rejected: "no audio device" on phone
 
 **Symptom:** the phone PWA's mic button fails to start recording. Browser
 console shows `NotAllowedError` or `NotFoundError` from `getUserMedia`.
@@ -238,7 +280,7 @@ context (`getUserMedia` requires a secure context — `https://` or
 
 ---
 
-## 8. Server fails to bind: address in use
+## 10. Server fails to bind: address in use
 
 **Symptom:** `systemctl --user status dictation-server` shows:
 
@@ -277,7 +319,7 @@ Update phone bookmarks + ST extension settings to the new port.
 
 ---
 
-## 9. RP-enhance returns empty / falls through to raw
+## 11. RP-enhance returns empty / falls through to raw
 
 **Symptom:** dictation produces only the raw whisper transcript — no
 asterisks, no enhanced phrasing — even when you've selected
@@ -318,7 +360,7 @@ Same drill for the OpenAI-shape proxy at `127.0.0.1:10531`, used for
 
 ---
 
-## 10. Transcribe hangs >2 min (cold model load)
+## 12. Transcribe hangs >2 min (cold model load)
 
 **Symptom:** the first `/transcribe` after server boot takes 30+ seconds,
 sometimes hits the 120-second whisper timeout. Subsequent calls are
@@ -362,3 +404,33 @@ If you still see >30s hangs:
 4. Inspect `journalctl --user -u dictation-server -f` during the hang —
    ROCm errors or Python tracebacks usually appear before the timeout
    fires.
+
+---
+
+## 11. Manual smoke: group-chat addressee QA
+
+Use this only after synthetic pytest coverage is green. Do **not** read,
+copy, export, or paste private chat text, character cards, avatars, tokens, or
+pairing URLs while smoking a live ST group.
+
+Checklist:
+
+1. Hard-refresh SillyTavern only if you are validating newly synced bridge
+   files; do not restart `dictation-server`, `whisper-server`, `kokoro-server`,
+   or SillyTavern services for this smoke.
+2. Open an active SillyTavern group chat and open Extensions → Dictation Bridge.
+3. Confirm the addressee/member chips show the expected group members.
+4. Confirm the latest non-user/non-system speaker is marked as the last-speaker
+   chip/default.
+5. Select one member, then select **All members**. The all-members addressee
+   should persist as `*all` rather than disappearing or becoming a solo
+   character.
+6. Verify the server-side `/state`/active-context payload using a safe debug
+   surface or logs: check only structural keys such as `chatType=group`,
+   `groupId`, `groupMembers`, `lastSpeaker`, and `characterName=*all`.
+   Do not print `lastAiMessage`, `mes`, transcript text, bearer tokens, or
+   tokenized URLs.
+7. Dictate a short synthetic throwaway phrase if needed, then verify the prompt
+   context still names the group and member list instead of collapsing to a
+   single solo character. Do not paste the actual private prompt or chat text
+   into issues or receipts.

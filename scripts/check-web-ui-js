@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Extract the embedded phone PWA JavaScript and run `node --check`.
+
+This is intentionally fail-loud: if the WEB_UI raw string or inline <script>
+block moves, the gate exits non-zero instead of silently checking nothing.
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+WEB_UI_RE = re.compile(r'^WEB_UI = r"""(.*?)"""', re.S | re.M)
+SCRIPT_RE = re.compile(r"<script>(.*?)</script>", re.S)
+
+
+def extract_scripts(source: Path) -> list[str]:
+    src = source.read_text(encoding="utf-8")
+    match = WEB_UI_RE.search(src)
+    if not match:
+        raise ValueError(
+            "GATE FAIL: WEB_UI raw-string block not found — gate is stale, fix the extractor"
+        )
+    scripts = SCRIPT_RE.findall(match.group(1))
+    if not scripts:
+        raise ValueError("GATE FAIL: no <script> body found inside WEB_UI")
+    return scripts
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Syntax-check JavaScript embedded in server/calliope-server WEB_UI."
+    )
+    parser.add_argument(
+        "--source",
+        type=Path,
+        default=Path("server/calliope-server"),
+        help="server source file containing WEB_UI (default: server/calliope-server)",
+    )
+    parser.add_argument(
+        "--node",
+        default="node",
+        help="node executable to use for --check (default: node)",
+    )
+    parser.add_argument(
+        "--keep-temp",
+        action="store_true",
+        help="keep the extracted temporary JS file for inspection",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        scripts = extract_scripts(args.source)
+    except OSError as exc:
+        print(f"GATE FAIL: could not read {args.source}: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", suffix=".js", prefix="calliope-webui-", delete=False
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+            tmp.write("\n;\n".join(scripts))
+        print(f"extracted {len(scripts)} script block(s) -> {tmp_path}")
+        try:
+            result = subprocess.run([args.node, "--check", str(tmp_path)], check=False)
+        except FileNotFoundError:
+            print(
+                f"GATE FAIL: node executable not found: {args.node!r}",
+                file=sys.stderr,
+            )
+            return 1
+        if result.returncode != 0:
+            print("GATE FAIL: node --check failed for extracted WEB_UI JS", file=sys.stderr)
+        return result.returncode
+    finally:
+        if tmp_path and not args.keep_temp:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

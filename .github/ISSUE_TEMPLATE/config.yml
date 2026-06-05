@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Privacy-safe support checklist
+    url: https://github.com/ar221/calliope/blob/main/SECURITY.md
+    about: Read before filing. Never attach audio, bearer tokens, tokenized URLs, certs/keys, or private chat logs.
