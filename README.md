@@ -107,9 +107,9 @@ runs a 10-second self-test:
 dictation-server --setup
 ```
 
-The wizard prints the cert SHA-256 fingerprint and a QR code containing the
-URL + token + fingerprint. Save the fingerprint somewhere — you will match
-it on first phone connect.
+The wizard prints the cert SHA-256 fingerprint and stores the bearer token.
+Save the fingerprint somewhere — you will match it on first phone connect.
+Pair phones from the SillyTavern extension after it is installed.
 
 **6. Install the SillyTavern extension.** Drop `dictation-bridge/` under
 `<ST install>/data/default-user/extensions/third-party/` (or symlink from
@@ -123,10 +123,12 @@ Hard-refresh ST. A mic button appears in the send bar.
 Mod+Shift+M  { spawn "bash" "-c" "$HOME/.local/bin/dictate toggle"; }
 ```
 
-**8. First phone connection.** Scan the QR code from the wizard with your
-phone camera. Visit the resulting URL, trust the cert (one-time per
-browser profile, see [`docs/cert-trust.md`](docs/cert-trust.md)), bookmark
-it, install as PWA. Test recording.
+**8. First phone connection.** In ST, open Extensions → Dictation Bridge and
+use **Re-pair this phone**, **Show local QR**, or **Copy pairing URL**. The QR
+is rendered locally in the ST browser and contains the bearer-token pairing
+URL, so treat it like a password. Visit the URL, trust the cert (one-time per
+browser profile, see [`docs/cert-trust.md`](docs/cert-trust.md)), bookmark it,
+install as PWA, then test recording.
 
 ## Architecture
 

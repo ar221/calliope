@@ -20,6 +20,7 @@
 import { eventSource, event_types, name1, this_chid, characters, user_avatar, chat } from '../../../../script.js';
 import { extension_settings, getContext } from '../../../extensions.js';
 import { selected_group, groups } from '../../../group-chats.js';
+import { qrcodegen } from './qrcodegen.min.js';
 
 const MODULE = 'dictation-bridge';
 const LOG = (...a) => console.log('[dictation-bridge]', ...a);
@@ -1574,6 +1575,75 @@ function openPairedPhoneUrl() {
     window.open(url, 'calliope_pair_phone', 'width=500,height=900,menubar=no,toolbar=no,location=yes,status=no,scrollbars=yes,resizable=yes');
 }
 
+function drawQrToCanvas(text, canvas) {
+    const QrCode = qrcodegen?.QrCode;
+    if (!QrCode) throw new Error('QR library unavailable');
+    const qr = QrCode.encodeText(text, QrCode.Ecc.MEDIUM);
+    const border = 4;
+    const targetPx = 220;
+    const scale = Math.max(2, Math.floor(targetPx / (qr.size + border * 2)));
+    const width = (qr.size + border * 2) * scale;
+    canvas.width = width;
+    canvas.height = width;
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${width}px`;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('Canvas 2D unavailable');
+    ctx.fillStyle = '#fffaf0';
+    ctx.fillRect(0, 0, width, width);
+    ctx.fillStyle = '#1C150C';
+    for (let y = 0; y < qr.size; y++) {
+        for (let x = 0; x < qr.size; x++) {
+            if (qr.getModule(x, y)) {
+                ctx.fillRect((x + border) * scale, (y + border) * scale, scale, scale);
+            }
+        }
+    }
+}
+
+function clearPairQrPanel(host = document) {
+    const canvas = host.querySelector?.('#dictation_bridge_pair_qr_canvas');
+    if (canvas) {
+        try {
+            const ctx = canvas.getContext('2d');
+            if (ctx) ctx.clearRect(0, 0, canvas.width || 0, canvas.height || 0);
+        } catch {}
+        canvas.width = 0;
+        canvas.height = 0;
+    }
+    const urlNode = host.querySelector?.('#dictation_bridge_pair_qr_url');
+    if (urlNode) urlNode.remove();
+}
+
+function hidePairQrPanel(host = document) {
+    clearPairQrPanel(host);
+    const panel = host.querySelector?.('#dictation_bridge_pair_qr_panel');
+    if (panel) panel.style.display = 'none';
+}
+
+async function showPairQrPanel(host = document) {
+    const panel = host.querySelector?.('#dictation_bridge_pair_qr_panel');
+    const canvas = host.querySelector?.('#dictation_bridge_pair_qr_canvas');
+    if (!panel || !canvas) return;
+    hidePairQrPanel(host);
+    const url = buildPairedPhoneUrl({ embed: false });
+    const urlNode = document.createElement('span');
+    urlNode.id = 'dictation_bridge_pair_qr_url';
+    urlNode.hidden = true;
+    urlNode.textContent = url;
+    try {
+        drawQrToCanvas(url, canvas);
+        panel.appendChild(urlNode);
+        panel.style.display = 'block';
+    } catch (e) {
+        urlNode.remove();
+        clearPairQrPanel(host);
+        WARN('local QR render failed; falling back to copy URL', e?.message || e);
+        toast('warning', 'QR render failed; copying pairing URL instead.');
+        await copyPairedPhoneUrl();
+    }
+}
+
 /** Ping the server's /health to give an early failure before opening UI. */
 async function probeServer() {
     const cfg = settings();
@@ -2884,8 +2954,18 @@ function buildSettingsPanel() {
                     <small class="notes" style="margin-top:0">Found in <code>~/.local/share/dictation-server/token</code> on the dictation server.</small>
                     <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:4px 0 8px 0">
                         <button id="dictation_bridge_pair_open" type="button" class="menu_button" title="Open a fresh paired phone page for this active ST chat" style="padding:3px 10px;font-size:12px;border:1px solid rgba(255,182,72,0.55);background:rgba(255,182,72,0.08);color:#FFB648;border-radius:2px;cursor:pointer">Re-pair this phone</button>
-                        <button id="dictation_bridge_pair_copy" type="button" class="menu_button" title="Copy a tokenized pairing URL; use it as a QR source if pairing another device" style="padding:3px 10px;font-size:12px;border:1px solid rgba(201,178,139,0.45);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Copy pairing URL</button>
-                        <small class="notes" style="margin:0 0 0 4px">URL contains bearer token; avoid screenshots/logs.</small>
+                        <button id="dictation_bridge_pair_copy" type="button" class="menu_button" title="Copy a tokenized pairing URL; use it as a fallback if QR pairing fails" style="padding:3px 10px;font-size:12px;border:1px solid rgba(201,178,139,0.45);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Copy pairing URL</button>
+                        <button id="dictation_bridge_pair_qr_show" type="button" class="menu_button" title="Render a local QR code in this browser; no server round-trip or third-party service" style="padding:3px 10px;font-size:12px;border:1px solid rgba(168,201,123,0.55);background:rgba(168,201,123,0.08);color:#A8C97B;border-radius:2px;cursor:pointer">Show local QR</button>
+                        <small class="notes" style="margin:0 0 0 4px">URL/QR contains bearer token; avoid screenshots/logs.</small>
+                    </div>
+                    <div id="dictation_bridge_pair_qr_panel" style="display:none;margin:0 0 8px 0;padding:8px;border:1px solid rgba(168,201,123,0.35);background:rgba(0,0,0,0.20);border-radius:3px;max-width:max-content">
+                        <canvas id="dictation_bridge_pair_qr_canvas" aria-label="Tokenized Calliope pairing QR code" style="display:block;background:#fffaf0;border:6px solid #fffaf0;border-radius:2px"></canvas>
+                        <div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                            <button id="dictation_bridge_pair_qr_open" type="button" class="menu_button" style="padding:3px 10px;font-size:12px;border:1px solid rgba(255,182,72,0.55);background:rgba(255,182,72,0.08);color:#FFB648;border-radius:2px;cursor:pointer">Open</button>
+                            <button id="dictation_bridge_pair_qr_copy" type="button" class="menu_button" style="padding:3px 10px;font-size:12px;border:1px solid rgba(201,178,139,0.45);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Copy URL</button>
+                            <button id="dictation_bridge_pair_qr_hide" type="button" class="menu_button" style="padding:3px 10px;font-size:12px;border:1px solid rgba(201,178,139,0.30);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Hide + clear</button>
+                        </div>
+                        <small class="notes" style="display:block;margin-top:6px;color:#FFB648">This QR encodes the bearer-token pairing URL. Treat it like a password; hide clears the canvas and removes the URL node.</small>
                     </div>
 
                     <label for="dictation_bridge_open_style">Open style</label>
@@ -2999,6 +3079,10 @@ function buildSettingsPanel() {
     const tokenEl = host.querySelector('#dictation_bridge_token');
     const pairOpenEl = host.querySelector('#dictation_bridge_pair_open');
     const pairCopyEl = host.querySelector('#dictation_bridge_pair_copy');
+    const pairQrShowEl = host.querySelector('#dictation_bridge_pair_qr_show');
+    const pairQrOpenEl = host.querySelector('#dictation_bridge_pair_qr_open');
+    const pairQrCopyEl = host.querySelector('#dictation_bridge_pair_qr_copy');
+    const pairQrHideEl = host.querySelector('#dictation_bridge_pair_qr_hide');
     const openEl = host.querySelector('#dictation_bridge_open_style');
     const appendEl = host.querySelector('#dictation_bridge_append_mode');
     const autoEl = host.querySelector('#dictation_bridge_autosend');
@@ -3042,6 +3126,7 @@ function buildSettingsPanel() {
         s.serverUrl = urlEl.value.trim() || DEFAULTS.serverUrl;
         serverAuthStatus = { health: 'unknown', token: 'unknown', lastCheckedAt: 0, lastError: '' };
         saveSettings();
+        hidePairQrPanel(host);
         probeServer().then((ok) => { if (ok) return probeServerAuth(); }).catch(() => {});
         // URL changed — if SSE is on, reconnect to the new host.
         if (s.sseEnabled) connectSSE();
@@ -3050,12 +3135,17 @@ function buildSettingsPanel() {
         s.serverToken = tokenEl.value.trim();
         serverAuthStatus.token = 'unknown';
         saveSettings();
+        hidePairQrPanel(host);
         probeServerAuth().catch(() => {});
         // Token changed — bounce SSE so the new query-string token takes effect.
         if (s.sseEnabled) connectSSE();
     });
     if (pairOpenEl) pairOpenEl.addEventListener('click', openPairedPhoneUrl);
     if (pairCopyEl) pairCopyEl.addEventListener('click', () => copyPairedPhoneUrl().catch(() => {}));
+    if (pairQrShowEl) pairQrShowEl.addEventListener('click', () => showPairQrPanel(host).catch(() => {}));
+    if (pairQrOpenEl) pairQrOpenEl.addEventListener('click', openPairedPhoneUrl);
+    if (pairQrCopyEl) pairQrCopyEl.addEventListener('click', () => copyPairedPhoneUrl().catch(() => {}));
+    if (pairQrHideEl) pairQrHideEl.addEventListener('click', () => hidePairQrPanel(host));
     openEl.addEventListener('change', () => { s.openStyle = openEl.value; saveSettings(); });
     appendEl.addEventListener('change', () => { s.appendMode = appendEl.value; saveSettings(); });
     autoEl.addEventListener('change', () => { s.autoSend = !!autoEl.checked; saveSettings(); });

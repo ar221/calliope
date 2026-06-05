@@ -3,12 +3,53 @@
 The Calliope dictation server (`dictation-server`) is licensed under the MIT
 License — see [LICENSE](LICENSE). Copyright (c) 2024-2026 Ayaz Rashid.
 
-This document lists third-party software the dictation server depends on,
-either at runtime (shelled out, statically linked, or fetched), or through
-optional integrations. Each entry names the component, license, role, and
-upstream URL. The dictation server bundles none of these — they are user-
-installed system tools or downloaded artifacts. Attribution is provided per
-the redistribution requirements of the relevant licenses.
+This document lists third-party software Calliope depends on, either at
+runtime (shelled out, statically linked, or fetched), through optional
+integrations, or as browser-side code bundled with the SillyTavern extension.
+Each entry names the component, license, role, and upstream URL. Except for
+the vendored browser QR renderer listed below, these are user-installed system
+tools or downloaded artifacts. Attribution is provided per the redistribution
+requirements of the relevant licenses.
+
+---
+
+## Bundled browser code
+
+### Nayuki QR Code generator library
+
+- **License:** MIT
+- **URL:** https://github.com/nayuki/QR-Code-generator
+- **Vendored source:** `extension/qrcodegen.min.js`, generated from
+  `typescript-javascript/qrcodegen.ts` at upstream commit
+  `2c9044de6b049ca25cb3cd1649ed7e27aa055138`.
+- **Role:** Client-side pairing QR renderer in the SillyTavern settings panel.
+  The tokenized pairing URL is rendered locally into a Canvas; there is no
+  server endpoint, CDN fetch, or third-party QR service involved.
+
+MIT License text from upstream:
+
+```text
+Copyright © 2025 Project Nayuki. (MIT License)
+https://www.nayuki.io/page/qr-code-generator-library
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
 
 ---
 
@@ -114,8 +155,11 @@ the redistribution requirements of the relevant licenses.
 
 ## Notes on bundling
 
-- Nothing in this list is bundled into the dictation-server source. All
-  dependencies are user-installed system packages or fetched artifacts.
+- Calliope now bundles exactly one browser dependency: Nayuki's MIT QR Code
+  generator in `extension/qrcodegen.min.js`, used only for local settings-panel
+  QR rendering.
+- Other dependencies in this list are user-installed system packages or fetched
+  artifacts, not bundled into the dictation-server source.
 - Static-linking only happens transitively inside `whisper-cli` /
   `whisper-server` (ggml). Both upstream projects are MIT, so the
   redistribution chain stays clean.

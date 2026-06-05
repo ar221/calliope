@@ -171,9 +171,10 @@ cat ~/.local/share/dictation-server/cert.fingerprint
 journalctl --user -u dictation-server | grep -i fingerprint | tail -1
 ```
 
-The wizard QR code (Phase 4 `dictation-server --setup`) embeds the
-fingerprint alongside the URL + token. The phone PWA pins the fingerprint
-on first connect and warns if it changes.
+For phone pairing, use the SillyTavern extension's **Show local QR** or
+**Copy pairing URL** controls. The QR is rendered locally in the browser and
+contains the bearer-token pairing URL, so treat it like a password and avoid
+screenshots/logs.
 
 ## When the cert rotates
 
@@ -183,8 +184,8 @@ threshold (`CERT_RENEW_THRESHOLD_DAYS`, currently 14). After rotation:
 1. The fingerprint changes. The startup log shows the new value.
 2. Devices that trusted the *old* cert will see a fresh "your connection
    is not private" warning. Re-import the new cert, or click through.
-3. The phone PWA detects the change and prompts you to confirm the new
-   fingerprint before reconnecting (Phase 4 wizard pairing flow).
+3. Re-verify the new fingerprint before trusting the rotated cert on each
+   phone/browser profile.
 
 If you want to avoid the rotation churn entirely, use Tailscale (cert is
 managed by Tailscale + Let's Encrypt — see

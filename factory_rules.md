@@ -41,6 +41,7 @@ Use the nearest relevant checks:
 
 ```bash
 node --check extension/index.js
+node --check extension/qrcodegen.min.js
 scripts/check-web-ui-js
 python -m py_compile server/calliope-server scripts/learn-vocab scripts/kokoro-server.py
 pytest -q

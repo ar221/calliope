@@ -93,7 +93,10 @@ under `<ST install>/data/default-user/extensions/third-party/`. Three files:
 - `index.js` — mic button injected into `#send_form`, popup or iframe
   to phone UI, SSE subscriber via `EventSource('/events')`, undo stack
   (cap 8), state-machine bar wiring, voice-edit overlay, privacy peek,
-  and ST-state broadcasts on chat/lifecycle/mic-open events.
+  local pairing QR Canvas render, and ST-state broadcasts on
+  chat/lifecycle/mic-open events.
+- `qrcodegen.min.js` — vendored Nayuki MIT browser QR library used only in
+  the settings panel for local pairing QR generation.
 - `style.css` — Apollo-matched theming for the bar and overlay.
 
 Reads the bearer token from ST settings; sends on every fetch and as

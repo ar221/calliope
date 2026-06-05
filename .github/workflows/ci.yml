@@ -19,7 +19,9 @@ jobs:
         with:
           node-version: '22'
       - name: Check extension JS syntax
-        run: node --check extension/index.js
+        run: |
+          node --check extension/index.js
+          node --check extension/qrcodegen.min.js
       - name: Check embedded phone UI JS syntax
         run: scripts/check-web-ui-js
       - uses: astral-sh/setup-uv@v3

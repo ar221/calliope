@@ -25,8 +25,8 @@ Status date: 2026-05-18.
 
 1. **Pairing clarity**
    - Done: distinguish server health, token validity, SSE status, and ST-follow freshness.
-   - Done: ST settings panel can open a fresh paired phone page or copy a tokenized pairing URL for QR handoff.
-   - Next: optional fully local QR renderer in the settings panel, without sending the token to a third-party QR service.
+   - Done: ST settings panel can open a fresh paired phone page or copy a tokenized pairing URL.
+   - Done: local settings-panel QR renderer uses vendored Nayuki MIT browser JS and Canvas; no server round-trip or third-party QR service.
 
 2. **Group-chat QA**
    - Live-test addressee picker in actual ST group chats.
