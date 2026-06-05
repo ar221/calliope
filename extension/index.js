@@ -33,18 +33,11 @@ function defaultServerUrl() {
     return `https://${safeHost}:8384`;
 }
 
-const LEGACY_DEFAULT_SERVER_URLS = new Set([
-    'https://192.168.50.110:8384',
-    'https://192.168.50.113:8384',
-]);
-
 function isLocalHost(host) {
     return host === '127.0.0.1' || host === 'localhost' || host === '::1';
 }
 
 function shouldMigrateServerUrl(serverUrl) {
-    if (LEGACY_DEFAULT_SERVER_URLS.has(serverUrl)) return true;
-
     // If the user opens ST through Wi-Fi/Tailscale but the saved dictation URL
     // is pinned to a different LAN interface, the browser probe fails even
     // though both services are alive. Follow the current ST host instead.

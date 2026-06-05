@@ -255,5 +255,7 @@ extracts a per-request stage breakdown.
   the server. Still useful for offline-only workflows.
 - Footswitch daemon (WOW-7, not yet shipped) — would be another
   push-to-talk client targeting `/transcribe`.
-- AUR / pipx packaging (MVP-25, in progress) — distribution-only, no
-  runtime architecture impact.
+- AUR / pipx packaging (MVP-25) — distribution-only, no runtime architecture
+  impact. Both package paths preserve `server/calliope-server` as the
+  canonical single-file source; package wrappers/adapters point at that
+  artifact instead of splitting the embedded PWA into a separate browser file.

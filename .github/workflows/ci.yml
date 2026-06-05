@@ -18,12 +18,26 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Check extension JS syntax
         run: |
           node --check extension/index.js
           node --check extension/qrcodegen.min.js
       - name: Check embedded phone UI JS syntax
         run: scripts/check-web-ui-js
+      - name: Check Python syntax
+        run: python -m py_compile server/calliope-server scripts/learn-vocab scripts/kokoro-server.py
+      - name: Check packaging shell syntax
+        run: bash -n packaging/PKGBUILD packaging/PKGBUILD-stable
+      - name: Verify systemd user units
+        run: |
+          HOME=/home/runner systemd-analyze --user verify \
+            systemd/dictation-server.service \
+            systemd/whisper-server.service \
+            systemd/kokoro-server.service \
+            systemd/learn-vocab-nightly.service
       - uses: astral-sh/setup-uv@v3
       - name: Install ruff
         run: uv tool install ruff
@@ -40,7 +54,7 @@ jobs:
       - name: Install test dependencies
         run: pip install pyyaml pytest wordfreq
       - name: Run unit tests
-        run: pytest tests/ -v
+        run: pytest -q
 
   test-integration:
     runs-on: ubuntu-latest

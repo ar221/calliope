@@ -8,6 +8,25 @@ node_modules/
 # Local runtime/cache
 .cache/
 *.log
+*.tmp
+
+# Secrets and local runtime artifacts
+*.pem
+*.key
+token
+*.token
+.env
+.env.*
+
+# Models, generated audio, and bulky local fixtures
+models/
+*.gguf
+ggml-*.bin
+*.wav
+*.webm
+*.mp3
+*.flac
+*.ogg
 
 # Agent scratch/reports
 .agents/

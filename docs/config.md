@@ -44,6 +44,11 @@ Current server flags:
 - `DICTATION_RULES_DIR` — rules/formatting source directory.
 - `DICTATION_CHARACTERS_DIR` — character-card source directory.
 
+The checked-in service/source defaults point at Ayaz's local SillyTavern data
+root for the operator deployment. Public installs should override these with
+site-local paths such as `<ST-root>/data/default-user/...`; do not paste private
+chat paths or chat contents into issues.
+
 ### Whisper
 
 - `WHISPER_BIN` — fallback CLI binary.

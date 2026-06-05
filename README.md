@@ -96,8 +96,8 @@ single-file server onto your PATH:
 install -m 755 server/calliope-server ~/.local/bin/dictation-server
 ```
 
-(AUR `calliope-git` and `pipx install calliope` are tracked in
-[the roadmap](docs/roadmap.md).)
+(AUR `calliope-git` and pipx packaging via `calliope-dictation` are tracked in
+[the roadmap](docs/roadmap.md); neither channel is published yet.)
 
 **5. Run the wizard.** It probes audio, picks a model size from your VRAM,
 generates a self-signed cert + bearer token, installs the systemd unit, and
@@ -205,11 +205,12 @@ claude-code-proxy, Monaspace, Literata, system tools).
 ## Support
 
 - **Bugs:** file an issue in the repository when it is public. Until then, report locally to the maintainer/operator.
-- **Security:** see [`SECURITY.md`](SECURITY.md); never attach audio or tokenized URLs.
+- **Security:** see [`SECURITY.md`](SECURITY.md); never attach audio, bearer tokens, tokenized URLs, certs/keys, or private chat logs.
 - **Discussion:** use the project discussion space once published.
 
-When filing an issue: do not attach audio. The issue template defaults the
-"audio attached?" checkbox to NO and reminds you on submit.
+When filing an issue, use the templates under `.github/ISSUE_TEMPLATE/`; they
+require confirmation that no audio, tokenized URL, cert/key, or private chat
+text is attached.
 
 ## Status
 

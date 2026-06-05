@@ -227,10 +227,11 @@ audit performed on the 5,900-line `dictation-server` source plus the
 `dictation-bridge` ST extension. Every PASS / FAIL claim is grounded in a
 specific source line or `grep` query, not hand-waved.
 
-Phase 1 + 2 + 3 of the Calliope roadmap are shipped as of the date above —
+Phase 1–5 of the 2026-06 completion queue are represented in this tree:
 bearer-token auth, loopback default, CORS allowlist, sandboxed systemd
-unit, monkey-patched outbound audit log, in-RAM transcripts, ephemeral
-audio temp files, persistent `whisper-server` (MVP-8), streaming SSE
-partials (MVP-13), and the privacy badge + audit modal in the phone UI
-(MVP-23) are all live. Phase 4 (release-readiness, wizard, packaging) is
-in progress.
+unit templates, monkey-patched outbound audit log, in-RAM transcripts,
+ephemeral audio temp files, persistent `whisper-server` (MVP-8), formatter
+SSE text deltas (MVP-13), privacy badge + audit modal (MVP-23), local
+pairing QR rendering, safe token rotation CLI, group-chat synthetic QA,
+streaming-partial TTS deferral, packaging hygiene, and privacy-preserving
+issue templates. Packaging channels are prepared but not published.

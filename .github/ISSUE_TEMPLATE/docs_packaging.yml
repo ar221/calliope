@@ -1,0 +1,40 @@
+name: Docs or packaging issue
+about: Report public docs, install, AUR, pipx, systemd, or packaging problems.
+title: "[Docs/Packaging]: "
+labels: [docs, packaging]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Privacy rule
+        Do **not** attach audio files, bearer tokens, tokenized URLs containing `?token=`, certs, keys, cookies, private chat logs, or screenshots that reveal local secrets. Use placeholders: `<ST-root>`, `<host>`, `<token>`, `<cert-path>`.
+  - type: textarea
+    id: issue
+    attributes:
+      label: What needs fixing?
+      description: Link the doc/package path and describe the mismatch.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment, if relevant
+      description: Use generic paths and placeholders; do not paste private absolute paths unless they are already public examples.
+      placeholder: |
+        OS/package manager:
+        Install method:
+        Relevant command:
+  - type: textarea
+    id: proposed
+    attributes:
+      label: Proposed correction
+      description: Optional. Keep examples generic and token-free.
+  - type: checkboxes
+    id: privacy-confirmation
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I did not attach audio files.
+          required: true
+        - label: I removed bearer tokens, tokenized URLs, certs/keys, cookies, and private chat text.
+          required: true

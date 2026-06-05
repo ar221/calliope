@@ -1,0 +1,56 @@
+name: Bug report
+about: Report a Calliope bug without sharing private audio, chats, or tokens.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Privacy rule
+        Do **not** attach audio files, transcripts from private chats, bearer tokens, tokenized URLs containing `?token=`, cookies, certs, keys, or screenshots that show secrets. Redact hostnames/IPs if they identify a private machine.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the symptom. Use placeholders like `<host>`, `<token>`, and `<ST-root>`.
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Affected surface
+      options:
+        - Phone/PWA
+        - SillyTavern extension
+        - Calliope server
+        - Whisper/Kokoro service
+        - Packaging/install
+        - Docs
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Keep steps synthetic. Do not paste private chat text or tokenized pairing URLs.
+      placeholder: |
+        1. Start from ...
+        2. Click ...
+        3. Expected ... / actual ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs or command output
+      description: Paste only minimal redacted output. Replace bearer values and `?token=...` with `<redacted>`.
+      render: shell
+  - type: checkboxes
+    id: privacy-confirmation
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I did not attach audio files.
+          required: true
+        - label: I removed bearer tokens, tokenized URLs, certs/keys, cookies, and private chat text.
+          required: true

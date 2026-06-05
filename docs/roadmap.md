@@ -47,13 +47,14 @@ Status date: 2026-06-05.
    - Live sequence: stop service, rotate, update ST bridge token setting, restart, hard-refresh ST, re-pair phone.
 
 5. **Packaging**
-   - Prepare AUR `calliope-git` once repo paths/docs are public-safe.
-   - Prepare pipx/install script if the single-file server remains the distribution model.
+   - Done: AUR `calliope-git` packaging now follows the repo layout, installs the single-file server through package wrappers, includes the adjacent voice catalog, and keeps runtime state/certs/tokens/models out of the package.
+   - Done: pipx packaging remains a thin adapter around the single-file server source; Hatch copies `server/calliope-server` into the wheel as the `calliope-server` entry point without lifting out the embedded PWA.
+   - Pending: publish/tag/release steps remain blocked until Ayaz explicitly cuts a release.
 
 6. **Docs/publication hygiene**
-   - Keep public docs free of user-specific absolute paths.
-   - Keep `docs/config.md`, `docs/architecture.md`, and systemd unit examples synchronized with live defaults.
-   - Add issue templates that explicitly forbid attaching audio or tokenized URLs.
+   - Done: public-path scan completed; generic runtime paths stay as examples and Ayaz-local SillyTavern paths remain documented as local operational defaults.
+   - Done: CI mirrors local gates: pytest, ruff, Python syntax, extension JS syntax, embedded phone UI JS syntax, packaging shell syntax, and systemd unit verification.
+   - Done: `.github/ISSUE_TEMPLATE/` issue forms explicitly forbid audio attachments, tokenized URLs, bearer tokens, certs/keys, cookies, and private chat logs.
 
 ## Known intentional defaults
 
