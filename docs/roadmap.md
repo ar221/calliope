@@ -29,9 +29,13 @@ Status date: 2026-05-18.
    - Done: local settings-panel QR renderer uses vendored Nayuki MIT browser JS and Canvas; no server round-trip or third-party QR service.
 
 2. **Group-chat QA**
-   - Live-test addressee picker in actual ST group chats.
-   - Confirm last-speaker default and remembered addressee/mode behavior.
-   - Add a small regression fixture if ST state payloads can be mocked.
+   - Partial: synthetic server pytest now covers avatar filename → character-name
+     resolution, missing-avatar stem fallback, latest non-user/non-system last
+     speaker, `*all` addressee round-trip, and group scene-contract identity.
+   - Pending: run the live ST group smoke in
+     [`docs/troubleshooting.md`](troubleshooting.md#11-manual-smoke-group-chat-addressee-qa)
+     without copying private chat text, cards, avatars, tokens, or tokenized URLs.
+   - Pending: confirm remembered addressee/mode behavior in the same live smoke.
 
 3. **TTS completion**
    - Decide whether streaming partial TTS is core or deferred.

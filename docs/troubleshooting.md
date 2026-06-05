@@ -1,6 +1,6 @@
 # Troubleshooting
 
-The top 10 failure modes Calliope users hit, with concrete fixes. If
+Common failure modes Calliope users hit, with concrete fixes. If
 yours isn't here, report it locally until the repository is published — and read the relevant sub-doc:
 [`architecture.md`](architecture.md), [`cert-trust.md`](cert-trust.md),
 [`tailscale.md`](tailscale.md), [`desktop-hotkey.md`](desktop-hotkey.md).
@@ -404,3 +404,33 @@ If you still see >30s hangs:
 4. Inspect `journalctl --user -u dictation-server -f` during the hang —
    ROCm errors or Python tracebacks usually appear before the timeout
    fires.
+
+---
+
+## 11. Manual smoke: group-chat addressee QA
+
+Use this only after synthetic pytest coverage is green. Do **not** read,
+copy, export, or paste private chat text, character cards, avatars, tokens, or
+pairing URLs while smoking a live ST group.
+
+Checklist:
+
+1. Hard-refresh SillyTavern only if you are validating newly synced bridge
+   files; do not restart `dictation-server`, `whisper-server`, `kokoro-server`,
+   or SillyTavern services for this smoke.
+2. Open an active SillyTavern group chat and open Extensions → Dictation Bridge.
+3. Confirm the addressee/member chips show the expected group members.
+4. Confirm the latest non-user/non-system speaker is marked as the last-speaker
+   chip/default.
+5. Select one member, then select **All members**. The all-members addressee
+   should persist as `*all` rather than disappearing or becoming a solo
+   character.
+6. Verify the server-side `/state`/active-context payload using a safe debug
+   surface or logs: check only structural keys such as `chatType=group`,
+   `groupId`, `groupMembers`, `lastSpeaker`, and `characterName=*all`.
+   Do not print `lastAiMessage`, `mes`, transcript text, bearer tokens, or
+   tokenized URLs.
+7. Dictate a short synthetic throwaway phrase if needed, then verify the prompt
+   context still names the group and member list instead of collapsing to a
+   single solo character. Do not paste the actual private prompt or chat text
+   into issues or receipts.

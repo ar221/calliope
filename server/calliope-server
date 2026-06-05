@@ -869,9 +869,14 @@ class ChatReader:
             # Skip metadata line
             if "chat_metadata" in data:
                 continue
+            extra = data.get("extra") if isinstance(data.get("extra"), dict) else {}
             messages.append({
                 "name": data.get("name", "Unknown"),
                 "is_user": bool(data.get("is_user", False)),
+                "is_system": (
+                    bool(data.get("is_system", False))
+                    or str(extra.get("type", "")).lower() == "system"
+                ),
                 "text": data.get("mes", ""),
                 "send_date": data.get("send_date", ""),
             })
@@ -880,13 +885,38 @@ class ChatReader:
         return messages[-last_n:]
 
     @staticmethod
+    def _group_member_name_from_avatar(avatar: str) -> str:
+        """Resolve an ST group member avatar filename to display name.
+
+        Group defs store member avatar filenames. Prefer the character card's
+        declared name when the matching synthetic/real card exists; if the
+        avatar/card was deleted, fall back to the filename stem instead of
+        dropping the member or crashing.
+        """
+        stem = Path(str(avatar or "")).stem
+        if not stem:
+            return ""
+        try:
+            card = load_character_card(stem)
+        except Exception:  # pragma: no cover — defensive fallback only
+            card = {}
+        if isinstance(card, dict):
+            name = str(card.get("name") or "").strip()
+            if name:
+                return name
+        return stem
+
+    @staticmethod
     def get_group_members(group_name: str) -> list[str]:
-        """Return member names for a group chat."""
+        """Return member display names for a group chat."""
         for group in ChatReader._load_group_defs():
             if group.get("name", "") == group_name:
-                members = group.get("members", [])
-                # Members are stored as "CharName.png" — strip extension
-                return [m.replace(".png", "") for m in members]
+                names: list[str] = []
+                for member in group.get("members", []) or []:
+                    name = ChatReader._group_member_name_from_avatar(str(member))
+                    if name:
+                        names.append(name)
+                return names
         return []
 
     # ─── POL-6 — group-id helpers + last-speaker tracking ─────
@@ -932,8 +962,9 @@ class ChatReader:
         out: list[dict] = []
         for raw in group.get("members", []) or []:
             avatar = str(raw)
-            name = avatar[:-4] if avatar.lower().endswith(".png") else avatar
-            out.append({"name": name, "avatar": avatar})
+            name = ChatReader._group_member_name_from_avatar(avatar)
+            if name:
+                out.append({"name": name, "avatar": avatar})
         return out
 
     @staticmethod
@@ -971,10 +1002,10 @@ class ChatReader:
         )
         last_ai_name: str | None = None
         for msg in reversed(messages):
-            if msg.get("is_user"):
+            if msg.get("is_user") or msg.get("is_system"):
                 continue
             name = str(msg.get("name", "") or "").strip()
-            if name and name.lower() != "you":
+            if name and name.lower() not in {"you", "system"}:
                 last_ai_name = name
                 break
         with _group_last_speaker_lock:

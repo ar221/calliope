@@ -9,6 +9,7 @@ Covers:
 """
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import pathlib
@@ -24,9 +25,26 @@ SRC = pathlib.Path(__file__).resolve().parents[1] / "server" / "calliope-server"
 def mod():
     loader = SourceFileLoader("calliope_server", str(SRC))
     spec = importlib.util.spec_from_loader("calliope_server", loader)
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def write_synthetic_character_card(
+    chars_dir: pathlib.Path, stem: str, name: str,
+) -> None:
+    """Write a minimal synthetic PNG tEXt card; no real ST card data."""
+    payload = b"chara\x00" + base64.b64encode(
+        json.dumps({"data": {"name": name}}).encode("utf-8"),
+    )
+    chunk = (
+        len(payload).to_bytes(4, "big")
+        + b"tEXt" + payload
+        + b"\x00\x00\x00\x00"
+    )
+    (chars_dir / f"{stem}.png").write_bytes(b"\x89PNG\r\n\x1a\n" + chunk)
 
 
 @pytest.fixture
@@ -104,6 +122,32 @@ def test_group_member_objects(mod, group_fixture):
     assert avatars == ["Hana.png", "Yuri.png", "Suzy.png"]
 
 
+def test_group_members_resolve_avatar_filenames_to_character_names(mod, group_fixture):
+    """Avatar filenames map through synthetic character cards to display names."""
+    for stem, display_name in (
+        ("Hana", "Hana Mori"),
+        ("Yuri", "Yuri Vale"),
+        ("Suzy", "Suzy Park"),
+    ):
+        write_synthetic_character_card(group_fixture["chars_dir"], stem, display_name)
+
+    assert mod.ChatReader.get_group_members(group_fixture["group_name"]) == [
+        "Hana Mori", "Yuri Vale", "Suzy Park",
+    ]
+    members = mod.ChatReader.group_member_objects(group_fixture["group_id"])
+    assert [m["name"] for m in members] == ["Hana Mori", "Yuri Vale", "Suzy Park"]
+    assert [m["avatar"] for m in members] == ["Hana.png", "Yuri.png", "Suzy.png"]
+
+
+def test_group_member_missing_avatar_falls_back_to_filename_stem(mod, group_fixture):
+    """Deleted/missing character avatars stay selectable by stem instead of crashing."""
+    assert mod.ChatReader.get_group_members(group_fixture["group_name"]) == [
+        "Hana", "Yuri", "Suzy",
+    ]
+    members = mod.ChatReader.group_member_objects(group_fixture["group_id"])
+    assert [m["name"] for m in members] == ["Hana", "Yuri", "Suzy"]
+
+
 # ─── Last speaker tracking ────────────────────────────────────
 
 
@@ -133,7 +177,7 @@ def test_last_speaker_cached_by_mtime(mod, group_fixture):
     assert s2 == "Suzy"
 
 
-def test_last_speaker_none_when_no_ai_messages(mod, group_fixture, tmp_path):
+def test_last_speaker_none_when_no_ai_messages(mod, group_fixture):
     """Brand-new group chat → None (cold start)."""
     chat_file = group_fixture["group_chats_dir"] / "asylum-chat-1.jsonl"
     chat_file.write_text(
@@ -146,6 +190,33 @@ def test_last_speaker_none_when_no_ai_messages(mod, group_fixture, tmp_path):
         mod._group_last_speaker_cache.clear()
     speaker = mod.ChatReader.get_group_last_speaker(group_fixture["group_id"])
     assert speaker is None
+
+
+def test_last_speaker_skips_later_user_and_system_messages(mod, group_fixture):
+    """Latest non-user/non-system message wins even when newer noise exists."""
+    chat_file = group_fixture["group_chats_dir"] / "asylum-chat-1.jsonl"
+    chat_file.write_text(
+        "\n".join([
+            json.dumps({"chat_metadata": {}}),
+            json.dumps({
+                "name": "Yuri", "is_user": False,
+                "mes": "synthetic character line",
+            }),
+            json.dumps({
+                "name": "You", "is_user": True,
+                "mes": "synthetic user line",
+            }),
+            json.dumps({
+                "name": "System", "is_user": False, "is_system": True,
+                "mes": "synthetic system note",
+            }),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    with mod._group_last_speaker_lock:
+        mod._group_last_speaker_cache.clear()
+
+    assert mod.ChatReader.get_group_last_speaker(group_fixture["group_id"]) == "Yuri"
 
 
 # ─── load_character_card group-id error envelope ──────────────
@@ -213,4 +284,58 @@ def test_snapshot_state_group_includes_payload(mod, group_fixture):
     assert [m["name"] for m in members] == group_fixture["members"]
     assert snap["lastSpeaker"] == "Hana"
     # Reset.
-    mod.update_state({"chatType": "", "characterId": "", "chatId": ""})
+    mod.update_state({
+        "chatType": "", "characterId": "", "characterName": "", "chatId": "",
+    })
+
+
+def test_all_members_addressee_round_trips(mod, group_fixture):
+    """`*all` is a joint-context addressee, not an empty/solo-character fallback."""
+    gid = group_fixture["group_id"]
+    mod.update_state({
+        "chatId": "asylum-chat-1",
+        "chatType": "group",
+        "characterId": gid,
+        "characterName": "*all",
+        "personaId": "synthetic-persona",
+    })
+    snap = mod.snapshot_state()
+    contract = mod.build_scene_contract(snap)
+
+    assert snap["chatType"] == "group"
+    assert snap["characterName"] == "*all"
+    assert contract["chat_type"] == "group"
+    assert contract["addressee"] == "*all"
+    assert "group: *all" in contract["facts"]
+    assert "group: *all" in contract["prompt"]
+    mod.update_state({
+        "chatType": "", "characterId": "", "characterName": "", "chatId": "",
+    })
+
+
+def test_scene_contract_preserves_group_identity_not_solo_character(mod, group_fixture):
+    contract = mod.build_scene_contract({
+        "chatType": "group",
+        "characterId": group_fixture["group_id"],
+        "characterName": group_fixture["group_name"],
+        "personaId": "synthetic-persona",
+        "groupMembers": [
+            {"name": "Hana", "avatar": "Hana.png"},
+            {"name": "Yuri", "avatar": "Yuri.png"},
+            {"name": "Suzy", "avatar": "Suzy.png"},
+        ],
+        "lastSpeaker": "Yuri",
+    })
+
+    assert contract["chat_type"] == "group"
+    assert contract["character_id"] == group_fixture["group_id"]
+    assert contract["addressee"] == group_fixture["group_name"]
+    assert "group: Asylum Crew" in contract["facts"]
+    assert "group_members: Hana, Yuri, Suzy" in contract["facts"]
+    expected_rule = (
+        "In group chat, do not assume the last speaker is the addressee "
+        "unless dictated."
+    )
+    assert expected_rule in contract["rules"]
+    assert "chat_type: solo" not in contract["prompt"]
+    assert "addressee: Hana" not in contract["prompt"]

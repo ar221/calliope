@@ -85,7 +85,7 @@ fails (cert rejection or server down).
 - **Mixed content** — the server is HTTPS, so ST at `http://` would
   normally be fine. If ST is behind HTTPS with strict CSP, the iframe
   may be blocked; the popup window bypasses page-level CSP.
-- **Grouped chats** — current builds send group id, members, and last speaker; use the addressee picker when you need a specific group member voice. Edge cases should be treated as group-QA bugs, not a missing core feature.
+- **Grouped chats** — current builds send group id, members, and last speaker; use the addressee picker when you need a specific group member voice. Server-side synthetic regression tests cover the group payload shape; use the manual smoke checklist in `../docs/troubleshooting.md` for live ST validation without exposing private chat text.
 - **Third-party loading** — if ST's extension loader doesn't find the
   `third-party/` subdirectory convention, move the folder one level up
   into `extensions/` and reload.
