@@ -127,7 +127,7 @@ function serverOrigin() {
     try {
         return new URL(settings().serverUrl).origin;
     } catch {
-        return '*';
+        return null;
     }
 }
 
@@ -1813,18 +1813,30 @@ function openPopup(url) {
 function openIframe(url) {
     const modal = document.createElement('div');
     modal.className = 'dictation-bridge-modal';
-    modal.innerHTML = `
-        <div class="dictation-bridge-backdrop"></div>
-        <div class="dictation-bridge-frame-wrap">
-            <div class="dictation-bridge-close" title="Close">&times;</div>
-            <iframe class="dictation-bridge-iframe" src="${url}" allow="microphone; clipboard-write"></iframe>
-        </div>
-    `;
-    modal.querySelector('.dictation-bridge-backdrop').addEventListener('click', closeActive);
-    modal.querySelector('.dictation-bridge-close').addEventListener('click', closeActive);
+
+    const backdrop = document.createElement('div');
+    backdrop.className = 'dictation-bridge-backdrop';
+
+    const wrap = document.createElement('div');
+    wrap.className = 'dictation-bridge-frame-wrap';
+
+    const close = document.createElement('div');
+    close.className = 'dictation-bridge-close';
+    close.title = 'Close';
+    close.textContent = '×';
+
+    const iframe = document.createElement('iframe');
+    iframe.className = 'dictation-bridge-iframe';
+    iframe.src = url;
+    iframe.allow = 'microphone; clipboard-write';
+
+    wrap.append(close, iframe);
+    modal.append(backdrop, wrap);
+    backdrop.addEventListener('click', closeActive);
+    close.addEventListener('click', closeActive);
     document.body.appendChild(modal);
     activeModal = modal;
-    activeTarget = modal.querySelector('.dictation-bridge-iframe').contentWindow;
+    activeTarget = iframe.contentWindow;
     activeIsIframe = true;
 }
 
@@ -1851,8 +1863,13 @@ function pushContextIfEnabled() {
 
 function postToServer(payload) {
     if (!activeTarget) return;
+    const origin = serverOrigin();
+    if (!origin) {
+        WARN('postToServer skipped: invalid serverUrl');
+        return;
+    }
     try {
-        activeTarget.postMessage(payload, serverOrigin());
+        activeTarget.postMessage(payload, origin);
     } catch (e) {
         WARN('postToServer failed', e?.message || e);
     }
@@ -1885,7 +1902,7 @@ function writeToTextarea(text, { autoSend = false, appendMode = 'replace' } = {}
 function onWindowMessage(event) {
     if (!activeTarget) return;
     const origin = serverOrigin();
-    if (origin !== '*' && event.origin !== origin) return;
+    if (!origin || event.origin !== origin) return;
     const data = event?.data;
     if (!data || typeof data !== 'object') return;
     const type = typeof data.type === 'string' ? data.type : '';
