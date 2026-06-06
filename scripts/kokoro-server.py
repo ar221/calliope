@@ -191,6 +191,41 @@ def _split_for_synth(text: str, max_chars: int = 100) -> list[str]:
     return chunks
 
 
+def _synth_one(k, chunk: str, voice: str, speed: float):
+    """One model call -> mono float32 array (may be size 0). Caller holds _kokoro_lock."""
+    audio, sr = k.create(chunk, voice=voice, speed=speed, lang=LANG)
+    arr = np.asarray(audio, dtype=np.float32)
+    if arr.ndim > 1:
+        arr = np.squeeze(arr)
+    if arr.ndim > 1:
+        arr = arr.mean(axis=0)
+    return arr, sr
+
+
+def _synth_recover(k, chunk: str, voice: str, speed: float):
+    """Synthesize a chunk, recovering from the kokoro-onnx 0.5.0 phonemizer bug:
+    certain word *combinations* return zero-length audio while their sub-spans
+    synthesize fine. On empty output, re-split smaller and retry. Returns
+    (list_of_pieces, sample_rate); list is empty only when nothing in the chunk
+    is synthesizable (e.g. CJK under en-us)."""
+    arr, sr = _synth_one(k, chunk, voice, speed)
+    if arr.size:
+        return [arr], sr
+    subs = _split_long_fragment(chunk, max_chars=max(8, len(chunk) // 2))
+    if len(subs) <= 1:
+        subs = chunk.split()  # clause re-split made no progress -> word level
+    pieces: list[np.ndarray] = []
+    for sub in subs:
+        if not sub.strip():
+            continue
+        sub_arr, sr = _synth_one(k, sub, voice, speed)
+        if sub_arr.size:
+            pieces.append(sub_arr)
+    if not pieces:
+        log.warning("kokoro empty audio, unrecoverable for chunk: %r", chunk[:60])
+    return pieces, sr
+
+
 def _synthesize(text: str, voice: str, speed: float) -> tuple[bytes, int]:
     """Run the model. Returns (wav_bytes, sample_rate).
 
@@ -210,15 +245,8 @@ def _synthesize(text: str, voice: str, speed: float) -> tuple[bytes, int]:
     pieces: list[np.ndarray] = []
     with _kokoro_lock:
         for chunk in chunks:
-            audio, sr = k.create(chunk, voice=voice, speed=speed, lang=LANG)
-            arr = np.asarray(audio, dtype=np.float32)
-            if arr.ndim > 1:
-                arr = np.squeeze(arr)
-            if arr.ndim > 1:
-                arr = arr.mean(axis=0)
-            if arr.size == 0:
-                continue
-            pieces.append(arr)
+            recovered, sr = _synth_recover(k, chunk, voice, speed)
+            pieces.extend(recovered)
     if not pieces:
         raise RuntimeError("kokoro returned no audio for any chunk")
     full = np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
