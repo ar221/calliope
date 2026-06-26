@@ -47,23 +47,75 @@ def _clear_voices_cache(mod):
     mod._invalidate_kokoro_voices_cache()
 
 
-# ─── Deferred streaming-partials contract ───────────────────
+# ─── Streaming partial read-back contract ───────────────────
 
 
-def test_extension_streaming_partials_setting_is_deferred_off():
+def test_extension_streaming_partials_setting_is_user_toggle():
     src = EXT.read_text(encoding="utf-8")
-    assert "ttsReadStreamingPartials: false" in src
-    assert 'id="dictation_bridge_tts_stream_partials" type="checkbox" disabled aria-disabled="true"' in src
-    assert "Streaming partial TTS deferred — server streaming not shipped" in src
-    assert "s.ttsReadStreamingPartials = !!ttsStreamEl.checked" not in src
-    assert "ttsStreamEl.checked = false" in src
+    assert "ttsReadStreamingPartials: false" in src  # default stays opt-in
+    assert 'id="dictation_bridge_tts_stream_partials" type="checkbox" />' in src
+    assert "Stream TTS while AI text is streaming" in src
+    assert "s.ttsReadStreamingPartials = !!ttsStreamEl.checked" in src
+    assert "Streaming partial TTS deferred" not in src
 
 
-def test_no_streaming_tts_endpoint_or_client_path_shipped():
+def test_streaming_partials_reuse_existing_tts_endpoint():
     server_src = SRC.read_text(encoding="utf-8")
     ext_src = EXT.read_text(encoding="utf-8")
     assert '"/tts/stream' not in server_src
     assert "'/tts/stream" not in ext_src
+    assert "function maybeStartStreamingAutoRead" in ext_src
+    assert "function queueTtsStreamChunks" in ext_src
+    assert "characterData: true" in ext_src
+
+
+def test_streaming_tts_operator_controls_are_wired():
+    src = EXT.read_text(encoding="utf-8")
+    assert 'id="dbb_tts_stream_status_chip"' in src
+    assert 'id="dbb_tts_stream_preview"' in src
+    assert 'id="dbb_tts_stop_all"' in src
+    assert 'id="dbb_tts_skip_chunk"' in src
+    assert 'id="dbb_tts_pause_resume"' in src
+    assert 'id="dbb_tts_reread_last"' in src
+    assert "function setTtsStreamUiState" in src
+    assert "function skipCurrentTtsChunk" in src
+    assert "function toggleTtsStreamPause" in src
+    assert "Stop all" in src and "Skip" in src and "Reread last" in src
+
+
+def test_extension_diagnostics_panel_is_redacted_and_layered():
+    src = EXT.read_text(encoding="utf-8")
+    assert 'id="dbb_ql_diagnostics"' in src
+    assert "function buildDiagnosticsHtml" in src
+    assert "const tokenState" in src
+    for label in (
+        "Calliope server",
+        "Bearer token",
+        "SSE",
+        "ST state freshness",
+        "Whisper",
+        "Kokoro",
+        "Formatter/audit",
+    ):
+        assert label in src
+    assert "No bearer token, pairing URL, chat text, or audio path is rendered" in src
+    diagnostics_block = src[
+        src.index("async function buildDiagnosticsHtml"):src.index("function closeDiagnosticsPanel")
+    ]
+    assert "new URL(settings().serverUrl).host" in diagnostics_block
+    assert "settings().serverToken" not in diagnostics_block.replace(
+        "settings().serverToken || '').trim()) return 'missing'", ""
+    )
+
+
+def test_extension_repair_trace_drawer_is_in_memory_and_escaped():
+    src = EXT.read_text(encoding="utf-8")
+    assert "const REPAIR_TRACE_ID = 'dictation_bridge_repair_trace'" in src
+    assert "let latestRepairTrace = null" in src
+    assert "function renderRepairTraceFromPayload" in src
+    assert "escapeHtml(value || '—')" in src
+    assert "clearRepairTrace();" in src
+    assert "addEventListener('input', () =>" in src
 
 
 # ─── _validate_tts_request ─────────────────────────────────

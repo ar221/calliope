@@ -65,7 +65,7 @@ const DEFAULTS = {
     // ─── TTS read-back (Calliope Kokoro backend) ───────────────────────────
     ttsAutoReadAi: false,        // auto-fire TTS on every new AI message
     ttsAutoReadPersonaQuoted: true, // auto-fire TTS on new user messages, quoted dialogue only
-    ttsReadStreamingPartials: false, // deferred: server streaming partial TTS is not shipped
+    ttsReadStreamingPartials: false, // speak complete sentence chunks while AI text is streaming
     ttsVoice: 'af_heart',        // Kokoro default voice id
     ttsVoiceProfiles: {},        // WOW-2: character/addressee name -> Kokoro voice id
 };
@@ -104,13 +104,6 @@ function settings() {
         }
         if (shouldMigrateServerUrl(extension_settings[MODULE].serverUrl)) {
             extension_settings[MODULE].serverUrl = defaultServerUrl();
-            try { saveSettings(); } catch {}
-        }
-        // Phase 4: schema key retained for future compatibility, but
-        // streaming partial TTS is explicitly deferred until the server ships
-        // chunked audio support. Never let stale ST settings imply it is live.
-        if (extension_settings[MODULE].ttsReadStreamingPartials !== false) {
-            extension_settings[MODULE].ttsReadStreamingPartials = false;
             try { saveSettings(); } catch {}
         }
     }
@@ -1337,6 +1330,7 @@ function connectSSE() {
 
             // First token for a new request: snapshot base and init session.
             if (!streamingSession || streamingSession.requestId !== requestId) {
+                clearRepairTrace();
                 endStreamingSession();
                 const base = (cfg.appendMode === 'append' && ta.value)
                     ? ta.value.replace(/\s+$/, '')
@@ -1472,6 +1466,8 @@ function connectSSE() {
             writeToTextarea(text, { autoSend: doAutoSend, appendMode: cfg.appendMode });
             if (doAutoSend) setTimeout(() => maybeReadDictatedPersonaText(text), 200);
         }
+
+        renderRepairTraceFromPayload(data, text);
 
         if (data.formatting_skipped && window.toastr) {
             const reason = data.formatting_reason ? `: ${data.formatting_reason}` : '';
@@ -1919,6 +1915,7 @@ function onWindowMessage(event) {
             const cfg = settings();
             writeToTextarea(text, { autoSend: cfg.autoSend, appendMode: cfg.appendMode });
             if (cfg.autoSend) setTimeout(() => maybeReadDictatedPersonaText(text), 200);
+            renderRepairTraceFromPayload(data, text);
             if (data.formatting_skipped && window.toastr) {
                 const reason = data.formatting_reason ? `: ${data.formatting_reason}` : '';
                 window.toastr.warning(`RP formatting skipped${reason}. Raw transcript used.`, 'Dictation Bridge');
@@ -1943,6 +1940,54 @@ function onWindowMessage(event) {
             // Unknown — ignore.
             break;
     }
+}
+
+// ─── Repair trace drawer (in-memory only) ──────────────────────────────────
+const REPAIR_TRACE_ID = 'dictation_bridge_repair_trace';
+let latestRepairTrace = null;
+
+function extractRepairTracePayload(data, finalText) {
+    const trace = data?.repair_trace || data?.repairTrace || null;
+    const raw = data?.raw || data?.raw_text || data?.rawTranscript || trace?.raw || trace?.raw_text || '';
+    const cleaned = data?.cleaned || data?.cleaned_text || data?.cleanedText || trace?.cleaned || trace?.cleaned_text || '';
+    const final = finalText || data?.final || data?.final_text || trace?.final || trace?.final_text || data?.text || '';
+    if (!raw && !cleaned && !final && data?.has_repair_trace !== true) return null;
+    return { raw: String(raw || ''), cleaned: String(cleaned || ''), final: String(final || '') };
+}
+
+function clearRepairTrace() {
+    latestRepairTrace = null;
+    const el = document.getElementById(REPAIR_TRACE_ID);
+    if (el) try { el.remove(); } catch {}
+}
+
+function ensureRepairTraceDrawer() {
+    let el = document.getElementById(REPAIR_TRACE_ID);
+    if (el) return el;
+    const ta = document.getElementById('send_textarea');
+    const host = ta?.parentElement || document.getElementById('send_form') || document.getElementById('chat');
+    if (!host) return null;
+    el = document.createElement('div');
+    el.id = REPAIR_TRACE_ID;
+    el.style.cssText = 'margin:6px 0;padding:8px;border:1px solid rgba(255,182,72,0.35);background:rgba(0,0,0,0.22);border-radius:3px;color:#C9B28B;font-size:12px';
+    if (ta && ta.parentElement) ta.parentElement.insertBefore(el, ta);
+    else host.prepend(el);
+    return el;
+}
+
+function renderRepairTraceFromPayload(data, finalText) {
+    const trace = extractRepairTracePayload(data, finalText);
+    if (!trace) { clearRepairTrace(); return; }
+    latestRepairTrace = trace;
+    const el = ensureRepairTraceDrawer();
+    if (!el) return;
+    const row = (label, value) => `<div style="display:grid;grid-template-columns:72px 1fr;gap:8px;margin-top:4px"><strong style="color:#98876F">${label}</strong><span style="white-space:pre-wrap">${escapeHtml(value || '—')}</span></div>`;
+    el.innerHTML = `<div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
+        <strong style="color:#FFB648">Repair Trace</strong>
+        <button id="dictation_bridge_repair_trace_close" type="button" class="menu_button" title="Clear this in-memory repair trace" style="padding:2px 7px;font-size:11px">Dismiss</button>
+    </div>
+    ${row('Raw', trace.raw)}${row('Cleaned', trace.cleaned)}${row('Final', trace.final)}`;
+    el.querySelector('#dictation_bridge_repair_trace_close')?.addEventListener('click', clearRepairTrace);
 }
 
 // ─── MVP-23: privacy badge + audit log peek ───────────────────────────────
@@ -2187,6 +2232,11 @@ let ttsLastReadPersonaMesid = -1;
 let ttsLastDictatedPersonaQuoted = '';
 let ttsLastDictatedPersonaAt = 0;
 let ttsObserver = null;
+let ttsStreamingSession = null; // { mesid, mesEl, voice, btn, spokenUntil, queue, playing, paused, stopped }
+const TTS_STREAM_MIN_CHARS = 48;
+const TTS_STREAM_FORCE_CHARS = 260;
+const TTS_STREAM_PREVIEW_CHARS = 72;
+let ttsStreamUiState = { state: 'off', queueCount: 0, preview: '', paused: false };
 
 function ttsAudioErrorDetails(audio, blob) {
     const err = audio?.error;
@@ -2301,16 +2351,117 @@ function ttsSetButtonState(btn, state) {
     btn.dataset.dbbTtsState = state;
 }
 
-function stopTts() {
+function streamStatusForSession(session, fallback = 'watching') {
+    if (!settings().ttsReadStreamingPartials) return 'off';
+    if (!session) return settings().ttsAutoReadAi ? 'watching' : 'off';
+    if (session.stopped) return 'stopped';
+    if (session.error) return 'error';
+    if (session.paused) return 'paused';
+    if (session.playing) return 'speaking';
+    if (session.queue?.length) return 'queued';
+    return fallback;
+}
+
+function setTtsStreamUiState(state, session = ttsStreamingSession, preview = '') {
+    const currentPreview = preview || session?.currentChunk || session?.queue?.[0] || '';
+    ttsStreamUiState = {
+        state,
+        queueCount: session?.queue?.length || 0,
+        preview: String(currentPreview || '').replace(/\s+/g, ' ').trim().slice(0, TTS_STREAM_PREVIEW_CHARS),
+        paused: !!session?.paused,
+    };
+    paintTtsStreamStatus();
+}
+
+function paintTtsStreamStatus() {
+    const chip = document.getElementById('dbb_tts_stream_status_chip');
+    const preview = document.getElementById('dbb_tts_stream_preview');
+    if (!chip) return;
+    const st = ttsStreamUiState.state || 'off';
+    const count = ttsStreamUiState.queueCount || 0;
+    const labels = {
+        off: 'TTS stream: off',
+        watching: 'TTS stream: watching',
+        queued: `TTS stream: queued (${count})`,
+        speaking: `TTS stream: speaking (${count})`,
+        paused: `TTS stream: paused (${count})`,
+        stopped: 'TTS stream: stopped',
+        error: 'TTS stream: error',
+    };
+    chip.textContent = labels[st] || `TTS stream: ${st}`;
+    chip.dataset.state = st;
+    chip.setAttribute('title', ttsStreamUiState.preview ? `Current chunk: ${ttsStreamUiState.preview}` : labels[st] || st);
+    if (preview) {
+        preview.textContent = ttsStreamUiState.preview ? `“${ttsStreamUiState.preview}”` : '';
+        preview.style.display = ttsStreamUiState.preview ? 'inline' : 'none';
+    }
+    const pauseBtn = document.getElementById('dbb_tts_pause_resume');
+    if (pauseBtn) pauseBtn.textContent = st === 'paused' ? 'Resume' : 'Pause';
+}
+
+function cleanupCurrentTtsAudioOnly() {
     try { currentTtsAudioSource?.stop(); } catch {}
     try { currentTtsAudioContext?.close(); } catch {}
     currentTtsAudioSource = null;
     currentTtsAudioContext = null;
-    try { currentTtsAudio?.pause(); } catch {}
+    try { currentTtsAudio?.pause?.(); } catch {}
     if (currentTtsBlobUrl) {
         try { URL.revokeObjectURL(currentTtsBlobUrl); } catch {}
         currentTtsBlobUrl = null;
     }
+    currentTtsAudio = null;
+}
+
+function skipCurrentTtsChunk() {
+    const session = ttsStreamingSession;
+    if (!session) { stopTts(); return; }
+    cleanupCurrentTtsAudioOnly();
+    session.playing = false;
+    session.currentChunk = '';
+    setTtsStreamUiState(session.queue.length ? 'queued' : 'watching', session);
+    if (session.queue.length) playNextTtsStreamChunk(session);
+}
+
+function toggleTtsStreamPause() {
+    const session = ttsStreamingSession;
+    if (!session) return;
+    if (session.paused) {
+        session.paused = false;
+        if (currentTtsAudio?.play && currentTtsAudio.paused) {
+            currentTtsAudio.play().catch(e => WARN('tts resume failed', e?.message || e));
+        } else if (!session.playing && session.queue.length) {
+            playNextTtsStreamChunk(session);
+        }
+        setTtsStreamUiState(streamStatusForSession(session), session);
+        return;
+    }
+    session.paused = true;
+    if (currentTtsAudio?.pause) {
+        try { currentTtsAudio.pause(); } catch {}
+    } else {
+        cleanupCurrentTtsAudioOnly();
+        session.playing = false;
+        session.currentChunk = '';
+        toast('info', 'WebAudio playback cannot pause; skipped current chunk instead.');
+    }
+    setTtsStreamUiState('paused', session);
+}
+
+function cancelStreamingTts() {
+    if (!ttsStreamingSession) {
+        setTtsStreamUiState(settings().ttsReadStreamingPartials && settings().ttsAutoReadAi ? 'watching' : 'off', null);
+        return;
+    }
+    ttsStreamingSession.stopped = true;
+    ttsStreamingSession.queue = [];
+    ttsStreamingSession.currentChunk = '';
+    ttsStreamingSession = null;
+    setTtsStreamUiState(settings().ttsReadStreamingPartials && settings().ttsAutoReadAi ? 'stopped' : 'off', null);
+}
+
+function stopTts() {
+    cancelStreamingTts();
+    cleanupCurrentTtsAudioOnly();
     if (currentTtsBtn) {
         ttsSetButtonState(currentTtsBtn, 'idle');
         currentTtsBtn = null;
@@ -2323,6 +2474,17 @@ function stopTts() {
  * picks up reasoning blocks + extras). Falls back to .mes_text textContent
  * if the chat array slot isn't reachable.
  */
+
+function messageIdFromEl(mesEl) {
+    const id = parseInt(mesEl?.getAttribute?.('mesid') || '-1', 10);
+    return Number.isFinite(id) ? id : -1;
+}
+
+function isAiMessageId(mesid) {
+    const m = chat?.[mesid];
+    return !!m && !m.is_user && !m.is_system;
+}
+
 function extractMessageText(mesEl) {
     if (!mesEl) return '';
     const mesid = parseInt(mesEl.getAttribute('mesid') || '-1', 10);
@@ -2660,16 +2822,24 @@ function ensureTtsObserver() {
     try {
         ttsObserver = new MutationObserver((records) => {
             for (const rec of records) {
+                const targetMes = rec.target?.closest?.('.mes') || rec.target?.parentElement?.closest?.('.mes');
+                if (targetMes) handleTtsStreamingMutation(targetMes);
                 rec.addedNodes && rec.addedNodes.forEach(node => {
                     if (!(node instanceof HTMLElement)) return;
-                    if (node.classList?.contains('mes')) injectTtsButtonOn(node);
+                    if (node.classList?.contains('mes')) {
+                        injectTtsButtonOn(node);
+                        handleTtsStreamingMutation(node);
+                    }
                     // If a swipe re-renders, .mes_buttons may be replaced inside an existing .mes.
                     const inner = node.querySelector?.('.mes');
-                    if (inner) injectTtsButtonOn(inner);
+                    if (inner) {
+                        injectTtsButtonOn(inner);
+                        handleTtsStreamingMutation(inner);
+                    }
                 });
             }
         });
-        ttsObserver.observe(chatRoot, { childList: true, subtree: true });
+        ttsObserver.observe(chatRoot, { childList: true, subtree: true, characterData: true });
     } catch (e) {
         WARN('tts observer setup failed', e?.message || e);
     }
@@ -2679,10 +2849,151 @@ function ensureTtsObserver() {
  * Auto-read hook for new AI messages. Wired into MESSAGE_RECEIVED /
  * CHARACTER_MESSAGE_RENDERED. Gated so chat-load doesn't blast audio.
  */
+
+function nextTtsStreamChunk(session, { final = false } = {}) {
+    if (!session || session.stopped) return '';
+    const text = extractMessageText(session.mesEl);
+    if (!text || text.length <= session.spokenUntil) return '';
+    const unseen = text.slice(session.spokenUntil);
+
+    let cut = -1;
+    const sentenceEnd = /[.!?…]["'”’)]?(?:\s+|$)/g;
+    let match;
+    while ((match = sentenceEnd.exec(unseen)) !== null) {
+        if (match.index + match[0].length >= TTS_STREAM_MIN_CHARS) {
+            cut = match.index + match[0].length;
+        }
+    }
+    if (cut < 0 && unseen.length >= TTS_STREAM_FORCE_CHARS) {
+        const slice = unseen.slice(0, TTS_STREAM_FORCE_CHARS);
+        cut = Math.max(slice.lastIndexOf(' '), slice.lastIndexOf('\n'));
+        if (cut < TTS_STREAM_MIN_CHARS) cut = TTS_STREAM_FORCE_CHARS;
+    }
+    if (cut < 0 && final) cut = unseen.length;
+    if (cut <= 0) return '';
+
+    const chunk = unseen.slice(0, cut).trim();
+    session.spokenUntil += cut;
+    return chunk;
+}
+
+function queueTtsStreamChunks(session, { final = false } = {}) {
+    if (!session || session.stopped) return;
+    let chunk;
+    while ((chunk = nextTtsStreamChunk(session, { final })) !== '') {
+        session.queue.push(chunk);
+        if (!final) break; // Interim pass: at most one chunk per DOM burst.
+    }
+    setTtsStreamUiState(streamStatusForSession(session, session.queue.length ? 'queued' : 'watching'), session);
+    playNextTtsStreamChunk(session);
+}
+
+async function playNextTtsStreamChunk(session) {
+    if (!session || session.stopped || session.paused || session.playing || !session.queue.length) return;
+    const chunk = session.queue.shift();
+    session.currentChunk = chunk;
+    session.playing = true;
+    setTtsStreamUiState('speaking', session, chunk);
+    currentTtsBtn = session.btn || currentTtsBtn;
+    ttsSetButtonState(currentTtsBtn, 'loading');
+    try {
+        const blob = await fetchTts(chunk, session.voice);
+        if (session.stopped || ttsStreamingSession !== session) return;
+        ttsBackendAvailable = true;
+        const audio = await createAndPlayTtsAudio(blob, () => {
+            if (ttsStreamingSession !== session) return;
+            if (currentTtsAudio === audio) {
+                try { currentTtsAudio.pause?.(); } catch {}
+                if (currentTtsBlobUrl) {
+                    try { URL.revokeObjectURL(currentTtsBlobUrl); } catch {}
+                    currentTtsBlobUrl = null;
+                }
+                currentTtsAudio = null;
+                currentTtsAudioSource = null;
+                currentTtsAudioContext = null;
+            }
+            session.playing = false;
+            session.currentChunk = '';
+            if (session.queue.length && !session.paused) playNextTtsStreamChunk(session);
+            else {
+                ttsSetButtonState(session.btn, 'idle');
+                setTtsStreamUiState(streamStatusForSession(session), session);
+            }
+        });
+        ttsSetButtonState(session.btn, 'playing');
+    } catch (e) {
+        session.stopped = true;
+        session.error = true;
+        ttsStreamingSession = null;
+        const status = e?.status || 0;
+        if (status === 404 || status === 501 || status === 503 || status === 0) {
+            notifyTtsMissing(e?.message || `status_${status}`);
+        } else {
+            WARN('streaming TTS failed', e?.message || e);
+            toast('error', `Streaming TTS failed: ${e?.message || 'unknown'}`);
+        }
+        ttsSetButtonState(session.btn, 'idle');
+        session.playing = false;
+        setTtsStreamUiState('error', session);
+    }
+}
+
+function maybeStartStreamingAutoRead(mesid, mesEl) {
+    const cfg = settings();
+    if (!cfg.ttsAutoReadAi || !cfg.ttsReadStreamingPartials) return false;
+    if (!ttsAutoReadInitDone) return false;
+    const id = parseInt(mesid, 10);
+    if (!Number.isFinite(id) || id < 0 || !isAiMessageId(id)) return false;
+    if (id <= ttsLastReadMesid) return true;
+    ttsLastReadMesid = id;
+    const el = mesEl || document.querySelector(`#chat .mes[mesid="${id}"]`);
+    if (!el) return false;
+    injectTtsButtonOn(el);
+    const btn = el.querySelector(`.${TTS_BTN_CLASS}`);
+    if (!btn) return false;
+    if (ttsStreamingSession && ttsStreamingSession.mesid !== id) cancelStreamingTts();
+    if (!ttsStreamingSession || ttsStreamingSession.mesid !== id) {
+        stopTts();
+        ttsStreamingSession = {
+            mesid: id,
+            mesEl: el,
+            voice: resolveTtsVoiceForMessage(el),
+            btn,
+            spokenUntil: 0,
+            queue: [],
+            playing: false,
+            paused: false,
+            currentChunk: '',
+            stopped: false,
+        };
+    }
+    queueTtsStreamChunks(ttsStreamingSession, { final: false });
+    return true;
+}
+
+function handleTtsStreamingMutation(mesEl) {
+    if (!mesEl || !settings().ttsReadStreamingPartials) return;
+    const id = messageIdFromEl(mesEl);
+    if (id < 0) return;
+    if (ttsStreamingSession?.mesid === id) {
+        queueTtsStreamChunks(ttsStreamingSession, { final: false });
+        return;
+    }
+    maybeStartStreamingAutoRead(id, mesEl);
+}
+
+function finalizeStreamingAutoRead(mesid) {
+    const id = parseInt(mesid, 10);
+    if (!Number.isFinite(id) || !ttsStreamingSession || ttsStreamingSession.mesid !== id) return false;
+    queueTtsStreamChunks(ttsStreamingSession, { final: true });
+    return true;
+}
+
 function maybeAutoReadAi(mesid) {
     const cfg = settings();
     if (!cfg.ttsAutoReadAi) return;
     if (!ttsAutoReadInitDone) return;             // chat just loaded — skip
+    if (cfg.ttsReadStreamingPartials && finalizeStreamingAutoRead(mesid)) return;
     const id = parseInt(mesid, 10);
     if (!Number.isFinite(id) || id < 0) return;
     if (id <= ttsLastReadMesid) return;            // already handled / replay
@@ -2798,6 +3109,90 @@ async function fetchTtsVoices() {
     return Array.isArray(data?.voices) ? data.voices : [];
 }
 
+// ─── Diagnostics panel ─────────────────────────────────────────────────────
+const DIAGNOSTICS_ID = 'dictation_bridge_diagnostics_panel';
+
+async function fetchJsonStatus(path, opts = {}) {
+    const cfg = settings();
+    const url = `${cfg.serverUrl.replace(/\/+$/, '')}${path}`;
+    const started = Date.now();
+    try {
+        const res = await fetch(url, {
+            method: opts.method || 'GET',
+            mode: 'cors',
+            cache: 'no-store',
+            headers: { ...(opts.auth ? authHeaders() : {}) },
+        });
+        let data = null;
+        try { data = await res.json(); } catch {}
+        return { ok: res.ok, status: res.status, ms: Date.now() - started, data };
+    } catch (e) {
+        return { ok: false, status: 0, ms: Date.now() - started, error: e?.message || String(e) };
+    }
+}
+
+function diagnosticsRow(label, state, detail, tone = 'neutral') {
+    const colors = { ok: '#A8C97B', warn: '#FFB648', bad: '#FF8274', neutral: '#C9B28B' };
+    return `<div style="display:grid;grid-template-columns:145px 92px 1fr;gap:8px;padding:4px 0;border-bottom:1px solid rgba(255,182,72,0.08);font-size:12px">
+        <strong style="color:#98876F">${escapeHtml(label)}</strong>
+        <span style="color:${colors[tone] || colors.neutral}">${escapeHtml(state)}</span>
+        <span>${escapeHtml(detail || '')}</span>
+    </div>`;
+}
+
+async function buildDiagnosticsHtml() {
+    const health = await fetchJsonStatus('/health', { auth: true });
+    const state = await fetchJsonStatus('/state', { auth: true });
+    const voices = await fetchJsonStatus('/tts/voices', { auth: true });
+    const audit = await fetchAuditNetwork();
+    const now = Date.now();
+    const sseAge = sseStatus.lastEventAt ? Math.round((now - sseStatus.lastEventAt) / 1000) : null;
+    const stateAge = lastStatePayload?.t ? Math.round((now - lastStatePayload.t) / 1000) : null;
+    const tokenState = (() => {
+        if (!(settings().serverToken || '').trim()) return 'missing';
+        if (state.status === 401 || state.status === 403) return 'invalid';
+        if (state.ok) return 'valid';
+        return tokenStatusLabel();
+    })();
+    const formatter = audit?.summary?.llm || health.data?.formatter || health.data?.provider || 'see /audit/network';
+    const whisper = health.data?.whisper || health.data?.whisper_server || health.data?.model || health.data?.asr || 'not reported by /health';
+    const rows = [
+        diagnosticsRow('Calliope server', health.ok ? 'reachable' : 'unreachable', health.ok ? `/health HTTP ${health.status} · ${health.ms}ms` : (health.error || `HTTP ${health.status}`), health.ok ? 'ok' : 'bad'),
+        diagnosticsRow('Bearer token', tokenState, serverAuthStatus.lastError || (state.ok ? `/state HTTP ${state.status}` : `state probe HTTP ${state.status || 'network'}`), tokenState === 'valid' ? 'ok' : (tokenState === 'missing' || tokenState === 'invalid' ? 'bad' : 'warn')),
+        diagnosticsRow('SSE', sseStatus.state, sseAge == null ? 'no event received yet' : `last event ${sseAge}s ago${sseStatus.lastError ? ` · ${sseStatus.lastError}` : ''}`, sseStatus.state === 'connected' ? 'ok' : 'warn'),
+        diagnosticsRow('ST state freshness', stateAge == null ? 'unknown' : (stateAge <= 60 ? 'fresh' : 'stale'), stateAge == null ? 'no local state post recorded' : `last local /state payload ${stateAge}s ago`, stateAge != null && stateAge <= 60 ? 'ok' : 'warn'),
+        diagnosticsRow('Whisper', health.ok ? 'reported' : 'unknown', typeof whisper === 'string' ? whisper : JSON.stringify(whisper).slice(0, 160), health.ok ? 'ok' : 'warn'),
+        diagnosticsRow('Kokoro', voices.ok ? 'available' : 'unavailable', voices.ok ? `/tts/voices HTTP ${voices.status}` : (voices.error || `HTTP ${voices.status}`), voices.ok ? 'ok' : 'bad'),
+        diagnosticsRow('Formatter/audit', audit?.error ? 'limited' : 'available', audit?.error || String(formatter).slice(0, 180), audit?.warning ? 'bad' : (audit?.error ? 'warn' : 'ok')),
+    ].join('');
+    return `<div class="dictation-bridge-modal" id="${DIAGNOSTICS_ID}" style="z-index:10002">
+        <div class="dictation-bridge-backdrop"></div>
+        <div class="dictation-bridge-frame-wrap" style="background:#1C150C;border:1px solid #FFB648;border-radius:2px;width:min(92vw, 720px);max-height:80vh;overflow:auto;padding:16px;color:#C9B28B;font-family:inherit">
+            <div class="dictation-bridge-close" style="color:#FFB648">&times;</div>
+            <h3 style="margin:0 0 10px 0;color:#FFB648;font-size:16px">Calliope Diagnostics</h3>
+            <p style="margin:0 0 10px 0;color:#98876F;font-size:12px">Redacted live-state checks only. No bearer token, pairing URL, chat text, or audio path is rendered.</p>
+            ${rows}
+            <div style="margin-top:10px;font-size:11px;color:#98876F">Server URL host: ${escapeHtml((() => { try { return new URL(settings().serverUrl).host; } catch { return 'invalid'; } })())}</div>
+        </div>
+    </div>`;
+}
+
+function closeDiagnosticsPanel() {
+    const existing = document.getElementById(DIAGNOSTICS_ID);
+    if (existing) try { existing.remove(); } catch {}
+}
+
+async function openDiagnosticsPanel() {
+    closeDiagnosticsPanel();
+    const wrapper = document.createElement('div');
+    wrapper.innerHTML = await buildDiagnosticsHtml();
+    const modal = wrapper.firstElementChild;
+    if (!modal) return;
+    document.body.appendChild(modal);
+    modal.querySelector('.dictation-bridge-backdrop')?.addEventListener('click', closeDiagnosticsPanel);
+    modal.querySelector('.dictation-bridge-close')?.addEventListener('click', closeDiagnosticsPanel);
+}
+
 // ─── Quick-launch panel (above settings drawer) ────────────────────────────
 // Compact card: [🎤 Open Dictation] [🔊 Read All AI Msgs] · status dot · mode
 // label · "Last: <ago>s". Mounted at #extensions_settings2 INSERT-BEFORE the
@@ -2829,6 +3224,15 @@ function buildQuickLaunchPanel() {
                     <span class="fa-solid fa-volume-high"></span>
                     <span class="dbb-ql-toggle-label">Read All AI Msgs</span>
                 </button>
+                <button id="dbb_ql_diagnostics" type="button" class="menu_button dbb-ql-btn" title="Open Calliope diagnostics panel">Diagnostics</button>
+            </div>
+            <div class="dbb-tts-stream-row" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:6px 0;font-size:12px">
+                <span id="dbb_tts_stream_status_chip" class="dbb-tts-stream-chip" data-state="off" style="border:1px solid rgba(255,182,72,0.45);border-radius:2px;padding:2px 8px;color:#FFB648">TTS stream: off</span>
+                <span id="dbb_tts_stream_preview" style="display:none;color:#98876F;max-width:32em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+                <button id="dbb_tts_stop_all" type="button" class="menu_button" title="Stop current TTS and clear queued chunks" style="padding:2px 7px;font-size:11px">Stop all</button>
+                <button id="dbb_tts_skip_chunk" type="button" class="menu_button" title="Skip only the current spoken chunk and continue the queue" style="padding:2px 7px;font-size:11px">Skip</button>
+                <button id="dbb_tts_pause_resume" type="button" class="menu_button" title="Pause/resume HTMLAudio playback; WebAudio fallback stops the current chunk" style="padding:2px 7px;font-size:11px">Pause</button>
+                <button id="dbb_tts_reread_last" type="button" class="menu_button" title="Reread the last AI message" style="padding:2px 7px;font-size:11px">Reread last</button>
             </div>
             <div class="dbb-ql-status">
                 <span class="dbb-ql-dot" id="dbb_ql_status_dot"></span>
@@ -2856,8 +3260,16 @@ function buildQuickLaunchPanel() {
     wrap.querySelector('#dbb_ql_toggle_auto_read').addEventListener('click', () => {
         toggleAutoReadAi();
     });
+    wrap.querySelector('#dbb_ql_diagnostics')?.addEventListener('click', () => {
+        openDiagnosticsPanel().catch(e => WARN('diagnostics panel failed', e?.message || e));
+    });
+    wrap.querySelector('#dbb_tts_stop_all')?.addEventListener('click', stopTts);
+    wrap.querySelector('#dbb_tts_skip_chunk')?.addEventListener('click', skipCurrentTtsChunk);
+    wrap.querySelector('#dbb_tts_pause_resume')?.addEventListener('click', toggleTtsStreamPause);
+    wrap.querySelector('#dbb_tts_reread_last')?.addEventListener('click', readLastAiMessage);
 
     paintQuickLaunchAutoReadBtn();
+    paintTtsStreamStatus();
     paintQuickLaunchStatus();
 
     // Keep "Last: <ago>s" fresh on a 1Hz tick. Cheap; teardown on container
@@ -3050,21 +3462,27 @@ function buildSettingsPanel() {
                             <span>Auto-read my quoted dialogue</span>
                         </label>
 
-                        <label class="checkbox_label" title="Deferred — server streaming partial TTS is not shipped">
-                            <input id="dictation_bridge_tts_stream_partials" type="checkbox" disabled aria-disabled="true" />
-                            <span style="opacity:0.7">Streaming partial TTS deferred — server streaming not shipped</span>
+                        <label class="checkbox_label" title="Speak complete sentence chunks while the AI message is still streaming. Requires Auto-read AI messages.">
+                            <input id="dictation_bridge_tts_stream_partials" type="checkbox" />
+                            <span>Stream TTS while AI text is streaming</span>
                         </label>
 
-                        <label for="dictation_bridge_tts_voice">Voice</label>
-                        <select id="dictation_bridge_tts_voice" class="text_pole">
-                            <option value="af_heart">af_heart (Kokoro default)</option>
-                        </select>
-                        <small id="dictation_bridge_tts_profile_hint" class="notes" style="margin-top:0">Voices populate from <code>/tts/voices</code>. Changing the picker saves a profile for the active character/addressee.</small>
-
-                        <div style="display:flex;gap:6px;align-items:center;margin:4px 0 0 0">
-                            <button id="dictation_bridge_tts_test" type="button" class="menu_button" style="padding:3px 10px;font-size:12px;border:1px solid rgba(201, 178, 139, 0.45);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Test voice</button>
-                            <button id="dictation_bridge_tts_save_persona" type="button" class="menu_button" style="padding:3px 10px;font-size:12px;border:1px solid rgba(201, 178, 139, 0.45);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Save for persona</button>
-                            <small class="notes" style="margin:0 0 0 4px">Plays a short sample with the selected voice.</small>
+                        <div id="dictation_bridge_voice_profile_card" style="border:1px solid rgba(255,182,72,0.25);border-radius:3px;padding:8px;margin:6px 0;background:rgba(0,0,0,0.18)">
+                            <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:4px">
+                                <strong style="color:#FFB648">Voice profile</strong>
+                                <span id="dictation_bridge_tts_profile_target" style="font-size:12px;color:#C9B28B">Target: —</span>
+                            </div>
+                            <label for="dictation_bridge_tts_voice">Active voice</label>
+                            <select id="dictation_bridge_tts_voice" class="text_pole">
+                                <option value="af_heart">af_heart (Kokoro default)</option>
+                            </select>
+                            <small id="dictation_bridge_tts_profile_hint" class="notes" style="margin-top:0">Voices populate from <code>/tts/voices</code>. Changing the picker saves a profile for the active character/addressee.</small>
+                            <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:4px 0 0 0">
+                                <button id="dictation_bridge_tts_test" type="button" class="menu_button" title="Play a short sample with the selected voice" style="padding:3px 10px;font-size:12px;border:1px solid rgba(201, 178, 139, 0.45);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Sample</button>
+                                <button id="dictation_bridge_tts_save_character" type="button" class="menu_button" title="Save this voice for the active character or group addressee" style="padding:3px 10px;font-size:12px;border:1px solid rgba(201, 178, 139, 0.45);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Save target</button>
+                                <button id="dictation_bridge_tts_save_persona" type="button" class="menu_button" title="Save this voice for your persona" style="padding:3px 10px;font-size:12px;border:1px solid rgba(201, 178, 139, 0.45);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Save persona</button>
+                                <button id="dictation_bridge_tts_reset_profile" type="button" class="menu_button" title="Reset only the active target voice profile" style="padding:3px 10px;font-size:12px;border:1px solid rgba(255, 90, 78, 0.45);background:transparent;color:#FF8274;border-radius:2px;cursor:pointer">Reset target</button>
+                            </div>
                         </div>
 
                         <div style="display:flex;gap:6px;align-items:center;margin:6px 0 0 0">
@@ -3197,7 +3615,10 @@ function buildSettingsPanel() {
     const ttsStreamEl = host.querySelector('#dictation_bridge_tts_stream_partials');
     const ttsVoiceEl = host.querySelector('#dictation_bridge_tts_voice');
     const ttsTestEl = host.querySelector('#dictation_bridge_tts_test');
+    const ttsSaveCharacterEl = host.querySelector('#dictation_bridge_tts_save_character');
     const ttsSavePersonaEl = host.querySelector('#dictation_bridge_tts_save_persona');
+    const ttsResetProfileEl = host.querySelector('#dictation_bridge_tts_reset_profile');
+    const ttsProfileTargetEl = host.querySelector('#dictation_bridge_tts_profile_target');
     const audiobookExportEl = host.querySelector('#dictation_bridge_audiobook_export');
     const ttsSuggestEl = host.querySelector('#dictation_bridge_tts_suggest');
     const ttsSuggestionPanelEl = host.querySelector('#dictation_bridge_tts_suggestion_panel');
@@ -3208,8 +3629,10 @@ function buildSettingsPanel() {
         const name = currentTtsProfileName();
         const key = normalizeVoiceProfileKey(name);
         const voice = (settings().ttsVoiceProfiles || {})[key] || settings().ttsVoice || 'af_heart';
+        const persona = currentPersonaTtsProfileName();
+        if (ttsProfileTargetEl) ttsProfileTargetEl.textContent = name ? `Target: ${name}` : `Target: global fallback · Persona: ${persona}`;
         ttsProfileHintEl.innerHTML = name
-            ? `Voice profile for <strong>${escapeHtml(name)}</strong>: <code>${escapeHtml(voice)}</code>. Change picker to update this character.`
+            ? `Voice profile for <strong>${escapeHtml(name)}</strong>: <code>${escapeHtml(voice)}</code>. Change picker or Save target to update only this character/addressee.`
             : 'Voices populate from <code>/tts/voices</code>. Change picker to set the global fallback voice.';
     };
 
@@ -3229,17 +3652,11 @@ function buildSettingsPanel() {
         });
     }
     if (ttsStreamEl) {
-        s.ttsReadStreamingPartials = false;
-        ttsStreamEl.checked = false;
-        ttsStreamEl.disabled = true;
-        ttsStreamEl.setAttribute('aria-disabled', 'true');
-        ttsStreamEl.title = 'Deferred — server streaming partial TTS is not shipped';
-        // Defensive only: disabled controls should not fire, but stale browser
-        // or script changes must still collapse back to the non-streaming path.
+        ttsStreamEl.checked = !!s.ttsReadStreamingPartials;
         ttsStreamEl.addEventListener('change', () => {
-            s.ttsReadStreamingPartials = false;
-            ttsStreamEl.checked = false;
+            s.ttsReadStreamingPartials = !!ttsStreamEl.checked;
             saveSettings();
+            if (!s.ttsReadStreamingPartials) cancelStreamingTts();
         });
     }
 
@@ -3320,6 +3737,32 @@ function buildSettingsPanel() {
             } finally {
                 ttsTestEl.textContent = prev;
                 ttsTestEl.removeAttribute('disabled');
+            }
+        });
+    }
+
+    if (ttsSaveCharacterEl && ttsVoiceEl) {
+        ttsSaveCharacterEl.addEventListener('click', () => {
+            const profileName = rememberTtsVoiceForCurrentProfile(ttsVoiceEl.value || settings().ttsVoice || 'af_heart');
+            saveSettings();
+            paintTtsProfileHint();
+            if (profileName) toast('success', `Saved TTS voice for ${profileName}`);
+            else toast('success', 'Saved global fallback TTS voice');
+        });
+    }
+
+    if (ttsResetProfileEl && ttsVoiceEl) {
+        ttsResetProfileEl.addEventListener('click', () => {
+            const name = currentTtsProfileName();
+            const key = normalizeVoiceProfileKey(name);
+            if (key && settings().ttsVoiceProfiles?.[key]) {
+                delete settings().ttsVoiceProfiles[key];
+                saveSettings();
+                ttsVoiceEl.value = settings().ttsVoice || 'af_heart';
+                paintTtsProfileHint();
+                toast('info', `Reset TTS voice profile for ${name}`);
+            } else {
+                toast('info', 'No active target voice profile to reset');
             }
         });
     }
@@ -3493,6 +3936,7 @@ export async function init() {
         ttsLastDictatedPersonaQuoted = '';
         ttsLastDictatedPersonaAt = 0;
         stopTts();
+        clearRepairTrace();
         setTimeout(() => {
             sweepInjectTtsButtons();
             // Mark init complete a tick after the chat is fully painted so
@@ -3528,6 +3972,10 @@ export async function init() {
     // First-load fallback: if there's no chat yet, the gate stays closed
     // until APP_READY/CHAT_LOADED fires. If those don't show up (race), open
     // it after 3s so manual auto-read works on a hot session.
+    document.getElementById('send_textarea')?.addEventListener('input', () => {
+        if (latestRepairTrace) clearRepairTrace();
+    });
+    setTtsStreamUiState(settings().ttsReadStreamingPartials && settings().ttsAutoReadAi ? 'watching' : 'off', null);
     setTimeout(() => { if (!ttsAutoReadInitDone) ttsAutoReadInitDone = true; }, 3000);
 
     LOG('initialized');

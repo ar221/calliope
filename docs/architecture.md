@@ -170,10 +170,15 @@ Kokoro proxy:
 - `POST /tts` returns one complete WAV/audio response for the requested text.
 - `GET /tts/voices`, `POST /tts/voices/suggest`, and `POST /tts/audiobook`
   support voice profiles, samples, suggestions, and bounded audiobook export.
-- `ttsReadStreamingPartials` is retained as a future schema key but is forced
-  false in the extension. Streaming partial TTS is deferred until a separate
-  server streaming contract, buffering/cancellation model, and synthetic-audio
-  test plan are approved.
+- `ttsReadStreamingPartials` defaults false but is a real opt-in extension
+  toggle. It observes the SillyTavern assistant message DOM while text is still
+  appearing, cuts complete sentence chunks, and queues repeated authenticated
+  `POST /tts` WAV requests. This is **extension-side queued read-back**, not a
+  server `/tts/stream` endpoint.
+- The quick-launch card exposes a redacted TTS stream status row with queue
+  count, chunk preview, stop/skip/pause/reread controls, and a diagnostics
+  panel that separates server, token, SSE, ST-state, Whisper, Kokoro, and
+  formatter/audit status without rendering tokens or private chat text.
 
 ## Data flows
 
