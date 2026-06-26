@@ -9032,6 +9032,10 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             return
         text, voice, speed, err = _validate_tts_request(body)
         if err is not None:
+            log.warning(
+                "/tts validation failed: code=%s status=%s text_len=%s",
+                err.get("code"), err.get("status"), len(str(body.get("text", "") or "")) if isinstance(body, dict) else 0,
+            )
             self.send_error_json(err["error"], code=err["code"], status=err["status"])
             return
         if not _ensure_kokoro_alive():

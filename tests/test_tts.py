@@ -112,6 +112,18 @@ def test_extension_unlocks_audio_for_auto_tts_after_user_gesture():
     assert "ttsUnlockedAudioContext.state === 'running'" in src
 
 
+def test_extension_chunks_long_tts_requests_before_server_limit():
+    src = EXT.read_text(encoding="utf-8")
+    assert "const TTS_REQUEST_MAX_CHARS = 4800" in src
+    assert "function splitTextForTtsRequests" in src
+    assert "if (cleanText.length > 5000)" in src
+    read_block = src[src.index("async function readMessageAloud"):src.index("/** Inject 🔊 button")]
+    assert "const chunks = splitTextForTtsRequests(text);" in read_block
+    assert "if (chunks.length > 1)" in read_block
+    assert "queue: chunks" in read_block
+    assert "playNextTtsStreamChunk(ttsStreamingSession);" in read_block
+
+
 def test_extension_diagnostics_panel_is_redacted_and_layered():
     src = EXT.read_text(encoding="utf-8")
     assert 'id="dbb_ql_diagnostics"' in src

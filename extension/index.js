@@ -2237,6 +2237,7 @@ let ttsStreamingSession = null; // { mesid, mesEl, voice, btn, spokenUntil, queu
 const TTS_STREAM_MIN_CHARS = 48;
 const TTS_STREAM_FORCE_CHARS = 260;
 const TTS_STREAM_PREVIEW_CHARS = 72;
+const TTS_REQUEST_MAX_CHARS = 4800; // server hard limit is 5000; keep request headroom
 let ttsStreamUiState = { state: 'off', queueCount: 0, preview: '', paused: false };
 
 function ttsAudioErrorDetails(audio, blob) {
@@ -2543,6 +2544,32 @@ function stripMarkdownForTts(s) {
         .trim();
 }
 
+function splitTextForTtsRequests(text, maxChars = TTS_REQUEST_MAX_CHARS) {
+    const raw = String(text || '').trim();
+    if (!raw) return [];
+    const chunks = [];
+    let remaining = raw;
+    while (remaining.length > maxChars) {
+        const slice = remaining.slice(0, maxChars);
+        let cut = Math.max(
+            slice.lastIndexOf('\n\n'),
+            slice.lastIndexOf('\n'),
+            slice.lastIndexOf('. '),
+            slice.lastIndexOf('! '),
+            slice.lastIndexOf('? '),
+            slice.lastIndexOf('; '),
+            slice.lastIndexOf(', '),
+            slice.lastIndexOf(' '),
+        );
+        if (cut < Math.floor(maxChars * 0.55)) cut = maxChars;
+        const chunk = remaining.slice(0, cut).trim();
+        if (chunk) chunks.push(chunk);
+        remaining = remaining.slice(cut).trim();
+    }
+    if (remaining) chunks.push(remaining);
+    return chunks;
+}
+
 function isUserMessageEl(mesEl) {
     if (!mesEl) return false;
     if (mesEl.getAttribute('is_user') === 'true') return true;
@@ -2579,6 +2606,11 @@ async function fetchTts(text, voice) {
         err.status = 400;
         throw err;
     }
+    if (cleanText.length > 5000) {
+        const err = new Error('tts_text_too_long');
+        err.status = 400;
+        throw err;
+    }
     const body = { text: cleanText };
     if (voice) body.voice = voice;
     const res = await fetch(url, {
@@ -2589,7 +2621,12 @@ async function fetchTts(text, voice) {
         body: JSON.stringify(body),
     });
     if (!res.ok) {
-        const err = new Error(`tts_http_${res.status}`);
+        let code = `tts_http_${res.status}`;
+        try {
+            const payload = await res.clone().json();
+            if (payload?.code) code = `tts_${payload.code}`;
+        } catch {}
+        const err = new Error(code);
         err.status = res.status;
         throw err;
     }
@@ -2759,6 +2796,28 @@ async function readMessageAloud(mesEl, btn) {
     const text = extractMessageText(mesEl);
     if (!text) {
         toast('warning', isUserMessageEl(mesEl) ? 'No quoted dialogue to read' : 'No text to read');
+        return;
+    }
+
+    const chunks = splitTextForTtsRequests(text);
+    if (chunks.length > 1) {
+        if (ttsStreamingSession && ttsStreamingSession.mesEl !== mesEl) cancelStreamingTts();
+        stopTts();
+        ttsStreamingSession = {
+            mesid: messageIdFromEl(mesEl),
+            mesEl,
+            voice: resolveTtsVoiceForMessage(mesEl),
+            btn,
+            spokenUntil: text.length,
+            queue: chunks,
+            playing: false,
+            paused: false,
+            currentChunk: '',
+            stopped: false,
+        };
+        currentTtsBtn = btn;
+        setTtsStreamUiState('queued', ttsStreamingSession, chunks[0]);
+        playNextTtsStreamChunk(ttsStreamingSession);
         return;
     }
 
