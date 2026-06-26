@@ -83,6 +83,25 @@ def test_streaming_tts_operator_controls_are_wired():
     assert "Stop all" in src and "Skip" in src and "Reread last" in src
 
 
+def test_extension_auto_tts_retries_until_message_text_exists():
+    src = EXT.read_text(encoding="utf-8")
+    assert "function maybeAutoReadAi(mesid, attempt = 0)" in src
+    assert "setTimeout(() => maybeAutoReadAi(id, attempt + 1), 250)" in src
+    assert "ttsLastReadMesid = id;" in src
+    before_mark = src.index("if (!text) {")
+    last_read_mark = src.index("ttsLastReadMesid = id;", before_mark)
+    assert before_mark < last_read_mark
+    assert "tts_empty_text" in src
+
+
+def test_extension_message_received_handles_ai_auto_tts_too():
+    src = EXT.read_text(encoding="utf-8")
+    block = src[src.index("if (event_types.MESSAGE_RECEIVED)"):]
+    assert "maybeAutoReadAi(mesid);" in block
+    assert "maybeAutoReadPersonaQuoted(mesid);" in block
+    assert "!m.is_user && !m.is_system" in block
+
+
 def test_extension_diagnostics_panel_is_redacted_and_layered():
     src = EXT.read_text(encoding="utf-8")
     assert 'id="dbb_ql_diagnostics"' in src

@@ -2544,7 +2544,13 @@ function isTtsMessageEl(mesEl) {
 async function fetchTts(text, voice) {
     const cfg = settings();
     const url = `${cfg.serverUrl.replace(/\/+$/, '')}/tts`;
-    const body = { text };
+    const cleanText = String(text || '').trim();
+    if (!cleanText) {
+        const err = new Error('tts_empty_text');
+        err.status = 400;
+        throw err;
+    }
+    const body = { text: cleanText };
     if (voice) body.voice = voice;
     const res = await fetch(url, {
         method: 'POST',
@@ -2989,7 +2995,7 @@ function finalizeStreamingAutoRead(mesid) {
     return true;
 }
 
-function maybeAutoReadAi(mesid) {
+function maybeAutoReadAi(mesid, attempt = 0) {
     const cfg = settings();
     if (!cfg.ttsAutoReadAi) return;
     if (!ttsAutoReadInitDone) return;             // chat just loaded — skip
@@ -2997,17 +3003,28 @@ function maybeAutoReadAi(mesid) {
     const id = parseInt(mesid, 10);
     if (!Number.isFinite(id) || id < 0) return;
     if (id <= ttsLastReadMesid) return;            // already handled / replay
-    ttsLastReadMesid = id;
     const m = chat?.[id];
     if (!m || m.is_user || m.is_system) return;
     const mesEl = document.querySelector(`#chat .mes[mesid="${id}"]`);
-    if (!mesEl) return;
+    if (!mesEl) {
+        if (attempt < 8) setTimeout(() => maybeAutoReadAi(id, attempt + 1), 250);
+        return;
+    }
     const btn = mesEl.querySelector(`.${TTS_BTN_CLASS}`);
     if (!btn) {
         // Inject first, then read.
         injectTtsButtonOn(mesEl);
     }
     const fresh = mesEl.querySelector(`.${TTS_BTN_CLASS}`);
+    const text = extractMessageText(mesEl);
+    if (!text) {
+        // ST can fire message events before the final .mes text/chat slot is
+        // populated. Do not mark the message as read yet; retry briefly so
+        // auto-TTS doesn't silently burn the mesid or POST an empty /tts body.
+        if (attempt < 8) setTimeout(() => maybeAutoReadAi(id, attempt + 1), 250);
+        return;
+    }
+    ttsLastReadMesid = id;
     if (fresh) readMessageAloud(mesEl, fresh).catch(err => WARN('autoRead', err?.message || err));
 }
 
@@ -3966,7 +3983,15 @@ export async function init() {
             const id = parseInt(mesid, 10);
             const el = document.querySelector(`#chat .mes[mesid="${id}"]`);
             if (el) injectTtsButtonOn(el);
-            maybeAutoReadPersonaQuoted(mesid);
+            const m = chat?.[id];
+            if (m && !m.is_user && !m.is_system) {
+                // Some ST builds fire MESSAGE_RECEIVED for completed AI output
+                // without CHARACTER_MESSAGE_RENDERED; use the same guarded
+                // auto-read path so Read All keeps working across versions.
+                maybeAutoReadAi(mesid);
+            } else {
+                maybeAutoReadPersonaQuoted(mesid);
+            }
         });
     }
     // First-load fallback: if there's no chat yet, the gate stays closed
