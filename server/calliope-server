@@ -471,6 +471,18 @@ RP_FMT_PROSE = (
     "- Internal/involuntary thoughts woven into narration or offset with em-dashes\n"
 )
 
+FORMATTER_OUTPUT_CONTRACT = (
+    "\n\nOUTPUT CONTRACT — STRICT:\n"
+    "- Rewrite ONLY the text after the DICTATED INPUT / dictated line marker.\n"
+    "- Do NOT add a lead-in, preamble, aside, compliment, reaction, title, label, "
+    "summary, or commentary.\n"
+    "- Forbidden starts include: 'Sure', 'Of course', 'Here is', 'Here\'s', "
+    "'This is', 'That is', 'Oh,', 'Nice', 'Delicious', and any sentence "
+    "about the quality or content of the scene.\n"
+    "- Do NOT explain what you changed. Do NOT mention the rewrite.\n"
+    "- The first character of your answer must be part of the rewritten message itself."
+)
+
 
 # ─── Persona discovery & loading ─────────────────────────
 def discover_personas() -> list[dict]:
@@ -2182,6 +2194,7 @@ RP_SYSTEM_FORMAT = (
     "- Maintain the speaker's intent and meaning exactly\n"
     "- Do not add content, only format what's given\n"
     "- Output ONLY the formatted text, nothing else"
+    + FORMATTER_OUTPUT_CONTRACT
 )
 
 RP_SYSTEM_ENHANCE = (
@@ -2230,6 +2243,7 @@ RP_SYSTEM_ENHANCE = (
     "- Preserve the speaker's intent, meaning, and all plot points exactly.\n"
     "- Do not add new plot points or characters.\n"
     "- Output ONLY the enhanced rewrite, nothing else."
+    + FORMATTER_OUTPUT_CONTRACT
 )
 
 
@@ -2252,6 +2266,7 @@ GRAMMAR_CLEAN_SYSTEM = (
     "Rewrite the following raw dictated speech with correct punctuation, capitalization, "
     "and sentence structure. Preserve the speaker's exact meaning and word choices; only "
     "fix mechanics. Do not add content. Output only the cleaned text."
+    + FORMATTER_OUTPUT_CONTRACT
 )
 
 DISFLUENCY_CLEAN_SYSTEM = (
@@ -3144,7 +3159,7 @@ DEFAULT_MODES: list[dict] = [
         # disfluency_clean merged into rp_enhance system prompt — see ADR-9 / Agent 3 §10.
         "pipeline": ["whisper", "hallucination_filter", "command_dispatch", "vocab_correct", "rp_enhance"],
         "system_prompt": "",  # empty → use built-in RP_SYSTEM_ENHANCE
-        "temperature": 0.7,
+        "temperature": 0.45,
         "preset": "pyrite",
         "use_persona": True,
         "use_character": True,
@@ -3176,6 +3191,7 @@ DEFAULT_MODES: list[dict] = [
             "Keep the speaker's intent and continuity, but convert first-person actions into clean third-person prose. "
             "Use past tense. Preserve dialogue in quotes when the user dictated spoken words. "
             "Do not continue the scene, do not answer as the character, and do not add new events. Output only the rewrite."
+            + FORMATTER_OUTPUT_CONTRACT
         ),
         "temperature": 0.4,
         "preset": "pyrite",
@@ -3989,6 +4005,7 @@ def _build_persona_pov_prompt(persona: dict, character: dict, chat_context: str,
         f"addressing {character_name}, consistent with the tone of the ongoing chat. "
         f"Do NOT respond as {character_name}. Only polish what was dictated. "
         f"Preserve intent exactly. Output only the rewrite."
+        + FORMATTER_OUTPUT_CONTRACT
     )
     sections.append(
         "Voice tuning examples:\n"

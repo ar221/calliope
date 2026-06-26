@@ -127,6 +127,11 @@ def test_persona_pov_uses_lower_temperature(mod):
     assert mode["temperature"] == 0.4
 
 
+def test_rp_enhance_uses_low_temperature_for_faithful_rewrite(mod):
+    mode = next(m for m in mod.DEFAULT_MODES if m["id"] == "rp_enhance")
+    assert mode["temperature"] == 0.45
+
+
 def test_narrator_past_mode_registered(mod):
     mode = next(m for m in mod.DEFAULT_MODES if m["id"] == "narrator_past")
     assert mode["pipeline"] == [
@@ -145,6 +150,8 @@ def test_persona_pov_prompt_includes_few_shot_tuning(mod):
     )
     assert "Voice tuning examples" in system
     assert "Do not add extra actions" in system
+    assert "OUTPUT CONTRACT" in system
+    assert "Do NOT add a lead-in, preamble" in system
 
 
 def test_persona_pov_prompt_includes_scene_continuity(mod):
@@ -468,6 +475,8 @@ def test_rp_enhance_payload_includes_scene_continuity(monkeypatch, mod):
     user_content = json.dumps(captured["payload"])
     assert "SCENE CONTINUITY" in user_content
     assert "location: hallway" in user_content
+    assert "OUTPUT CONTRACT" in user_content
+    assert "Do NOT add a lead-in, preamble" in user_content
 
 
 def test_build_scene_contract_is_in_memory_and_prompt_ready(mod):
