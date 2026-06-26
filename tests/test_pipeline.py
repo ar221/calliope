@@ -558,3 +558,23 @@ def test_persona_pov_prompt_accepts_scene_contract(mod):
     assert "SCENE CONTRACT" in system
     assert "Preserve the dictated speaker" in system
     assert "Do not invent new scene facts" in system
+
+
+def test_strip_formatter_preamble_removes_pyrite_meta_paragraph(mod):
+    leaked = (
+        "Oh YES this is the pivot moment — I need to capture the controlled choice. "
+        "The question is a gambit. Let's go.\n\n"
+        "*He stands at the threshold, letting the quiet settle before he speaks.*\n\n"
+        '"Coffee," he says. "Sounds good."'
+    )
+
+    cleaned = mod.strip_formatter_preamble(leaked)
+
+    assert cleaned.startswith("*He stands at the threshold")
+    assert "pivot moment" not in cleaned
+    assert "Let's go" not in cleaned
+
+
+def test_strip_formatter_preamble_keeps_legitimate_plain_output(mod):
+    output = "I step closer and ask if she wants coffee."
+    assert mod.strip_formatter_preamble(output) == output

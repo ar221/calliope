@@ -2813,6 +2813,64 @@ class _ThinkingTagFilter:
         return out
 
 
+_FORMATTER_META_PREAMBLE_RE = re.compile(
+    r"\b("
+    r"pivot moment|i need to|need to capture|capture that|"
+    r"let's go|voice drops|watch-adjust|beard-stroke|"
+    r"the .*? question is|raw and unfiltered|prose texture"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_FORMATTER_LEADIN_RE = re.compile(
+    r"^\s*(?:>\s*)?"
+    r"(?:sure|of course|here(?:'s| is)|this is|that is|oh\b|nice\b|delicious\b)",
+    re.IGNORECASE,
+)
+
+
+def strip_formatter_preamble(output: str) -> str:
+    """Drop model meta-commentary before the actual rewritten dictation.
+
+    Pyrite-style formatters sometimes emit chain-of-thought as normal text
+    instead of inside <thinking> tags, e.g. a paragraph analyzing the scene and
+    ending with "Let's go." before the real RP prose. Prompts tell it not to,
+    but the final paste path must be defensive: if the first paragraph looks
+    like formatter commentary and a later paragraph looks like the actual
+    rewrite, return only the rewrite.
+    """
+    text = str(output or "").strip()
+    if not text:
+        return ""
+
+    text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL).strip()
+    if not text:
+        return ""
+
+    # Split on blank lines; SillyTavern/RP rewrites commonly keep paragraph
+    # blocks, and model meta-preambles are usually a separate first paragraph.
+    parts = re.split(r"\n\s*\n", text, maxsplit=1)
+    if len(parts) < 2:
+        return text
+
+    first = parts[0].strip()
+    rest = parts[1].strip()
+    if not rest:
+        return text
+
+    normalized_first = re.sub(r"^\s*>\s?", "", first, flags=re.MULTILINE).strip()
+    rest_lstrip = rest.lstrip()
+    rest_looks_like_rewrite = rest_lstrip.startswith(("*", '"', "“", "'")) or "\n*" in rest
+    first_looks_meta = (
+        _FORMATTER_LEADIN_RE.search(normalized_first) is not None
+        or _FORMATTER_META_PREAMBLE_RE.search(normalized_first) is not None
+    )
+
+    if first_looks_meta and rest_looks_like_rewrite:
+        return rest
+    return text
+
+
 def _parse_sse_delta(provider: str, line_data: str) -> tuple[str, bool]:
     """Parse one SSE `data:` line; return (delta_text, is_done).
 
@@ -3074,10 +3132,9 @@ def format_rp(text: str, mode: int = 1, context: str = "",
             "delta": "",
             "done": True,
         })
-        # Strip any residual thinking-tag fragments the streaming filter
-        # let through (defensive — the filter normally handles them).
-        full_text = re.sub(r"<thinking>.*?</thinking>", "", full_text, flags=re.DOTALL)
-        full_text = full_text.strip()
+        # Strip pyrite thinking tags and any leaked natural-language meta preamble
+        # before returning the canonical final text.
+        full_text = strip_formatter_preamble(full_text)
         if full_text:
             return full_text, False, ""
         if stream_err:
@@ -3096,9 +3153,7 @@ def format_rp(text: str, mode: int = 1, context: str = "",
         with urllib.request.urlopen(req, timeout=FORMATTER_TIMEOUT_SECONDS) as resp:
             data = json.loads(resp.read())
         formatted = formatter_response_text(data)
-        # Strip pyrite thinking tags
-        formatted = re.sub(r"<thinking>.*?</thinking>", "", formatted, flags=re.DOTALL)
-        formatted = formatted.strip()
+        formatted = strip_formatter_preamble(formatted)
         if formatted:
             return formatted, False, ""
         return text, True, "RP proxy returned empty response"
