@@ -102,6 +102,16 @@ def test_extension_message_received_handles_ai_auto_tts_too():
     assert "!m.is_user && !m.is_system" in block
 
 
+def test_extension_unlocks_audio_for_auto_tts_after_user_gesture():
+    src = EXT.read_text(encoding="utf-8")
+    assert "let ttsUnlockedAudioContext = null" in src
+    assert "async function unlockTtsAudio" in src
+    assert "unlockTtsAudio('auto-read-toggle')" in src
+    assert "unlockTtsAudio('settings-auto-read')" in src
+    assert "unlockTtsAudio('page-pointerdown')" in src
+    assert "ttsUnlockedAudioContext.state === 'running'" in src
+
+
 def test_extension_diagnostics_panel_is_redacted_and_layered():
     src = EXT.read_text(encoding="utf-8")
     assert 'id="dbb_ql_diagnostics"' in src

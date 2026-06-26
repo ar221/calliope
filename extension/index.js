@@ -2224,6 +2224,7 @@ let currentTtsBlobUrl = null;
 let currentTtsBtn = null;
 let currentTtsAudioContext = null;
 let currentTtsAudioSource = null;
+let ttsUnlockedAudioContext = null; // kept warm after user gesture for auto-read playback
 let ttsBackendAvailable = null; // null = unknown; true/false after first call
 let ttsBackendNotifiedMissing = false;
 let ttsAutoReadInitDone = false; // gate: don't auto-read on chat-load first messages
@@ -2296,6 +2297,31 @@ async function createAndPlayTtsAudio(blob, onEnded) {
     return audio;
 }
 
+async function unlockTtsAudio(reason = 'gesture') {
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return false;
+    try {
+        if (!ttsUnlockedAudioContext || ttsUnlockedAudioContext.state === 'closed') {
+            ttsUnlockedAudioContext = new AudioCtx();
+        }
+        if (ttsUnlockedAudioContext.state === 'suspended') {
+            await ttsUnlockedAudioContext.resume();
+        }
+        const buffer = ttsUnlockedAudioContext.createBuffer(1, 1, 24000);
+        const source = ttsUnlockedAudioContext.createBufferSource();
+        const gain = ttsUnlockedAudioContext.createGain();
+        gain.gain.value = 0;
+        source.buffer = buffer;
+        source.connect(gain).connect(ttsUnlockedAudioContext.destination);
+        source.start(0);
+        LOG('tts audio unlocked', reason, ttsUnlockedAudioContext.state);
+        return ttsUnlockedAudioContext.state === 'running';
+    } catch (e) {
+        WARN('tts audio unlock failed', reason, e?.message || e);
+        return false;
+    }
+}
+
 async function createAndPlayTtsWebAudio(blob, onEnded, originalError) {
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
     if (!AudioCtx) {
@@ -2303,7 +2329,10 @@ async function createAndPlayTtsWebAudio(blob, onEnded, originalError) {
         err.name = originalError?.name || 'AudioPlaybackError';
         throw err;
     }
-    const ctx = new AudioCtx();
+    const ctx = (ttsUnlockedAudioContext && ttsUnlockedAudioContext.state !== 'closed')
+        ? ttsUnlockedAudioContext
+        : new AudioCtx();
+    ttsUnlockedAudioContext = ctx;
     currentTtsAudioContext = ctx;
     const buffer = await ctx.decodeAudioData(await blob.arrayBuffer());
     const source = ctx.createBufferSource();
@@ -2315,13 +2344,11 @@ async function createAndPlayTtsWebAudio(blob, onEnded, originalError) {
         pause() {
             this.paused = true;
             try { source.stop(); } catch {}
-            try { ctx.close(); } catch {}
         },
     };
     currentTtsAudio = playback;
     source.onended = () => {
         playback.paused = true;
-        try { ctx.close(); } catch {}
         if (currentTtsAudio === playback) onEnded?.();
     };
     if (ctx.state === 'suspended') await ctx.resume();
@@ -2401,7 +2428,9 @@ function paintTtsStreamStatus() {
 
 function cleanupCurrentTtsAudioOnly() {
     try { currentTtsAudioSource?.stop(); } catch {}
-    try { currentTtsAudioContext?.close(); } catch {}
+    if (currentTtsAudioContext && currentTtsAudioContext !== ttsUnlockedAudioContext) {
+        try { currentTtsAudioContext.close(); } catch {}
+    }
     currentTtsAudioSource = null;
     currentTtsAudioContext = null;
     try { currentTtsAudio?.pause?.(); } catch {}
@@ -2796,12 +2825,16 @@ function injectTtsButtonOn(mesEl) {
     btn.dataset.dbbTtsState = 'idle';
     btn.addEventListener('click', (e) => {
         e.stopPropagation();
-        readMessageAloud(mesEl, btn).catch(err => WARN('readMessageAloud', err?.message || err));
+        unlockTtsAudio('message-button').finally(() => {
+            readMessageAloud(mesEl, btn).catch(err => WARN('readMessageAloud', err?.message || err));
+        });
     });
     btn.addEventListener('keydown', (e) => {
         if (e.key === 'Enter' || e.key === ' ') {
             e.preventDefault();
-            readMessageAloud(mesEl, btn).catch(err => WARN('readMessageAloud', err?.message || err));
+            unlockTtsAudio('message-button-keyboard').finally(() => {
+                readMessageAloud(mesEl, btn).catch(err => WARN('readMessageAloud', err?.message || err));
+            });
         }
     });
 
@@ -3099,6 +3132,7 @@ function readLastAiMessage() {
 function toggleAutoReadAi() {
     const s = settings();
     s.ttsAutoReadAi = !s.ttsAutoReadAi;
+    if (s.ttsAutoReadAi) unlockTtsAudio('auto-read-toggle');
     saveSettings();
     // Reflect in settings panel checkbox + quick-launch button.
     const chk = document.getElementById('dictation_bridge_tts_auto_read');
@@ -3283,7 +3317,9 @@ function buildQuickLaunchPanel() {
     wrap.querySelector('#dbb_tts_stop_all')?.addEventListener('click', stopTts);
     wrap.querySelector('#dbb_tts_skip_chunk')?.addEventListener('click', skipCurrentTtsChunk);
     wrap.querySelector('#dbb_tts_pause_resume')?.addEventListener('click', toggleTtsStreamPause);
-    wrap.querySelector('#dbb_tts_reread_last')?.addEventListener('click', readLastAiMessage);
+    wrap.querySelector('#dbb_tts_reread_last')?.addEventListener('click', () => {
+        unlockTtsAudio('quick-reread-last').finally(() => readLastAiMessage());
+    });
 
     paintQuickLaunchAutoReadBtn();
     paintTtsStreamStatus();
@@ -3657,6 +3693,7 @@ function buildSettingsPanel() {
         ttsAutoEl.checked = !!s.ttsAutoReadAi;
         ttsAutoEl.addEventListener('change', () => {
             s.ttsAutoReadAi = !!ttsAutoEl.checked;
+            if (s.ttsAutoReadAi) unlockTtsAudio('settings-auto-read');
             saveSettings();
             try { paintQuickLaunchAutoReadBtn(); } catch {}
         });
@@ -3733,6 +3770,7 @@ function buildSettingsPanel() {
 
     if (ttsTestEl) {
         ttsTestEl.addEventListener('click', async () => {
+            await unlockTtsAudio('test-voice');
             const sample = 'Hello, my name is Calliope. I read for you.';
             const prev = ttsTestEl.textContent;
             ttsTestEl.textContent = 'Testing…';
@@ -4002,6 +4040,10 @@ export async function init() {
     });
     setTtsStreamUiState(settings().ttsReadStreamingPartials && settings().ttsAutoReadAi ? 'watching' : 'off', null);
     setTimeout(() => { if (!ttsAutoReadInitDone) ttsAutoReadInitDone = true; }, 3000);
+
+    // Any user gesture can unlock browser audio for later auto-read playback.
+    document.addEventListener('pointerdown', () => { unlockTtsAudio('page-pointerdown'); }, { once: true, capture: true });
+    document.addEventListener('keydown', () => { unlockTtsAudio('page-keydown'); }, { once: true, capture: true });
 
     LOG('initialized');
 }
