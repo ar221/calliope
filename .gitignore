@@ -30,3 +30,6 @@ ggml-*.bin
 
 # Agent scratch/reports
 .agents/
+
+# Graphify knowledge-graph output (local analysis cache)
+graphify-out/
