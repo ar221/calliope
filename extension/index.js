@@ -3333,6 +3333,11 @@ async function buildDiagnosticsHtml() {
     })();
     const formatter = audit?.summary?.llm || health.data?.formatter || health.data?.provider || 'see /audit/network';
     const whisper = health.data?.whisper || health.data?.whisper_server || health.data?.model || health.data?.asr || 'not reported by /health';
+    const certDays = (typeof health.data?.cert_expires_days === 'number') ? health.data.cert_expires_days : null;
+    const certSeverity = certDays == null ? 'warn' : (certDays < 7 ? 'bad' : (certDays < 30 ? 'warn' : 'ok'));
+    const certDetail = certDays == null
+        ? 'not reported by /health'
+        : `${certDays} day${certDays === 1 ? '' : 's'} remaining · server auto-renews under 7d (restart-free)`;
     const rows = [
         diagnosticsRow('Calliope server', health.ok ? 'reachable' : 'unreachable', health.ok ? `/health HTTP ${health.status} · ${health.ms}ms` : (health.error || `HTTP ${health.status}`), health.ok ? 'ok' : 'bad'),
         diagnosticsRow('Bearer token', tokenState, serverAuthStatus.lastError || (state.ok ? `/state HTTP ${state.status}` : `state probe HTTP ${state.status || 'network'}`), tokenState === 'valid' ? 'ok' : (tokenState === 'missing' || tokenState === 'invalid' ? 'bad' : 'warn')),
@@ -3340,6 +3345,7 @@ async function buildDiagnosticsHtml() {
         diagnosticsRow('ST state freshness', stateAge == null ? 'unknown' : (stateAge <= 60 ? 'fresh' : 'stale'), stateAge == null ? 'no local state post recorded' : `last local /state payload ${stateAge}s ago`, stateAge != null && stateAge <= 60 ? 'ok' : 'warn'),
         diagnosticsRow('Whisper', health.ok ? 'reported' : 'unknown', typeof whisper === 'string' ? whisper : JSON.stringify(whisper).slice(0, 160), health.ok ? 'ok' : 'warn'),
         diagnosticsRow('Kokoro', voices.ok ? 'available' : 'unavailable', voices.ok ? `/tts/voices HTTP ${voices.status}` : (voices.error || `HTTP ${voices.status}`), voices.ok ? 'ok' : 'bad'),
+        diagnosticsRow('TLS cert', certDays == null ? 'unknown' : (certDays < 7 ? 'expiring' : 'valid'), certDetail, certSeverity),
         diagnosticsRow('Formatter/audit', audit?.error ? 'limited' : 'available', audit?.error || String(formatter).slice(0, 180), audit?.warning ? 'bad' : (audit?.error ? 'warn' : 'ok')),
     ].join('');
     return `<div class="dictation-bridge-modal" id="${DIAGNOSTICS_ID}" style="z-index:10002">

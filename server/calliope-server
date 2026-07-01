@@ -1073,6 +1073,12 @@ class ContextBuilder:
 # ─── SSL cert generation ─────────────────────────────────
 CERT_RENEW_THRESHOLD_DAYS = 7   # auto-regenerate if less than this remaining
 CERT_WARN_THRESHOLD_DAYS = 30   # log a warning below this
+CERT_RENEW_CHECK_INTERVAL_SECONDS = 12 * 3600  # in-run periodic cert check
+
+# Set at bootstrap to the live SSLContext so the in-run renewal thread can
+# hot-reload the cert chain for new TLS handshakes without a full restart.
+_ssl_context: "ssl.SSLContext | None" = None
+_cert_renew_thread: "threading.Thread | None" = None
 
 CERT_FINGERPRINT_FILE = DATA_DIR / "cert.fingerprint"
 CERT_VALIDITY_DAYS = 90  # was 3650 — see ADR-7 / Agent 5 §7.
@@ -1214,6 +1220,73 @@ def ensure_ssl_cert():
         log.warning(f"SSL cert expires in {days} days — consider regenerating soon")
     else:
         log.info(f"SSL cert valid for {days} more days")
+
+
+def _reload_ssl_context_cert() -> bool:
+    """Hot-reload the cert chain into the live SSLContext.
+
+    ``SSLContext.load_cert_chain`` can be re-called on a running context; new
+    TLS handshakes pick up the fresh cert while existing connections keep the
+    old one until they close. Returns True on success. No-op (False) when the
+    context was never registered (e.g. --no-ssl) or reload fails.
+    """
+    ctx = _ssl_context
+    if ctx is None:
+        return False
+    try:
+        ctx.load_cert_chain(str(CERT_FILE), str(KEY_FILE))
+        log.info("Reloaded regenerated cert into live SSLContext (new handshakes only)")
+        return True
+    except Exception as e:
+        log.warning(f"Could not hot-reload cert into live SSLContext: {e}")
+        return False
+
+
+def _check_and_renew_cert() -> bool:
+    """One in-run cert renewal check. Returns True if the cert was renewed.
+
+    Regenerates when fewer than CERT_RENEW_THRESHOLD_DAYS remain and hot-reloads
+    the live SSLContext so a long-running server does not cross expiry between
+    restarts. Separated from the loop so tests can drive it directly.
+    """
+    days = cert_days_remaining()
+    if days is None:
+        log.warning("In-run cert check: could not determine cert expiry — skipping")
+        return False
+    if days >= CERT_RENEW_THRESHOLD_DAYS:
+        if days < CERT_WARN_THRESHOLD_DAYS:
+            log.info(f"In-run cert check: {days} days remaining")
+        return False
+    log.warning(f"In-run cert check: cert expires in {days} days — regenerating")
+    ensure_ssl_cert()
+    if not _reload_ssl_context_cert():
+        log.warning("Regenerated cert on disk but could not hot-reload it — "
+                    "restart the dictation-server to serve the new cert")
+    return True
+
+
+def _cert_renew_loop() -> None:
+    """Daemon loop: periodically renew the cert in-run. Never raises out."""
+    while True:
+        time.sleep(CERT_RENEW_CHECK_INTERVAL_SECONDS)
+        try:
+            _check_and_renew_cert()
+        except Exception as e:  # pragma: no cover - defensive
+            log.warning(f"In-run cert renewal loop error: {e}")
+
+
+def _start_cert_renew_thread() -> None:
+    """Start the in-run cert renewal daemon thread once. Idempotent."""
+    global _cert_renew_thread
+    if _cert_renew_thread is not None and _cert_renew_thread.is_alive():
+        return
+    t = threading.Thread(
+        target=_cert_renew_loop,
+        name="cert-inrun-renewal",
+        daemon=True,
+    )
+    t.start()
+    _cert_renew_thread = t
 
 
 # ─── Auth: bearer token + loopback bypass + CORS allowlist ─
@@ -10860,6 +10933,11 @@ def main():
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(str(CERT_FILE), str(KEY_FILE))
         server.socket = ctx.wrap_socket(server.socket, server_side=True)
+        # Register the live context so the in-run renewal thread can hot-reload
+        # a regenerated cert without a restart, then start that thread.
+        global _ssl_context
+        _ssl_context = ctx
+        _start_cert_renew_thread()
         proto = "https"
     else:
         proto = "http"
