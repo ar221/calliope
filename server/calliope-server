@@ -170,9 +170,40 @@ CLAUDE_RP_MODEL = os.environ.get(
 OPENAI_PROXY_URL = os.environ.get("DICTATION_OPENAI_PROXY_URL", "http://127.0.0.1:10531/v1")
 OPENAI_RP_MODEL = os.environ.get("DICTATION_OPENAI_RP_MODEL", "gpt-5.4")
 OPENAI_CLEAN_MODEL = os.environ.get("DICTATION_OPENAI_CLEAN_MODEL", "gpt-5.4-mini")
-DEFAULT_FORMATTER_PROVIDER = os.environ.get("DICTATION_FORMATTER_PROVIDER", "openai").strip().lower()
-if DEFAULT_FORMATTER_PROVIDER not in {"claude", "openai"}:
-    DEFAULT_FORMATTER_PROVIDER = "claude"
+
+# ─── OmniRoute provider (OpenAI-compatible aggregator) ─────
+# Local aggregator that fronts the user's paid subs (Claude Code, Codex,
+# Kimi Code, Super Grok, Nous Portal, NanoGPT) behind one OpenAI-shape
+# endpoint. Speaks /v1/chat/completions, so it reuses the "openai" wire
+# format. Distinct provider id keeps routing/audit legible and lets it
+# carry a tiered *fallback chain* instead of a single model: a model that
+# is transiently un-credentialed ("No credentials for provider: X") or
+# errors is skipped and the next tier is tried, so a single expired sub
+# never blocks dictation.
+OMNIROUTE_PROXY_URL = os.environ.get("DICTATION_OMNIROUTE_URL", "http://127.0.0.1:20128/v1")
+
+
+def _parse_model_chain(raw: str, default: list[str]) -> list[str]:
+    """Parse a comma-separated model chain env override; fall back to default."""
+    items = [m.strip() for m in (raw or "").split(",") if m.strip()]
+    return items or list(default)
+
+
+# RP/enhance chain (creative-quality first). Live-verified 2026-07-01.
+OMNIROUTE_RP_CHAIN = _parse_model_chain(
+    os.environ.get("DICTATION_OMNIROUTE_RP_CHAIN", ""),
+    ["claude/claude-opus-4-8", "codex/gpt-5.5", "claude/claude-sonnet-4-6", "nous/x-ai/grok-4.3"],
+)
+# Cleanup/grammar chain (cheaper + faster first).
+OMNIROUTE_CLEAN_CHAIN = _parse_model_chain(
+    os.environ.get("DICTATION_OMNIROUTE_CLEAN_CHAIN", ""),
+    ["codex/gpt-5.4", "claude/claude-sonnet-4-6"],
+)
+
+_VALID_PROVIDERS = {"claude", "openai", "omniroute"}
+DEFAULT_FORMATTER_PROVIDER = os.environ.get("DICTATION_FORMATTER_PROVIDER", "omniroute").strip().lower()
+if DEFAULT_FORMATTER_PROVIDER not in _VALID_PROVIDERS:
+    DEFAULT_FORMATTER_PROVIDER = "omniroute"
 DEFAULT_MODEL = "large-v3-turbo"
 TRANSCRIPT_CONTEXT_LIMIT = 3000  # max chars of transcript to include in RP+ prompt
 PERSONAS_DIR = Path(os.environ.get("DICTATION_PERSONAS_DIR", Path.home() / "STWork/personas"))
@@ -2441,21 +2472,31 @@ DISFLUENCY_CLEAN_SYSTEM = (
 
 def normalize_formatter_provider(provider: str | None) -> str:
     provider = (provider or DEFAULT_FORMATTER_PROVIDER).strip().lower()
-    return provider if provider in {"claude", "openai"} else DEFAULT_FORMATTER_PROVIDER
+    return provider if provider in _VALID_PROVIDERS else DEFAULT_FORMATTER_PROVIDER
+
+
+def _is_openai_shape(provider: str) -> bool:
+    """OmniRoute and the OpenAI proxy both speak /v1/chat/completions."""
+    return normalize_formatter_provider(provider) in {"openai", "omniroute"}
 
 
 def formatter_base_url(provider: str) -> str:
     provider = normalize_formatter_provider(provider)
-    base = OPENAI_PROXY_URL if provider == "openai" else CLAUDE_PROXY_URL
+    if provider == "omniroute":
+        base = OMNIROUTE_PROXY_URL
+    elif provider == "openai":
+        base = OPENAI_PROXY_URL
+    else:
+        base = CLAUDE_PROXY_URL
     base = base.strip().rstrip("/")
-    if provider == "openai" and base.endswith("/v1"):
+    if _is_openai_shape(provider) and base.endswith("/v1"):
         base = base[:-3]
     return base
 
 
 def formatter_health_url(provider: str) -> str:
     base = formatter_base_url(provider)
-    if normalize_formatter_provider(provider) == "openai":
+    if _is_openai_shape(provider):
         return f"{base}/v1/models"
     return f"{base}/health"
 
@@ -2463,7 +2504,7 @@ def formatter_health_url(provider: str) -> str:
 def formatter_request_url(provider: str, endpoint_override: str = "") -> str:
     provider = normalize_formatter_provider(provider)
     base = formatter_base_url(provider)
-    if provider == "openai":
+    if _is_openai_shape(provider):
         return f"{base}/v1/chat/completions"
     endpoint = endpoint_override or "/v1/messages"
     return f"{base}{endpoint}"
@@ -2471,9 +2512,22 @@ def formatter_request_url(provider: str, endpoint_override: str = "") -> str:
 
 def formatter_model(provider: str, *, cleanup: bool = False) -> str:
     provider = normalize_formatter_provider(provider)
+    if provider == "omniroute":
+        chain = OMNIROUTE_CLEAN_CHAIN if cleanup else OMNIROUTE_RP_CHAIN
+        return chain[0] if chain else CLAUDE_RP_MODEL
     if provider == "openai":
         return OPENAI_CLEAN_MODEL if cleanup else OPENAI_RP_MODEL
     return DISFLUENCY_CLEAN_MODEL if cleanup else CLAUDE_RP_MODEL
+
+
+def formatter_model_chain(provider: str, *, cleanup: bool = False) -> list[str]:
+    """Ordered model fallback chain for a provider. Non-omniroute providers
+    have a single-element chain (their one configured model)."""
+    provider = normalize_formatter_provider(provider)
+    if provider == "omniroute":
+        chain = OMNIROUTE_CLEAN_CHAIN if cleanup else OMNIROUTE_RP_CHAIN
+        return list(chain) if chain else [CLAUDE_RP_MODEL]
+    return [formatter_model(provider, cleanup=cleanup)]
 
 
 def formatter_payload(
@@ -2486,7 +2540,7 @@ def formatter_payload(
     temperature: float | None,
 ) -> dict:
     provider = normalize_formatter_provider(provider)
-    if provider == "openai":
+    if _is_openai_shape(provider):
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -2553,6 +2607,41 @@ def formatter_response_text(data: dict) -> str:
     return ""
 
 
+def formatter_error_text(data: dict) -> str:
+    """Extract an error message from an OpenAI/OmniRoute-shape error body."""
+    err = data.get("error") if isinstance(data, dict) else None
+    if isinstance(err, dict):
+        return str(err.get("message") or err.get("code") or "")
+    if isinstance(err, str):
+        return err
+    return ""
+
+
+# Substrings that mark a model as un-usable *right now* but worth skipping to
+# the next chain tier (transient/credential/routing issues), rather than a
+# hard failure of the whole request.
+_CHAIN_SKIP_MARKERS = (
+    "no credentials",
+    "not found",
+    "does not exist",
+    "unavailable",
+    "not available",
+    "no such model",
+    "insufficient",
+    "unauthorized",
+    "forbidden",
+    "rate limit",
+    "overloaded",
+    "capacity",
+)
+
+
+def _is_chain_skippable_error(message: str) -> bool:
+    """True if an error should skip to the next model in the chain."""
+    m = (message or "").lower()
+    return any(marker in m for marker in _CHAIN_SKIP_MARKERS)
+
+
 def probe_formatter(provider: str, timeout: float = 2.0) -> tuple[bool, str]:
     try:
         req = urllib.request.Request(formatter_health_url(provider), method="GET")
@@ -2584,41 +2673,62 @@ def disfluency_clean(text: str, provider: str = DEFAULT_FORMATTER_PROVIDER) -> t
         log.info("disfluency_clean: %s formatter unreachable — passing through raw", provider)
         return text, False, f"cleanup proxy unreachable ({provider})"
 
-    payload = json.dumps(
-        formatter_payload(
-            provider,
-            system_prompt=DISFLUENCY_CLEAN_SYSTEM,
-            user_content=text,
-            model=formatter_model(provider, cleanup=True),
-            max_tokens=max(512, len(text) * 2),
-            temperature=0.0,
-        )
-    ).encode()
+    request_url = formatter_request_url(provider)
+    chain = formatter_model_chain(provider, cleanup=True)
+    last_reason = "cleanup failed"
 
-    try:
-        req = urllib.request.Request(
-            formatter_request_url(provider),
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=DISFLUENCY_CLEAN_TIMEOUT) as resp:
-            data = json.loads(resp.read())
-        cleaned = formatter_response_text(data)
-        if not cleaned:
-            return text, False, "cleanup returned empty"
-        # Safety: if cleanup output is drastically shorter (<40% of input by word count)
-        # we're likely looking at a truncation or the model dropping content — fall back.
-        if len(cleaned.split()) < max(3, word_count * 0.4):
-            log.warning(
-                "disfluency_clean: output suspiciously short "
-                f"({len(cleaned.split())} words vs {word_count}) — falling back to raw"
+    for idx, model in enumerate(chain):
+        has_next = idx + 1 < len(chain)
+        payload = json.dumps(
+            formatter_payload(
+                provider,
+                system_prompt=DISFLUENCY_CLEAN_SYSTEM,
+                user_content=text,
+                model=model,
+                max_tokens=max(512, len(text) * 2),
+                temperature=0.0,
             )
-            return text, False, "cleanup output too short, possible truncation"
-        return cleaned, True, ""
-    except Exception as e:
-        log.info(f"disfluency_clean: failed ({e}) — passing through raw")
-        return text, False, f"cleanup failed: {e}"
+        ).encode()
+        try:
+            req = urllib.request.Request(
+                request_url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=DISFLUENCY_CLEAN_TIMEOUT) as resp:
+                data = json.loads(resp.read())
+            err_msg = formatter_error_text(data)
+            if err_msg:
+                if has_next and _is_chain_skippable_error(err_msg):
+                    last_reason = f"cleanup failed: {err_msg}"
+                    continue
+                return text, False, f"cleanup failed: {err_msg}"
+            cleaned = formatter_response_text(data)
+            if not cleaned:
+                last_reason = "cleanup returned empty"
+                if has_next:
+                    continue
+                return text, False, last_reason
+            # Safety: if cleanup output is drastically shorter (<40% of input by
+            # word count) we're likely looking at a truncation or the model
+            # dropping content — fall back to raw.
+            if len(cleaned.split()) < max(3, word_count * 0.4):
+                log.warning(
+                    "disfluency_clean: output suspiciously short "
+                    f"({len(cleaned.split())} words vs {word_count}) — falling back to raw"
+                )
+                return text, False, "cleanup output too short, possible truncation"
+            return cleaned, True, ""
+        except Exception as e:
+            msg = str(e)
+            if has_next and _is_chain_skippable_error(msg):
+                last_reason = f"cleanup failed: {msg}"
+                continue
+            log.info(f"disfluency_clean: failed ({e}) — passing through raw")
+            return text, False, f"cleanup failed: {e}"
+
+    return text, False, last_reason
 
 
 # ─── Phase 3: Per-character mode memory ──────────────────
@@ -3244,73 +3354,94 @@ def format_rp(text: str, mode: int = 1, context: str = "",
 
         user_content += f"[YOUR DICTATED INPUT — rewrite ONLY this, in the persona's voice, addressing the character above:]\n{text}"
 
-    payload_obj = formatter_payload(
-        provider,
-        system_prompt=system_prompt,
-        user_content=user_content,
-        model=formatter_model(provider),
-        max_tokens=4096,
-        temperature=temperature,
-    )
-    if request_id:
-        payload_obj["stream"] = True
-    payload = json.dumps(payload_obj).encode()
-
     request_url = formatter_request_url(provider, endpoint)
+    # Ordered model chain. Single-element for claude/openai; multi-tier for
+    # omniroute so a transiently un-credentialed model skips to the next.
+    chain = formatter_model_chain(provider)
+    last_reason = "RP formatting failed"
 
-    if request_id:
-        # MVP-13: streaming path. Forward each visible (post-thinking-filter)
-        # delta to the SSE bus as a `dictation-token` event so the ST
-        # extension can paint #send_textarea token-by-token. The buffered
-        # full text is still returned to the caller, which emits the final
-        # `dictation-result` (source of truth — the extension overwrites
-        # the streamed buffer with that, preventing drift).
-        def _emit(delta_text: str) -> None:
-            broadcast_event("dictation-token", {
-                "requestId": request_id,
-                "delta": delta_text,
-                "done": False,
-            })
-
-        full_text, stream_err = _stream_formatter(
-            request_url, payload, provider, _emit,
-            timeout=FORMATTER_TIMEOUT_SECONDS,
+    for idx, model in enumerate(chain):
+        payload_obj = formatter_payload(
+            provider,
+            system_prompt=system_prompt,
+            user_content=user_content,
+            model=model,
+            max_tokens=4096,
+            temperature=temperature,
         )
-        # Always emit a final done marker, even on partial-stream errors,
-        # so the ST extension can flip out of streaming-state.
-        broadcast_event("dictation-token", {
-            "requestId": request_id,
-            "delta": "",
-            "done": True,
-        })
-        # Strip pyrite thinking tags and any leaked natural-language meta preamble
-        # before returning the canonical final text.
-        full_text = strip_formatter_preamble(full_text)
-        if full_text:
-            return full_text, False, ""
-        if stream_err:
-            log.warning("RP streaming failed: %s", stream_err)
-            return text, True, f"RP streaming failed: {stream_err}"
-        return text, True, "RP proxy returned empty stream"
+        if request_id:
+            payload_obj["stream"] = True
+        payload = json.dumps(payload_obj).encode()
+        has_next = idx + 1 < len(chain)
 
-    # Legacy non-streaming path.
-    try:
-        req = urllib.request.Request(
-            request_url,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=FORMATTER_TIMEOUT_SECONDS) as resp:
-            data = json.loads(resp.read())
-        formatted = formatter_response_text(data)
-        formatted = strip_formatter_preamble(formatted)
-        if formatted:
-            return formatted, False, ""
-        return text, True, "RP proxy returned empty response"
-    except Exception as e:
-        log.warning(f"RP formatting failed: {e}")
-        return text, True, f"RP formatting failed: {e}"
+        if request_id:
+            # MVP-13: streaming path. Forward each visible (post-thinking-filter)
+            # delta to the SSE bus as a `dictation-token` event so the ST
+            # extension can paint #send_textarea token-by-token. The buffered
+            # full text is still returned to the caller, which emits the final
+            # `dictation-result` (source of truth — the extension overwrites
+            # the streamed buffer with that, preventing drift).
+            def _emit(delta_text: str) -> None:
+                broadcast_event("dictation-token", {
+                    "requestId": request_id,
+                    "delta": delta_text,
+                    "done": False,
+                })
+
+            full_text, stream_err = _stream_formatter(
+                request_url, payload, provider, _emit,
+                timeout=FORMATTER_TIMEOUT_SECONDS,
+            )
+            full_text = strip_formatter_preamble(full_text)
+            if full_text:
+                broadcast_event("dictation-token", {"requestId": request_id, "delta": "", "done": True})
+                return full_text, False, ""
+            # Skip to the next chain tier on a credential/routing error, but
+            # only if we have not already streamed visible tokens to the UI.
+            if stream_err and has_next and _is_chain_skippable_error(stream_err):
+                log.warning("RP model '%s' skipped (%s) — trying next tier", model, stream_err)
+                last_reason = f"RP streaming failed: {stream_err}"
+                continue
+            broadcast_event("dictation-token", {"requestId": request_id, "delta": "", "done": True})
+            if stream_err:
+                log.warning("RP streaming failed: %s", stream_err)
+                return text, True, f"RP streaming failed: {stream_err}"
+            return text, True, "RP proxy returned empty stream"
+
+        # Non-streaming path.
+        try:
+            req = urllib.request.Request(
+                request_url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=FORMATTER_TIMEOUT_SECONDS) as resp:
+                data = json.loads(resp.read())
+            err_msg = formatter_error_text(data)
+            if err_msg:
+                if has_next and _is_chain_skippable_error(err_msg):
+                    log.warning("RP model '%s' skipped (%s) — trying next tier", model, err_msg)
+                    last_reason = f"RP formatting failed: {err_msg}"
+                    continue
+                return text, True, f"RP formatting failed: {err_msg}"
+            formatted = strip_formatter_preamble(formatter_response_text(data))
+            if formatted:
+                return formatted, False, ""
+            last_reason = "RP proxy returned empty response"
+            if has_next:
+                continue
+            return text, True, last_reason
+        except Exception as e:
+            msg = str(e)
+            if has_next and _is_chain_skippable_error(msg):
+                log.warning("RP model '%s' skipped (%s) — trying next tier", model, msg)
+                last_reason = f"RP formatting failed: {msg}"
+                continue
+            log.warning(f"RP formatting failed: {e}")
+            return text, True, f"RP formatting failed: {e}"
+
+    return text, True, last_reason
 
 
 # ─── Phase 2: Modes system ───────────────────────────────
@@ -8798,7 +8929,8 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             days = cert_days_remaining()
             payload = {
                 "status": "ok",
-                "providers": ["claude", "openai"],
+                "providers": sorted(_VALID_PROVIDERS),
+                "default_provider": DEFAULT_FORMATTER_PROVIDER,
                 "mode_count": len(load_modes()),
             }
             if days is not None:
@@ -10932,7 +11064,9 @@ def main():
         f"Config format: {'YAML' if _HAVE_YAML else 'JSON (PyYAML unavailable)'} | "
         f"modes: {len(initial_modes)} ({', '.join(m.get('id','') for m in initial_modes)}) | "
         f"vocab entries: {len(load_vocab())} | "
-        f"formatters: claude={CLAUDE_PROXY_URL}, openai={OPENAI_PROXY_URL}, default={DEFAULT_FORMATTER_PROVIDER}"
+        f"formatters: claude={CLAUDE_PROXY_URL}, openai={OPENAI_PROXY_URL}, "
+        f"omniroute={OMNIROUTE_PROXY_URL}, default={DEFAULT_FORMATTER_PROVIDER} | "
+        f"omni-rp-chain=[{', '.join(OMNIROUTE_RP_CHAIN)}]"
     )
 
     # Mint or load the bearer token before binding the socket.
