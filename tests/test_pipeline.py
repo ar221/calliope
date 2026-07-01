@@ -142,6 +142,17 @@ def test_narrator_past_mode_registered(mod):
     assert "third-person past-tense" in mode["system_prompt"]
 
 
+def test_narrator_present_mode_registered(mod):
+    mode = next(m for m in mod.DEFAULT_MODES if m["id"] == "narrator_present")
+    assert mode["pipeline"] == [
+        "whisper", "hallucination_filter", "command_dispatch",
+        "vocab_correct", "disfluency_clean", "rp_enhance",
+    ]
+    assert mode["temperature"] == 0.4
+    assert "third-person present-tense" in mode["system_prompt"]
+    assert "present tense" in mode["system_prompt"].lower()
+
+
 def test_persona_pov_prompt_includes_few_shot_tuning(mod):
     system, _ = mod._build_persona_pov_prompt(
         {"name": "Ayaz", "description": "Direct, intense."},

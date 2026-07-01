@@ -3334,6 +3334,26 @@ DEFAULT_MODES: list[dict] = [
         "use_rules": False,
     },
     {
+        "id": "narrator_present",
+        "label": "Narrator Present",
+        "icon": "book-open",
+        "whisper_model": DEFAULT_MODEL,
+        "pipeline": ["whisper", "hallucination_filter", "command_dispatch", "vocab_correct", "disfluency_clean", "rp_enhance"],
+        "system_prompt": (
+            "Rewrite dictated speech into third-person present-tense narration for the current SillyTavern scene. "
+            "Keep the speaker's intent and continuity, but convert first-person actions into clean third-person prose. "
+            "Use present tense. Preserve dialogue in quotes when the user dictated spoken words. "
+            "Do not continue the scene, do not answer as the character, and do not add new events. Output only the rewrite."
+            + FORMATTER_OUTPUT_CONTRACT
+        ),
+        "temperature": 0.4,
+        "preset": "pyrite",
+        "use_persona": True,
+        "use_character": True,
+        "use_chat_context": True,
+        "use_rules": False,
+    },
+    {
         # POL-1 — pure command mode. No vocab/format steps; whisper output
         # is fed straight to the regex dispatcher. Useful as a phone-side
         # "voice cockpit" mode that always emits an SSE command + drops the
