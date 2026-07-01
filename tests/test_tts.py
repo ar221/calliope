@@ -112,6 +112,15 @@ def test_extension_unlocks_audio_for_auto_tts_after_user_gesture():
     assert "ttsUnlockedAudioContext.state === 'running'" in src
 
 
+def test_extension_html_audio_play_has_timeout_fallback():
+    src = EXT.read_text(encoding="utf-8")
+    assert "const TTS_AUDIO_PLAY_TIMEOUT_MS = 3000" in src
+    assert "async function playHtmlAudioWithTimeout" in src
+    assert "err.name = 'AudioPlayTimeout'" in src
+    assert "await playHtmlAudioWithTimeout(audio)" in src
+    assert "return await createAndPlayTtsWebAudio(audioBlob, onEnded, e)" in src
+
+
 def test_extension_chunks_long_tts_requests_before_server_limit():
     src = EXT.read_text(encoding="utf-8")
     assert "const TTS_REQUEST_MAX_CHARS = 4800" in src

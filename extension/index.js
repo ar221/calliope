@@ -2238,6 +2238,7 @@ const TTS_STREAM_MIN_CHARS = 48;
 const TTS_STREAM_FORCE_CHARS = 260;
 const TTS_STREAM_PREVIEW_CHARS = 72;
 const TTS_REQUEST_MAX_CHARS = 4800; // server hard limit is 5000; keep request headroom
+const TTS_AUDIO_PLAY_TIMEOUT_MS = 3000; // browser play() can hang behind autoplay policy
 let ttsStreamUiState = { state: 'off', queueCount: 0, preview: '', paused: false };
 
 function ttsAudioErrorDetails(audio, blob) {
@@ -2274,6 +2275,26 @@ function waitForTtsAudioReady(audio, blob) {
     });
 }
 
+async function playHtmlAudioWithTimeout(audio, timeoutMs = TTS_AUDIO_PLAY_TIMEOUT_MS) {
+    let timer = null;
+    try {
+        const playPromise = audio.play();
+        if (!playPromise || typeof playPromise.then !== 'function') return;
+        await Promise.race([
+            playPromise,
+            new Promise((_, reject) => {
+                timer = setTimeout(() => {
+                    const err = new Error('audio_play_timeout');
+                    err.name = 'AudioPlayTimeout';
+                    reject(err);
+                }, timeoutMs);
+            }),
+        ]);
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+}
+
 async function createAndPlayTtsAudio(blob, onEnded) {
     const audioBlob = normalizeTtsBlob(blob);
     currentTtsBlobUrl = URL.createObjectURL(audioBlob);
@@ -2287,7 +2308,7 @@ async function createAndPlayTtsAudio(blob, onEnded) {
     });
     try {
         await waitForTtsAudioReady(audio, audioBlob);
-        await audio.play();
+        await playHtmlAudioWithTimeout(audio);
     } catch (e) {
         WARN('html audio playback failed; trying WebAudio fallback', e?.message || e, ttsAudioErrorDetails(audio, audioBlob));
         try { audio.pause(); } catch {}
