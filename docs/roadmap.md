@@ -10,7 +10,7 @@ Status date: 2026-06-26.
 - ST state broadcast to Calliope: active chat, character/group, persona, last AI message, scene continuity, and mode.
 - Phone follow mode for fresh ST state.
 - Persistent whisper.cpp HTTP daemon on `127.0.0.1:9001` with fallback paths.
-- Formatter modes: `plain`, `grammar_clean`, `rp_format`, `rp_enhance`, `persona_pov`, `narrator_past`, `command`.
+- Formatter modes: `plain`, `grammar_clean`, `rp_format`, `rp_enhance`, `persona_pov`, `narrator_past`, `narrator_present`, `command`.
 - SSE events for state, raw transcript preview, formatter tokens, final result, edits, and voice commands.
 - Privacy badge and `/audit/network` external-destination audit.
 - Token-bearing URL log redaction.
