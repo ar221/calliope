@@ -2475,6 +2475,45 @@ def normalize_formatter_provider(provider: str | None) -> str:
     return provider if provider in _VALID_PROVIDERS else DEFAULT_FORMATTER_PROVIDER
 
 
+# ─── Model attribution ─────────────────────────────────────
+# The formatter chain can fall through several models per request. We record
+# which model actually produced the final text in a thread-local slot so the
+# server thread handling this request can surface it in `dictation-result`
+# without threading a new return value through every format_rp/run_pipeline
+# caller. The HTTP server is threaded, so thread-local state is request-safe.
+_attribution = threading.local()
+
+
+def reset_model_attribution() -> None:
+    """Clear the per-request attribution slot at the start of a pipeline run."""
+    _attribution.provider = ""
+    _attribution.model = ""
+    _attribution.fallback = False
+    _attribution.tier = 0
+
+
+def record_model_attribution(provider: str, model: str, *, tier: int) -> None:
+    """Record the model that produced the final formatted text.
+
+    tier is the 0-based index into the model chain; tier > 0 means one or more
+    earlier models were skipped (fallback occurred).
+    """
+    _attribution.provider = provider
+    _attribution.model = model
+    _attribution.tier = tier
+    _attribution.fallback = tier > 0
+
+
+def get_model_attribution() -> dict:
+    """Return the last-recorded attribution for this thread (safe defaults)."""
+    return {
+        "provider": getattr(_attribution, "provider", ""),
+        "model": getattr(_attribution, "model", ""),
+        "fallback": getattr(_attribution, "fallback", False),
+        "tier": getattr(_attribution, "tier", 0),
+    }
+
+
 def _is_openai_shape(provider: str) -> bool:
     """OmniRoute and the OpenAI proxy both speak /v1/chat/completions."""
     return normalize_formatter_provider(provider) in {"openai", "omniroute"}
@@ -2719,6 +2758,7 @@ def disfluency_clean(text: str, provider: str = DEFAULT_FORMATTER_PROVIDER) -> t
                     f"({len(cleaned.split())} words vs {word_count}) — falling back to raw"
                 )
                 return text, False, "cleanup output too short, possible truncation"
+            record_model_attribution(provider, model, tier=idx)
             return cleaned, True, ""
         except Exception as e:
             msg = str(e)
@@ -3395,6 +3435,7 @@ def format_rp(text: str, mode: int = 1, context: str = "",
             full_text = strip_formatter_preamble(full_text)
             if full_text:
                 broadcast_event("dictation-token", {"requestId": request_id, "delta": "", "done": True})
+                record_model_attribution(provider, model, tier=idx)
                 return full_text, False, ""
             # Skip to the next chain tier on a credential/routing error, but
             # only if we have not already streamed visible tokens to the UI.
@@ -3427,6 +3468,7 @@ def format_rp(text: str, mode: int = 1, context: str = "",
                 return text, True, f"RP formatting failed: {err_msg}"
             formatted = strip_formatter_preamble(formatter_response_text(data))
             if formatted:
+                record_model_attribution(provider, model, tier=idx)
                 return formatted, False, ""
             last_reason = "RP proxy returned empty response"
             if has_next:
@@ -4481,6 +4523,10 @@ def run_pipeline(text: str, mode: dict,
 
     out = text
     provider = normalize_formatter_provider(provider)
+    # Fresh attribution slot for this pipeline run. A formatter/cleanup step
+    # records the winning model into it; steps that never call the LLM leave
+    # it empty (plain mode, or a pure vocab/hallucination pass).
+    reset_model_attribution()
     if scene_contract is None:
         scene_contract = build_scene_contract(
             snapshot_state(),
@@ -9238,6 +9284,9 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 "mode": str(body.get("mode", "")),
                 "formatting_skipped": bool(body.get("formatting_skipped", False)),
                 "formatting_reason": str(body.get("formatting_reason", "")),
+                "model": str(body.get("model", "")),
+                "model_fallback": bool(body.get("model_fallback", False)),
+                "model_tier": int(body.get("model_tier", 0) or 0),
                 "auto_send": bool(body.get("auto_send", False)),
                 "ts": time.time(),
             }
@@ -9709,6 +9758,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             transcript_count = len(session_transcript)
 
         repair_trace = build_repair_trace(text, cleaned_text, formatted)
+        attribution = get_model_attribution()
         self.send_json({
             "text": formatted,
             "raw": text,
@@ -9719,6 +9769,9 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             "transcript_count": transcript_count,
             "formatting_skipped": formatting_skipped,
             "formatting_reason": formatting_reason,
+            "model": attribution["model"],
+            "model_fallback": attribution["fallback"],
+            "model_tier": attribution["tier"],
             "entry_id": result_entry_id,
             "chat_id": chat_id_tag,
         })
@@ -9949,6 +10002,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 transcript_count = len(session_transcript)
 
             repair_trace = build_repair_trace(raw_text, cleaned_text, output_text)
+            attribution = get_model_attribution()
 
             # MVP-13: emit canonical `dictation-result` after streaming. The
             # ST extension overwrites whatever it accumulated from
@@ -9964,6 +10018,9 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                     "provider": provider,
                     "formatting_skipped": formatting_skipped,
                     "formatting_reason": formatting_reason,
+                    "model": attribution["model"],
+                    "model_fallback": attribution["fallback"],
+                    "model_tier": attribution["tier"],
                     "auto_send": False,
                     "ts": time.time(),
                 })
@@ -10017,6 +10074,9 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 "transcript_count": transcript_count,
                 "formatting_skipped": formatting_skipped,
                 "formatting_reason": formatting_reason,
+                "model": attribution["model"],
+                "model_fallback": attribution["fallback"],
+                "model_tier": attribution["tier"],
                 "chat_id": chat_id_for_entry or "",
                 # MVP-9: per-word confidences from whisper-server JSON output.
                 # Empty when subprocess fallback ran or response carried no

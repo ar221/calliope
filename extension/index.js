@@ -474,6 +474,20 @@ let stateBarSession = null;       // { requestId, lastState }
 let stateBarHideTimer = null;
 let stateBarObserver = null;
 let lastDoneMode = '';            // remembered from dictation-result for "Done · <mode>"
+let lastDoneModel = '';           // winning formatter model slug (OmniRoute chain attribution)
+let lastModelFallback = false;    // true when an earlier chain tier was skipped
+
+// Shorten an OmniRoute model slug for compact display: "claude/claude-opus-4-8"
+// -> "opus-4-8"; "codex/gpt-5.5" -> "gpt-5.5". Provider prefix and duplicated
+// vendor stem are dropped; falls back to the raw slug if the shape is unknown.
+function shortModelLabel(slug) {
+    if (!slug || typeof slug !== 'string') return '';
+    let s = slug.trim();
+    const slash = s.lastIndexOf('/');
+    if (slash >= 0) s = s.slice(slash + 1);
+    s = s.replace(/^claude-/, '');
+    return s;
+}
 let prefersReducedMotion = false;
 try { prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch {}
 
@@ -592,6 +606,10 @@ function paintStateBar(state, details) {
     let labelOut = labelText;
     if (state === 'done' && lastDoneMode) {
         labelOut = `${labelText} · ${lastDoneMode}`;
+        if (lastDoneModel) {
+            const short = shortModelLabel(lastDoneModel);
+            labelOut += lastModelFallback ? ` · ↳${short}` : ` · ${short}`;
+        }
     }
     label.textContent = labelOut;
     detail.textContent = details ? String(details).slice(0, 140) : '';
@@ -1428,6 +1446,10 @@ function connectSSE() {
         // MVP-16: remember the mode for "Done · <mode>" labelling on the
         // state bar's terminal frame.
         if (data.mode && typeof data.mode === 'string') lastDoneMode = data.mode;
+        // Model attribution — which formatter model won the chain (and whether
+        // an earlier tier was skipped). Surfaces on the "Done" bar + Diagnostics.
+        if (typeof data.model === 'string') lastDoneModel = data.model;
+        lastModelFallback = !!data.model_fallback;
         const cfg = settings();
         // Per-event auto_send overrides setting when explicitly true; otherwise setting applies.
         const doAutoSend = data.auto_send === true ? true : !!cfg.autoSend;
@@ -1912,6 +1934,8 @@ function onWindowMessage(event) {
         case 'dictation-result': {
             const text = String(data.text ?? '');
             if (!text) { WARN('dictation-result had empty text'); return; }
+            if (typeof data.model === 'string') lastDoneModel = data.model;
+            lastModelFallback = !!data.model_fallback;
             const cfg = settings();
             writeToTextarea(text, { autoSend: cfg.autoSend, appendMode: cfg.appendMode });
             if (cfg.autoSend) setTimeout(() => maybeReadDictatedPersonaText(text), 200);
@@ -3332,6 +3356,13 @@ async function buildDiagnosticsHtml() {
         return tokenStatusLabel();
     })();
     const formatter = audit?.summary?.llm || health.data?.formatter || health.data?.provider || 'see /audit/network';
+    const defaultProvider = health.data?.default_provider || '';
+    // Last-used model attribution (from the most recent dictation-result).
+    const lastModel = lastDoneModel ? shortModelLabel(lastDoneModel) : '';
+    const modelState = lastModel ? (lastModelFallback ? 'fallback' : 'primary') : (defaultProvider || 'unknown');
+    const modelDetail = lastModel
+        ? `last: ${lastModel}${lastModelFallback ? ' (chain fell through)' : ''}${defaultProvider ? ` · default provider ${defaultProvider}` : ''}`
+        : (defaultProvider ? `default provider ${defaultProvider} · no dictation yet this session` : 'no attribution yet');
     const whisper = health.data?.whisper || health.data?.whisper_server || health.data?.model || health.data?.asr || 'not reported by /health';
     const certDays = (typeof health.data?.cert_expires_days === 'number') ? health.data.cert_expires_days : null;
     const certSeverity = certDays == null ? 'warn' : (certDays < 7 ? 'bad' : (certDays < 30 ? 'warn' : 'ok'));
@@ -3347,6 +3378,7 @@ async function buildDiagnosticsHtml() {
         diagnosticsRow('Kokoro', voices.ok ? 'available' : 'unavailable', voices.ok ? `/tts/voices HTTP ${voices.status}` : (voices.error || `HTTP ${voices.status}`), voices.ok ? 'ok' : 'bad'),
         diagnosticsRow('TLS cert', certDays == null ? 'unknown' : (certDays < 7 ? 'expiring' : 'valid'), certDetail, certSeverity),
         diagnosticsRow('Formatter/audit', audit?.error ? 'limited' : 'available', audit?.error || String(formatter).slice(0, 180), audit?.warning ? 'bad' : (audit?.error ? 'warn' : 'ok')),
+        diagnosticsRow('Formatter model', modelState, modelDetail, lastModel ? (lastModelFallback ? 'warn' : 'ok') : 'neutral'),
     ].join('');
     return `<div class="dictation-bridge-modal" id="${DIAGNOSTICS_ID}" style="z-index:10002">
         <div class="dictation-bridge-backdrop"></div>
