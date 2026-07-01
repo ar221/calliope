@@ -2134,6 +2134,84 @@ def _suggest_voices(
     return [{"voice": vid, "score": round(sc, 2), "reason": rsn} for sc, vid, rsn in scored[:n]]
 
 
+def _autocast_voices(
+    members: list[dict],
+    existing_voices: dict[str, str],
+    narrator: str,
+    overwrite: bool = False,
+) -> dict:
+    """Assign a distinct Kokoro voice to each group member in one pass.
+
+    `members` is an ordered list of {name, description?, personality?,
+    recent_messages?} dicts. Assignment is greedy: each member's top
+    suggestion is chosen while accumulating already-picked voices into the
+    used set, so the per-member used-voice penalty in `_suggest_voices`
+    steers the cast toward distinct voices. When distinct voices run out
+    (more members than catalog entries) it falls back to the best-scoring
+    voice even if reused, so every member still gets a voice.
+
+    `overwrite=False` preserves any name already present in
+    `existing_voices`; `overwrite=True` reassigns every member.
+
+    Returns {assignments: {name: voice}, assigned: [...], skipped: [...],
+    reused: [...]} where names are echoed as provided (caller owns
+    normalization for storage).
+    """
+    catalog = _load_voice_catalog()
+    assignments: dict[str, str] = {}
+    assigned: list[dict] = []
+    skipped: list[str] = []
+    reused: list[str] = []
+
+    # Seed the used set from existing profiles + narrator so the cast avoids
+    # colliding with voices the user already locked in.
+    used: set[str] = {v for v in existing_voices.values() if v}
+    if narrator:
+        used.add(narrator)
+
+    existing_lower = {str(k).strip().lower() for k in existing_voices}
+
+    for member in members:
+        name = str(member.get("name") or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if not overwrite and key in existing_lower:
+            skipped.append(name)
+            continue
+        if not catalog:
+            continue
+
+        description = str(member.get("description") or "")
+        personality = str(member.get("personality") or "")
+        recent = member.get("recent_messages")
+        recent = [str(m) for m in (recent if isinstance(recent, list) else [])]
+
+        # Pass the running used-set as existing_voices so distinct voices win.
+        ranked = _suggest_voices(
+            name, description, personality, recent,
+            {f"_used_{i}": v for i, v in enumerate(used)}, narrator, n=len(catalog),
+        )
+        if not ranked:
+            continue
+
+        # Prefer the top unused suggestion; fall back to the top pick overall.
+        pick = next((r for r in ranked if r["voice"] not in used), ranked[0])
+        voice = pick["voice"]
+        if voice in used:
+            reused.append(name)
+        used.add(voice)
+        assignments[name] = voice
+        assigned.append({"name": name, "voice": voice, "reason": pick.get("reason", "")})
+
+    return {
+        "assignments": assignments,
+        "assigned": assigned,
+        "skipped": skipped,
+        "reused": reused,
+    }
+
+
 def transcribe(audio_path: Path, model: str = DEFAULT_MODEL, use_gpu: bool = True,
                prompt: str = "", language: str = "en") -> str:
     """Run whisper STT against `audio_path` and return cleaned text.
@@ -9014,6 +9092,8 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             self._handle_tts_audiobook()
         elif path == "/tts/voices/suggest":
             self._handle_tts_voices_suggest()
+        elif path == "/tts/voices/autocast":
+            self._handle_tts_voices_autocast()
         else:
             self.send_response(404)
             self.end_headers()
@@ -9167,6 +9247,41 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         n = min(max(int(body.get("n") or 3), 1), 10)
         suggestions = _suggest_voices(name, description, personality, recent, existing, narrator, n)
         self.send_json({"suggestions": suggestions})
+
+    def _handle_tts_voices_autocast(self) -> None:
+        """POST /tts/voices/autocast — assign distinct voices to a whole cast.
+
+        Body: {members: [{name, description?, personality?, recent_messages?}],
+               existing_voices?, narrator?, overwrite?}
+        Returns: {assignments: {name: voice}, assigned, skipped, reused}
+        The client owns persistence: it merges `assignments` into its stored
+        name->voice profile map. This endpoint is stateless.
+        """
+        try:
+            body = self.read_json_body()
+        except Exception:
+            self.send_error_json("Invalid JSON", code="bad_json", status=400)
+            return
+        if not isinstance(body, dict):
+            self.send_error_json("Body must be an object", code="bad_json", status=400)
+            return
+        raw_members = body.get("members")
+        if not isinstance(raw_members, list) or not raw_members:
+            self.send_error_json("Missing 'members' list", code="missing_param", status=400)
+            return
+        members: list[dict] = []
+        for m in raw_members[:64]:  # bound cast size defensively
+            if isinstance(m, dict) and str(m.get("name") or "").strip():
+                members.append(m)
+        if not members:
+            self.send_error_json("No named members provided", code="missing_param", status=400)
+            return
+        existing = body.get("existing_voices")
+        existing = existing if isinstance(existing, dict) else {}
+        narrator = str(body.get("narrator") or "")
+        overwrite = bool(body.get("overwrite"))
+        result = _autocast_voices(members, existing, narrator, overwrite=overwrite)
+        self.send_json(result)
 
     def _handle_vocab_add(self):
         """POST /vocab — append a vocab entry, persist atomically, return full list."""

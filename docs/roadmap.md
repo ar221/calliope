@@ -20,6 +20,7 @@ Status date: 2026-06-26.
 - POL-17 first slice: in-RAM Raw → Cleaned → Final repair trace in phone UI and result payloads; explicit “Accept as vocab” is the only persistence path.
 - MVP-26 first slice: request-scoped in-memory scene contract injected into RP+ and Persona POV prompts; no persistent scene DB.
 - MVP-27 first slice: deterministic local RP eval harness with synthetic fixtures for intent/addressee/privacy/expansion checks.
+- WOW-2 group cast voicing: one-click `Auto-cast group` assigns a distinct Kokoro voice to every group member via the stateless `POST /tts/voices/autocast` endpoint (greedy distinct-voice pick reusing the `_suggest_voices` heuristic), plus an editable name→voice roster (per-row Sample/Remove) in the ST settings panel. Client owns persistence into `ttsVoiceProfiles`; server stays stateless.
 
 ## Release-hardening queue
 

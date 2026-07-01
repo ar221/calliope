@@ -442,3 +442,67 @@ def test_combine_wav_segments_rejects_incompatible_formats(mod):
     second = _wav_bytes(b"\x02\x00" * 10, rate=16000)
     with pytest.raises(ValueError, match="incompatible"):
         mod._combine_wav_segments([first, second])
+
+
+# ─── WOW-2: auto-cast distinct voices across a group ────────
+
+
+def test_autocast_assigns_distinct_voices_to_each_member(mod):
+    members = [
+        {"name": "Alice", "description": "a woman, she is a warm gentle lady"},
+        {"name": "Bob", "description": "a man, he is a gruff rough soldier"},
+        {"name": "Cora", "description": "a girl, she is a bright cheerful female"},
+    ]
+    result = mod._autocast_voices(members, {}, "af_heart", overwrite=False)
+    assignments = result["assignments"]
+    assert set(assignments) == {"Alice", "Bob", "Cora"}
+    # Distinct voices when catalog is larger than the cast.
+    assert len(set(assignments.values())) == 3
+    # Narrator voice is avoided.
+    assert "af_heart" not in assignments.values()
+    assert result["reused"] == []
+
+
+def test_autocast_skips_existing_profiles_without_overwrite(mod):
+    members = [{"name": "Alice", "description": "she a woman"},
+               {"name": "Bob", "description": "he a man"}]
+    existing = {"alice": "af_bella"}
+    result = mod._autocast_voices(members, existing, "af_heart", overwrite=False)
+    assert "Alice" in result["skipped"]
+    assert "Alice" not in result["assignments"]
+    assert "Bob" in result["assignments"]
+    # Bob must not collide with the locked-in Alice voice.
+    assert result["assignments"]["Bob"] != "af_bella"
+
+
+def test_autocast_overwrite_reassigns_existing(mod):
+    members = [{"name": "Alice", "description": "she a woman"}]
+    existing = {"alice": "af_bella"}
+    result = mod._autocast_voices(members, existing, "", overwrite=True)
+    assert "Alice" in result["assignments"]
+    assert result["skipped"] == []
+
+
+def test_autocast_reuses_when_cast_exceeds_catalog(mod):
+    catalog = mod._load_voice_catalog()
+    n = len(catalog) + 2
+    members = [{"name": f"Char{i}", "description": "a person"} for i in range(n)]
+    result = mod._autocast_voices(members, {}, "", overwrite=False)
+    # Everyone still gets a voice even past the distinct-voice budget.
+    assert len(result["assignments"]) == n
+    assert len(result["reused"]) >= 2
+
+
+def test_autocast_ignores_unnamed_members(mod):
+    members = [{"name": "Alice", "description": "she a woman"},
+               {"name": "   ", "description": "blank"},
+               {"description": "no name key"}]
+    result = mod._autocast_voices(members, {}, "", overwrite=False)
+    assert set(result["assignments"]) == {"Alice"}
+
+
+def test_extension_has_group_autocast_button_and_handler():
+    src = EXT.read_text(encoding="utf-8")
+    assert "/tts/voices/autocast" in src
+    assert "dictation_bridge_tts_autocast" in src
+    assert "async function fetchVoiceAutocast" in src

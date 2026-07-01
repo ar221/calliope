@@ -2240,6 +2240,7 @@ const TTS_STREAM_PREVIEW_CHARS = 72;
 const TTS_REQUEST_MAX_CHARS = 4800; // server hard limit is 5000; keep request headroom
 const TTS_AUDIO_PLAY_TIMEOUT_MS = 3000; // browser play() can hang behind autoplay policy
 let ttsStreamUiState = { state: 'off', queueCount: 0, preview: '', paused: false };
+let repaintTtsRoster = null; // set by settings panel; called on group/chat switch
 
 function ttsAudioErrorDetails(audio, blob) {
     const err = audio?.error;
@@ -2723,6 +2724,51 @@ function buildVoiceSuggestPayload() {
         narrator: s.ttsVoice || 'af_heart',
         n: 3,
     };
+}
+
+async function fetchVoiceAutocast(payload) {
+    const cfg = settings();
+    const url = `${cfg.serverUrl.replace(/\/+$/, '')}/tts/voices/autocast`;
+    const res = await fetch(url, {
+        method: 'POST',
+        mode: 'cors',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+        let detail = '';
+        try { detail = (await res.json())?.error || ''; } catch {}
+        const err = new Error(detail || `voice_autocast_http_${res.status}`);
+        err.status = res.status;
+        throw err;
+    }
+    return await res.json();
+}
+
+/**
+ * WOW-2: gather the current group cast as autocast member payloads.
+ * Each member carries card description/personality (when the card is loaded
+ * in ST) so the server heuristic has signal. Returns [] outside a group.
+ */
+function buildAutocastMembers() {
+    if (!selected_group) return [];
+    const group = groups?.find(g => g.id == selected_group) || null;
+    const names = resolveGroupMembers(group);
+    const seen = new Set();
+    const members = [];
+    for (const name of names) {
+        const key = normalizeVoiceProfileKey(name);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        const card = (characters || []).find(c => c?.name === name) || null;
+        members.push({
+            name,
+            description: card?.description || '',
+            personality: card?.personality || '',
+        });
+    }
+    return members;
 }
 
 async function fetchAudiobookExport(payload) {
@@ -3628,6 +3674,19 @@ function buildSettingsPanel() {
                             <small class="notes" style="margin:0 0 0 4px">Top 3 voices based on character card + recent dialogue.</small>
                         </div>
                         <div id="dictation_bridge_tts_suggestion_panel" style="display:none;margin-top:6px;border:1px solid rgba(201,178,139,0.2);border-radius:3px;padding:6px 8px;background:rgba(0,0,0,0.2)"></div>
+
+                        <div id="dictation_bridge_tts_cast_card" style="border:1px solid rgba(196,167,231,0.25);border-radius:3px;padding:8px;margin:6px 0 0 0;background:rgba(0,0,0,0.18)">
+                            <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:4px">
+                                <strong style="color:#C4A7E7">Cast voices</strong>
+                                <span id="dictation_bridge_tts_cast_count" style="font-size:11px;color:#98876F"></span>
+                            </div>
+                            <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0 0 4px 0">
+                                <button id="dictation_bridge_tts_autocast" type="button" class="menu_button" title="Assign a distinct voice to every group member in one pass" style="padding:3px 10px;font-size:12px;border:1px solid rgba(196,167,231,0.45);background:rgba(196,167,231,0.08);color:#C4A7E7;border-radius:2px;cursor:pointer">Auto-cast group</button>
+                                <label style="display:inline-flex;align-items:center;gap:4px;font-size:11px;color:#98876F;cursor:pointer"><input id="dictation_bridge_tts_autocast_overwrite" type="checkbox" /> Overwrite existing</label>
+                            </div>
+                            <small class="notes" style="margin:0">Distinct Kokoro voice per group member. Reuses the narrator plus any voices you already locked in. Roster below is editable.</small>
+                            <div id="dictation_bridge_tts_roster" style="margin-top:6px"></div>
+                        </div>
                     </div>
 
                     <small class="notes">
@@ -3756,6 +3815,10 @@ function buildSettingsPanel() {
     const ttsSuggestEl = host.querySelector('#dictation_bridge_tts_suggest');
     const ttsSuggestionPanelEl = host.querySelector('#dictation_bridge_tts_suggestion_panel');
     const ttsProfileHintEl = host.querySelector('#dictation_bridge_tts_profile_hint');
+    const ttsAutocastEl = host.querySelector('#dictation_bridge_tts_autocast');
+    const ttsAutocastOverwriteEl = host.querySelector('#dictation_bridge_tts_autocast_overwrite');
+    const ttsRosterEl = host.querySelector('#dictation_bridge_tts_roster');
+    const ttsCastCountEl = host.querySelector('#dictation_bridge_tts_cast_count');
 
     const paintTtsProfileHint = () => {
         if (!ttsProfileHintEl) return;
@@ -3767,6 +3830,75 @@ function buildSettingsPanel() {
         ttsProfileHintEl.innerHTML = name
             ? `Voice profile for <strong>${escapeHtml(name)}</strong>: <code>${escapeHtml(voice)}</code>. Change picker or Save target to update only this character/addressee.`
             : 'Voices populate from <code>/tts/voices</code>. Change picker to set the global fallback voice.';
+    };
+
+    // WOW-2: render the editable name->voice roster and the group-cast controls.
+    const paintTtsRoster = () => {
+        if (!ttsRosterEl) return;
+        const s2 = settings();
+        const profiles = s2.ttsVoiceProfiles || {};
+        const inGroup = !!selected_group;
+        const memberKeys = new Set(buildAutocastMembers().map(m => normalizeVoiceProfileKey(m.name)));
+        if (ttsAutocastEl) {
+            ttsAutocastEl.disabled = !inGroup;
+            ttsAutocastEl.style.opacity = inGroup ? '1' : '0.5';
+            ttsAutocastEl.style.cursor = inGroup ? 'pointer' : 'not-allowed';
+            ttsAutocastEl.title = inGroup
+                ? 'Assign a distinct voice to every group member in one pass'
+                : 'Open a group chat to auto-cast voices';
+        }
+        const entries = Object.entries(profiles).filter(([k, v]) => k && v);
+        if (ttsCastCountEl) {
+            ttsCastCountEl.textContent = inGroup
+                ? `${memberKeys.size} in cast · ${entries.length} saved`
+                : `${entries.length} saved`;
+        }
+        if (!entries.length) {
+            ttsRosterEl.innerHTML = '<small class="notes" style="margin:0;color:#98876F">No saved voice profiles yet. Auto-cast a group or Save target above.</small>';
+            return;
+        }
+        entries.sort((a, b) => a[0].localeCompare(b[0]));
+        ttsRosterEl.innerHTML = entries.map(([key, v]) => {
+            const inCast = memberKeys.has(key);
+            return `<div style="display:flex;align-items:center;gap:6px;padding:3px 0;border-bottom:1px solid rgba(196,167,231,0.1)">
+                <span style="min-width:90px;font-size:12px;color:${inCast ? '#C4A7E7' : '#98876F'}">${escapeHtml(key)}${inCast ? ' •' : ''}</span>
+                <code style="color:#C9B28B;font-size:11px;flex:1">${escapeHtml(v)}</code>
+                <button data-voice="${escapeHtml(v)}" class="calliope-roster-sample menu_button" style="padding:2px 7px;font-size:11px;border:1px solid rgba(201,178,139,0.35);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Sample</button>
+                <button data-key="${escapeHtml(key)}" class="calliope-roster-remove menu_button" style="padding:2px 7px;font-size:11px;border:1px solid rgba(255,90,78,0.4);background:transparent;color:#FF8274;border-radius:2px;cursor:pointer">Remove</button>
+            </div>`;
+        }).join('');
+        ttsRosterEl.querySelectorAll('.calliope-roster-sample').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                const voice = btn.getAttribute('data-voice');
+                const prevLabel = btn.textContent;
+                btn.textContent = '…';
+                btn.setAttribute('disabled', 'disabled');
+                try {
+                    await unlockTtsAudio('roster-sample');
+                    const blob = await fetchTts('Hello. My voice is ready for your story.', voice);
+                    stopTts();
+                    await createAndPlayTtsAudio(blob, () => {});
+                } catch (e) {
+                    toast('error', `Sample failed: ${e?.message || 'unknown'}`);
+                } finally {
+                    btn.textContent = prevLabel;
+                    btn.removeAttribute('disabled');
+                }
+            });
+        });
+        ttsRosterEl.querySelectorAll('.calliope-roster-remove').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const key = btn.getAttribute('data-key');
+                const s3 = settings();
+                if (key && s3.ttsVoiceProfiles?.[key]) {
+                    delete s3.ttsVoiceProfiles[key];
+                    saveSettings();
+                    paintTtsRoster();
+                    paintTtsProfileHint();
+                    toast('info', `Removed voice profile for ${key}`);
+                }
+            });
+        });
     };
 
     if (ttsAutoEl) {
@@ -3984,6 +4116,57 @@ function buildSettingsPanel() {
         });
     }
 
+    // WOW-2: one-click distinct-voice cast for the active group.
+    if (ttsAutocastEl) {
+        paintTtsRoster();
+        repaintTtsRoster = paintTtsRoster;
+        ttsAutocastEl.addEventListener('click', async () => {
+            if (!selected_group) {
+                toast('info', 'Open a group chat to auto-cast voices');
+                return;
+            }
+            const members = buildAutocastMembers();
+            if (!members.length) {
+                toast('info', 'No group members resolved to cast');
+                return;
+            }
+            const prev = ttsAutocastEl.textContent;
+            ttsAutocastEl.textContent = 'Casting…';
+            ttsAutocastEl.setAttribute('disabled', 'disabled');
+            try {
+                const s2 = settings();
+                const result = await fetchVoiceAutocast({
+                    members,
+                    existing_voices: s2.ttsVoiceProfiles || {},
+                    narrator: s2.ttsVoice || 'af_heart',
+                    overwrite: !!ttsAutocastOverwriteEl?.checked,
+                });
+                const assignments = result?.assignments || {};
+                const names = Object.keys(assignments);
+                if (!names.length) {
+                    toast('info', result?.skipped?.length
+                        ? 'All members already have voices (enable Overwrite to reassign)'
+                        : 'No voices assigned — voice catalog may be empty');
+                } else {
+                    if (!s2.ttsVoiceProfiles || typeof s2.ttsVoiceProfiles !== 'object') s2.ttsVoiceProfiles = {};
+                    for (const [name, voice] of Object.entries(assignments)) {
+                        s2.ttsVoiceProfiles[normalizeVoiceProfileKey(name)] = voice;
+                    }
+                    saveSettings();
+                    paintTtsRoster();
+                    paintTtsProfileHint();
+                    const reused = result?.reused?.length ? ` (${result.reused.length} reused voice)` : '';
+                    toast('success', `Cast ${names.length} voice${names.length === 1 ? '' : 's'}${reused}`);
+                }
+            } catch (e) {
+                toast('error', `Auto-cast failed: ${e?.message || 'unknown'}`);
+            } finally {
+                ttsAutocastEl.textContent = prev;
+                ttsAutocastEl.removeAttribute('disabled');
+            }
+        });
+    }
+
     // POL-6: paint addressee picker now (in case ST is already in a group
     // chat when the panel mounts) and on every state-payload event.
     renderAddresseePicker();
@@ -4047,6 +4230,8 @@ export async function init() {
             // POL-6: chat/character switches may flip group status — repaint
             // the addressee picker (no-op when not in a group).
             try { renderAddresseePicker(); } catch (e) { WARN('addressee repaint failed', e?.message || e); }
+            // WOW-2: group switch changes the cast — refresh the roster if open.
+            try { if (repaintTtsRoster) repaintTtsRoster(); } catch (e) { WARN('roster repaint failed', e?.message || e); }
         });
     }
     startStateHeartbeat();
