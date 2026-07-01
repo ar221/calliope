@@ -5116,6 +5116,24 @@ WEB_UI = r"""<!DOCTYPE html>
     border-color: var(--primary);
   }
 
+  /* Model attribution caption under the result box. */
+  .result-meta {
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--text-dim);
+    letter-spacing: .02em;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .result-meta .model-chip {
+    color: var(--primary);
+    font-variant-numeric: tabular-nums;
+  }
+  .result-meta .model-chip.fallback {
+    color: var(--warning, #FFB648);
+  }
+
   .result-actions {
     display: flex;
     gap: 8px;
@@ -6201,6 +6219,7 @@ WEB_UI = r"""<!DOCTYPE html>
       <div id="repairStages" style="display:flex;flex-direction:column;gap:6px"></div>
     </div>
     <textarea class="result-box" id="resultText" rows="6" spellcheck="true" placeholder="Transcription appears here. Edit it, then copy."></textarea>
+    <div class="result-meta" id="resultMeta" style="display:none"></div>
     <div class="result-actions">
       <button class="btn" onclick="clearResult()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
@@ -7264,7 +7283,8 @@ async function sendAudio() {
                               repair_trace: data.repair_trace || null,
                               mode: lastUsedMode,
                               formatting_skipped: !!data.formatting_skipped,
-                              formatting_reason: data.formatting_reason || '' });
+                              formatting_reason: data.formatting_reason || '',
+                              model: data.model || '', model_fallback: !!data.model_fallback });
 
       // Regen is useful any time we have raw text to re-run through formatting,
       // and especially critical when enhancement refused or proxy was offline.
@@ -7332,7 +7352,8 @@ async function regenerate() {
                               repair_trace: data.repair_trace || null,
                               mode: resolvedMode,
                               formatting_skipped: !!data.formatting_skipped,
-                              formatting_reason: data.formatting_reason || '' });
+                              formatting_reason: data.formatting_reason || '',
+                              model: data.model || '', model_fallback: !!data.model_fallback });
       if (data.formatting_skipped) {
         showToast('⚠ ' + (data.formatting_reason || 'Formatting skipped — raw text shown'), 5000);
         flashRawBadge();
@@ -7358,6 +7379,22 @@ function showResult(text, meta) {
   label.textContent = 'Tap to record';
   lastRepairTrace = (meta && meta.repair_trace && meta.repair_trace.persistence === 'in_ram_only')
     ? meta.repair_trace : null;
+
+  // Model attribution caption: which formatter model produced this text, and
+  // whether the OmniRoute chain fell through to a fallback tier.
+  const resultMeta = document.getElementById('resultMeta');
+  if (resultMeta) {
+    const model = meta && meta.model ? shortModelLabel(meta.model) : '';
+    if (model && !(meta && meta.formatting_skipped)) {
+      const fb = meta && meta.model_fallback;
+      resultMeta.innerHTML = 'via <span class="model-chip' + (fb ? ' fallback' : '') + '">'
+        + (fb ? '↳ ' : '') + escapeHtml(model) + '</span>'
+        + (fb ? ' <span style="opacity:.7">(chain fell through)</span>' : '');
+      resultMeta.style.display = '';
+    } else {
+      resultMeta.style.display = 'none';
+    }
+  }
 
   // Phase 1: populate Raw / Cleaned accordion rows when different from formatted text.
   const rows = document.getElementById('resultRows');
@@ -7433,6 +7470,8 @@ function clearResult() {
   lastRawText = '';
   const rows = document.getElementById('resultRows');
   if (rows) rows.style.display = 'none';
+  const resultMeta = document.getElementById('resultMeta');
+  if (resultMeta) resultMeta.style.display = 'none';
   lastRepairTrace = null;
   renderRepairTrace();
 }
@@ -7441,6 +7480,16 @@ function escapeHtml(s) {
   return String(s || '').replace(/[&<>"']/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }[c]));
+}
+
+// Shorten an OmniRoute model slug for compact display:
+// "claude/claude-opus-4-8" -> "opus-4-8"; "codex/gpt-5.5" -> "gpt-5.5".
+function shortModelLabel(slug) {
+  if (!slug || typeof slug !== 'string') return '';
+  let s = slug.trim();
+  const slash = s.lastIndexOf('/');
+  if (slash >= 0) s = s.slice(slash + 1);
+  return s.replace(/^claude-/, '');
 }
 
 function repairStageLabel(stage) {
