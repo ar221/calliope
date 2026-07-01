@@ -3535,6 +3535,19 @@ def load_modes() -> list[dict]:
             if not modes:
                 log.warning(f"{MODES_FILE} is empty or contained no valid modes; falling back to defaults")
                 modes = [dict(m) for m in DEFAULT_MODES]
+            else:
+                # Upgrade path: surface newly shipped built-in modes that a
+                # pre-existing modes file predates, without clobbering the
+                # user's customizations of existing modes. Missing defaults
+                # are appended in DEFAULT_MODES order.
+                present = {m.get("id") for m in modes}
+                added = [dict(d) for d in DEFAULT_MODES if d["id"] not in present]
+                if added:
+                    log.info(
+                        "Merged %d new built-in mode(s) into %s: %s",
+                        len(added), MODES_FILE, ", ".join(d["id"] for d in added),
+                    )
+                    modes.extend(_normalize_mode(dict(d)) for d in added)
         except Exception as e:
             log.warning(f"Failed to parse {MODES_FILE}: {e} — falling back to defaults")
             modes = [dict(m) for m in DEFAULT_MODES]

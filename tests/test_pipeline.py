@@ -589,3 +589,48 @@ def test_strip_formatter_preamble_removes_pyrite_meta_paragraph(mod):
 def test_strip_formatter_preamble_keeps_legitimate_plain_output(mod):
     output = "I step closer and ask if she wants coffee."
     assert mod.strip_formatter_preamble(output) == output
+
+
+def _load_isolated_server(tmp_path, monkeypatch):
+    """Load a fresh server module bound to an isolated CALLIOPE_DATA_DIR."""
+    import uuid
+    monkeypatch.setenv("CALLIOPE_DATA_DIR", str(tmp_path))
+    name = f"calliope_server_modes_{uuid.uuid4().hex}"
+    loader = SourceFileLoader(name, str(SRC))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_load_modes_merges_new_builtin_into_legacy_file(tmp_path, monkeypatch):
+    """A pre-existing modes file that predates a new built-in mode should still
+    surface that mode, while preserving the user's customizations."""
+    m = _load_isolated_server(tmp_path, monkeypatch)
+    # Build a legacy modes file: all defaults EXCEPT narrator_present, with a
+    # customized rp_enhance (simulating the user's real edits).
+    legacy = [dict(d) for d in m.DEFAULT_MODES if d["id"] != "narrator_present"]
+    for mode in legacy:
+        if mode["id"] == "rp_enhance":
+            mode["temperature"] = 0.99  # user customization
+    m._atomic_write(m.MODES_FILE, m._serialize_config(legacy))
+    m._modes_cache["data"] = None  # bust cache
+
+    loaded = m.load_modes()
+    ids = [x["id"] for x in loaded]
+    assert "narrator_present" in ids, "new built-in mode must be merged in"
+    # Customization preserved, not overwritten by default merge.
+    rp = next(x for x in loaded if x["id"] == "rp_enhance")
+    assert rp["temperature"] == 0.99
+    # No duplicates.
+    assert len(ids) == len(set(ids))
+
+
+def test_load_modes_does_not_duplicate_when_file_current(tmp_path, monkeypatch):
+    m = _load_isolated_server(tmp_path, monkeypatch)
+    m._atomic_write(m.MODES_FILE, m._serialize_config([dict(d) for d in m.DEFAULT_MODES]))
+    m._modes_cache["data"] = None
+    loaded = m.load_modes()
+    ids = [x["id"] for x in loaded]
+    assert ids.count("narrator_present") == 1
+    assert len(ids) == len(m.DEFAULT_MODES)
