@@ -106,6 +106,7 @@ Under `~/.local/share/dictation-server/` by default. Set `CALLIOPE_DATA_DIR` for
 - `modes.yaml` — pipeline mode definitions.
 - `char-modes.yaml` — remembered mode choices.
 - voice macro/profile files as created by the TTS/profile UI.
+- `calliope_server/` + `voice_catalog.json` — installed by `scripts/install-server`; the wrapper searches for the package next to itself first, then here.
 
 ## Pairing and state freshness
 

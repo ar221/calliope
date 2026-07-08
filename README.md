@@ -91,12 +91,16 @@ curl -L -o ~/.local/share/whisper/ggml-large-v3-turbo.bin \
   https://huggingface.co/ggml-org/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin
 ```
 
-**4. Install Calliope.** Until the AUR / pipx packages publish, drop the
-single-file server onto your PATH:
+**4. Install Calliope.** Until the AUR / pipx packages publish, install the
+server from the checkout:
 
 ```bash
-install -m 755 server/calliope-server ~/.local/bin/dictation-server
+scripts/install-server
 ```
+
+This puts the executable wrapper at `~/.local/bin/dictation-server` and the
+`calliope_server/` package (plus `voice_catalog.json`) under
+`~/.local/share/dictation-server/`, where the wrapper finds it at runtime.
 
 (AUR `calliope-git` and pipx packaging via `calliope-dictation` are tracked in
 [the roadmap](docs/roadmap.md); neither channel is published yet.)

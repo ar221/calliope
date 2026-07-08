@@ -17,7 +17,7 @@ Local-first voice dictation server for SillyTavern. Hold-to-talk audio is transc
 - `docs/` — roadmap, guides; `tests/` — pytest suite.
 
 ## Entrypoint
-- Install server: `install -m 755 server/calliope-server ~/.local/bin/dictation-server`
+- Install server: `scripts/install-server` (wrapper → `~/.local/bin/dictation-server`, package + voice catalog → `~/.local/share/dictation-server/`)
 - First run wizard: `dictation-server --setup` (probes audio, picks model, gen cert+token, installs unit, self-test).
 - Tests: `pytest` (see `.pytest_cache`, `.ruff_cache` present).
 
