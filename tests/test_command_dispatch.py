@@ -152,7 +152,7 @@ def test_voice_macros_override(mod, tmp_path, monkeypatch):
         "    args_after: hint\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(mod, "VOICE_MACROS_FILE", macros_path)
+    monkeypatch.setattr(mod.config, "VOICE_MACROS_FILE", macros_path)
     mod._invalidate_voice_macros_cache()
     try:
         residual, cmd = mod.command_dispatch("agent: punt")

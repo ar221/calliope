@@ -37,7 +37,7 @@ def _inject_vocab(monkeypatch, mod, entries):
         norm = mod._normalize_vocab_entry(e)
         if norm:
             normalized.append(norm)
-    monkeypatch.setattr(mod, "load_vocab", lambda: normalized)
+    monkeypatch.setattr(mod.formatter, "load_vocab", lambda: normalized)
 
 
 # ─── Empirical regression corpus (Agent 3 §6) ────────────────────────
@@ -142,6 +142,6 @@ def test_empty_text_returns_empty(mod):
 
 
 def test_no_vocab_entries_passthrough(mod, monkeypatch):
-    monkeypatch.setattr(mod, "load_vocab", lambda: [])
+    monkeypatch.setattr(mod.formatter, "load_vocab", lambda: [])
     text = "yaz Yari Hane wear near"
     assert mod.vocab_correct(text, character_id="") == text

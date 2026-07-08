@@ -106,7 +106,7 @@ def test_alternatives_pull_from_vocab(mod, tmp_path, monkeypatch):
         "  aliases: []\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(mod, "VOCAB_FILE", vocab_file)
+    monkeypatch.setattr(mod.config, "VOCAB_FILE", vocab_file)
     mod._invalidate_vocab_cache()
     try:
         # Whisper hears "Suzie" instead of "Suzy" (close difflib ratio).
@@ -129,7 +129,7 @@ def test_alternatives_pull_from_vocab(mod, tmp_path, monkeypatch):
 def test_word_alternatives_empty_vocab_returns_empty(mod, tmp_path, monkeypatch):
     vocab_file = tmp_path / "vocab.yaml"
     vocab_file.write_text("[]\n", encoding="utf-8")
-    monkeypatch.setattr(mod, "VOCAB_FILE", vocab_file)
+    monkeypatch.setattr(mod.config, "VOCAB_FILE", vocab_file)
     mod._invalidate_vocab_cache()
     try:
         assert mod.word_alternatives("Sushi") == []

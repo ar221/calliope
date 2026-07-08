@@ -475,7 +475,7 @@ def test_rp_enhance_payload_includes_scene_continuity(monkeypatch, mod):
         captured["payload"] = json.loads(req.data.decode())
         return FakeResponse()
 
-    monkeypatch.setattr(mod, "probe_formatter", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(mod.formatter, "probe_formatter", lambda *a, **k: (True, ""))
     monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
     out, skipped, reason = mod.format_rp(
         "I step closer.", mode=2,
@@ -537,7 +537,7 @@ def test_rp_enhance_payload_uses_scene_contract(monkeypatch, mod):
         "chatType": "group",
         "lastSpeaker": "Mira",
     })
-    monkeypatch.setattr(mod, "probe_formatter", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(mod.formatter, "probe_formatter", lambda *a, **k: (True, ""))
     monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
 
     out, skipped, reason = mod.format_rp(
