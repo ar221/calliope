@@ -13,7 +13,6 @@ Usage:
 import argparse
 import collections
 import http.server
-import io
 import ipaddress
 import json
 import logging
@@ -30,7 +29,6 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-import wave
 from datetime import datetime
 from pathlib import Path
 
@@ -81,13 +79,13 @@ from calliope_server import config  # noqa: E402, F401
 # module-level globals on this file. Code that still lives in this file
 # reads THIS module's globals, so monkeypatching them here keeps working.
 from calliope_server.config import (  # noqa: E402
-    COMMON_EN_WORDS,
-    VOCAB_FUZZY_CUTOFF,
-    VOCAB_FUZZY_MIN_LEN,
-    VOCAB_FUZZY_MAX_HITS_PER_UTT,
-    WORD_CONFIDENCE_THRESHOLD,
-    WORD_CONFIDENCE_MAX_SPANS,
-    WORD_CONFIDENCE_MIN_LEN,
+    COMMON_EN_WORDS,  # noqa: F401 — re-export for tests/back-compat
+    VOCAB_FUZZY_CUTOFF,  # noqa: F401 — re-export for tests/back-compat
+    VOCAB_FUZZY_MIN_LEN,  # noqa: F401 — re-export for tests/back-compat
+    VOCAB_FUZZY_MAX_HITS_PER_UTT,  # noqa: F401 — re-export for tests/back-compat
+    WORD_CONFIDENCE_THRESHOLD,  # noqa: F401 — re-export for tests/back-compat
+    WORD_CONFIDENCE_MAX_SPANS,  # noqa: F401 — re-export for tests/back-compat
+    WORD_CONFIDENCE_MIN_LEN,  # noqa: F401 — re-export for tests/back-compat
     DEFAULT_PORT,
     DEFAULT_HOST,
     MODEL_DIR,
@@ -97,59 +95,59 @@ from calliope_server.config import (  # noqa: E402
     TOKEN_FILE,
     WHISPER_BIN,
     CLAUDE_PROXY_URL,
-    CLAUDE_RP_MODEL,
+    CLAUDE_RP_MODEL,  # noqa: F401 — re-export for tests/back-compat
     OPENAI_PROXY_URL,
-    OPENAI_RP_MODEL,
-    OPENAI_CLEAN_MODEL,
+    OPENAI_RP_MODEL,  # noqa: F401 — re-export for tests/back-compat
+    OPENAI_CLEAN_MODEL,  # noqa: F401 — re-export for tests/back-compat
     OMNIROUTE_PROXY_URL,
     _parse_model_chain,  # noqa: F401 — re-export for tests/back-compat
     _safe_child,  # noqa: F401 — moved to config (neutral home); re-export for tests/back-compat
     OMNIROUTE_RP_CHAIN,
-    OMNIROUTE_CLEAN_CHAIN,
+    OMNIROUTE_CLEAN_CHAIN,  # noqa: F401 — re-export for tests/back-compat
     _VALID_PROVIDERS,
     DEFAULT_FORMATTER_PROVIDER,
     DEFAULT_MODEL,
-    TRANSCRIPT_CONTEXT_LIMIT,
-    PERSONAS_DIR,
+    TRANSCRIPT_CONTEXT_LIMIT,  # noqa: F401 — re-export for tests/back-compat
+    PERSONAS_DIR,  # noqa: F401 — re-export for tests/back-compat
     RULES_DIR,  # noqa: F401 — re-export for tests/back-compat
     ST_DATA_ROOT,  # noqa: F401 — re-export for tests/back-compat
-    CHARACTERS_DIR,
-    ST_CHATS_DIR,
-    ST_GROUPS_DIR,
-    ST_GROUP_CHATS_DIR,
+    CHARACTERS_DIR,  # noqa: F401 — re-export for tests/back-compat
+    ST_CHATS_DIR,  # noqa: F401 — re-export for tests/back-compat
+    ST_GROUPS_DIR,  # noqa: F401 — re-export for tests/back-compat
+    ST_GROUP_CHATS_DIR,  # noqa: F401 — re-export for tests/back-compat
     CHAT_CONTEXT_WINDOW,
     MAX_JSON_BODY_BYTES,
     MAX_AUDIO_BODY_BYTES,
-    MODES_FILE,
+    MODES_FILE,  # noqa: F401 — re-export for tests/back-compat
     VOCAB_FILE,
-    CHAR_MODES_FILE,
-    VOICE_MACROS_FILE,
-    WHISPER_PROMPT_TOKEN_CAP,
-    STATE_FRESH_SECONDS,
-    STATE_STALE_SECONDS,
-    DISFLUENCY_CLEAN_MODEL,
-    DISFLUENCY_CLEAN_TIMEOUT,
-    DISFLUENCY_CLEAN_MAX_WORDS,
-    DISFLUENCY_CLEAN_MIN_WORDS,
-    FORMATTER_TIMEOUT_SECONDS,
-    WHISPER_SERVER_URL,
-    WHISPER_SERVER_HEALTH_TIMEOUT,
-    WHISPER_SERVER_REQUEST_TIMEOUT,
-    IDLE_SHUTDOWN_SECONDS,
-    IDLE_SHUTDOWN_DISABLED,
-    IDLE_SHUTDOWN_CHECK_INTERVAL,
-    KOKORO_SERVER_URL,
-    KOKORO_DEFAULT_VOICE,
-    KOKORO_IDLE_SHUTDOWN_SECONDS,
-    KOKORO_IDLE_SHUTDOWN_DISABLED,
-    KOKORO_PROBE_TIMEOUT,
-    KOKORO_BOOT_TIMEOUT,
-    KOKORO_REQUEST_TIMEOUT,
-    KOKORO_VOICES_TTL_SECONDS,
-    TTS_MAX_TEXT_CHARS,
-    TTS_AUDIOBOOK_MAX_MESSAGES,
-    TTS_AUDIOBOOK_MAX_TOTAL_CHARS,
-    TTS_AUDIOBOOK_SILENCE_MS,
+    CHAR_MODES_FILE,  # noqa: F401 — re-export for tests/back-compat
+    VOICE_MACROS_FILE,  # noqa: F401 — re-export for tests/back-compat
+    WHISPER_PROMPT_TOKEN_CAP,  # noqa: F401 — re-export for tests/back-compat
+    STATE_FRESH_SECONDS,  # noqa: F401 — re-export for tests/back-compat
+    STATE_STALE_SECONDS,  # noqa: F401 — re-export for tests/back-compat
+    DISFLUENCY_CLEAN_MODEL,  # noqa: F401 — re-export for tests/back-compat
+    DISFLUENCY_CLEAN_TIMEOUT,  # noqa: F401 — re-export for tests/back-compat
+    DISFLUENCY_CLEAN_MAX_WORDS,  # noqa: F401 — re-export for tests/back-compat
+    DISFLUENCY_CLEAN_MIN_WORDS,  # noqa: F401 — re-export for tests/back-compat
+    FORMATTER_TIMEOUT_SECONDS,  # noqa: F401 — re-export for tests/back-compat
+    WHISPER_SERVER_URL,  # noqa: F401 — re-export for tests/back-compat
+    WHISPER_SERVER_HEALTH_TIMEOUT,  # noqa: F401 — re-export for tests/back-compat
+    WHISPER_SERVER_REQUEST_TIMEOUT,  # noqa: F401 — re-export for tests/back-compat
+    IDLE_SHUTDOWN_SECONDS,  # noqa: F401 — re-export for tests/back-compat
+    IDLE_SHUTDOWN_DISABLED,  # noqa: F401 — re-export for tests/back-compat
+    IDLE_SHUTDOWN_CHECK_INTERVAL,  # noqa: F401 — re-export for tests/back-compat
+    KOKORO_SERVER_URL,  # noqa: F401 — re-export for tests/back-compat
+    KOKORO_DEFAULT_VOICE,  # noqa: F401 — re-export for tests/back-compat
+    KOKORO_IDLE_SHUTDOWN_SECONDS,  # noqa: F401 — re-export for tests/back-compat
+    KOKORO_IDLE_SHUTDOWN_DISABLED,  # noqa: F401 — re-export for tests/back-compat
+    KOKORO_PROBE_TIMEOUT,  # noqa: F401 — re-export for tests/back-compat
+    KOKORO_BOOT_TIMEOUT,  # noqa: F401 — re-export for tests/back-compat
+    KOKORO_REQUEST_TIMEOUT,  # noqa: F401 — re-export for tests/back-compat
+    KOKORO_VOICES_TTL_SECONDS,  # noqa: F401 — re-export for tests/back-compat
+    TTS_MAX_TEXT_CHARS,  # noqa: F401 — re-export for tests/back-compat
+    TTS_AUDIOBOOK_MAX_MESSAGES,  # noqa: F401 — re-export for tests/back-compat
+    TTS_AUDIOBOOK_MAX_TOTAL_CHARS,  # noqa: F401 — re-export for tests/back-compat
+    TTS_AUDIOBOOK_SILENCE_MS,  # noqa: F401 — re-export for tests/back-compat
     CERT_RENEW_THRESHOLD_DAYS,
     CERT_WARN_THRESHOLD_DAYS,
     CERT_RENEW_CHECK_INTERVAL_SECONDS,
@@ -170,18 +168,18 @@ from calliope_server.web_ui import (  # noqa: E402
 # hits the same objects.
 from calliope_server.sillytavern import (  # noqa: E402
     discover_personas,
-    load_persona_voice,
-    load_persona_full,
+    load_persona_voice,  # noqa: F401 — re-export for tests/back-compat
+    load_persona_full,  # noqa: F401 — re-export for tests/back-compat
     discover_characters,
     discover_group_characters,
-    load_character_card,
-    build_character_context,
+    load_character_card,  # noqa: F401 — re-export for tests/back-compat
+    build_character_context,  # noqa: F401 — re-export for tests/back-compat
     ChatReader,
     ContextBuilder,
     _recent_chats_cache,  # noqa: F401 — re-export for tests/back-compat
-    _recent_chats_lock,
-    _group_last_speaker_cache,
-    _group_last_speaker_lock,
+    _recent_chats_lock,  # noqa: F401 — re-export for tests/back-compat
+    _group_last_speaker_cache,  # noqa: F401 — re-export for tests/back-compat
+    _group_last_speaker_lock,  # noqa: F401 — re-export for tests/back-compat
 )
 # Whisper lifecycle + transcription layer. Functions read config via
 # `config.X` at call time. Handler code below calls these through THIS
@@ -192,7 +190,7 @@ from calliope_server.transcribe import (  # noqa: E402
     _ensure_whisper_server_alive,  # noqa: F401 — re-export for tests/back-compat
     _build_multipart_body,  # noqa: F401 — re-export for tests/back-compat
     _transcribe_whisper_server,  # noqa: F401 — re-export for tests/back-compat
-    extract_word_confidences,
+    extract_word_confidences,  # noqa: F401 — re-export for tests/back-compat
     _transcribe_subprocess_fallback,  # noqa: F401 — re-export for tests/back-compat
     _mark_transcribe_activity,  # noqa: F401 — re-export for tests/back-compat
     _idle_shutdown_loop,  # noqa: F401 — re-export for tests/back-compat
@@ -281,7 +279,7 @@ from calliope_server.formatter import (  # noqa: E402
     formatter_error_text,  # noqa: F401 — re-export for tests/back-compat
     _CHAIN_SKIP_MARKERS,  # noqa: F401 — re-export for tests/back-compat
     _is_chain_skippable_error,  # noqa: F401 — re-export for tests/back-compat
-    probe_formatter,
+    probe_formatter,  # noqa: F401 — re-export for tests/back-compat
     disfluency_clean,  # noqa: F401 — re-export for tests/back-compat
     _char_modes_cache,  # noqa: F401 — re-export for tests/back-compat
     char_modes_lock,  # noqa: F401 — re-export for tests/back-compat
@@ -314,7 +312,7 @@ from calliope_server.formatter import (  # noqa: E402
     _normalize_vocab_entry,
     load_vocab,
     _invalidate_vocab_cache,
-    _invalidate_modes_cache,
+    _invalidate_modes_cache,  # noqa: F401 — re-export for tests/back-compat
     WHISPER_HALLUCINATIONS_EN,  # noqa: F401 — re-export for tests/back-compat
     SINGLE_TOKEN_DEGENERATES,  # noqa: F401 — re-export for tests/back-compat
     hallucination_filter,  # noqa: F401 — re-export for tests/back-compat
@@ -329,7 +327,7 @@ from calliope_server.formatter import (  # noqa: E402
     _ensure_voice_macros_compiled,  # noqa: F401 — re-export for tests/back-compat
     load_voice_macros,  # noqa: F401 — re-export for tests/back-compat
     command_dispatch,  # noqa: F401 — re-export for tests/back-compat
-    _invalidate_voice_macros_cache,
+    _invalidate_voice_macros_cache,  # noqa: F401 — re-export for tests/back-compat
     _applies_to_character,  # noqa: F401 — re-export for tests/back-compat
     vocab_correct,  # noqa: F401 — re-export for tests/back-compat
     _vocab_correct_forms,  # noqa: F401 — re-export for tests/back-compat
