@@ -355,7 +355,7 @@ def test_kokoro_probe_false_when_unreachable(mod):
 
 
 def test_ensure_kokoro_alive_short_circuits_when_already_up(mod):
-    with patch.object(mod, "_kokoro_probe", return_value=True), \
+    with patch.object(mod.tts, "_kokoro_probe", return_value=True), \
             patch.object(mod.subprocess, "run") as run_mock:
         assert mod._ensure_kokoro_alive() is True
     run_mock.assert_not_called()
@@ -364,14 +364,14 @@ def test_ensure_kokoro_alive_short_circuits_when_already_up(mod):
 def test_ensure_kokoro_alive_returns_false_when_systemctl_fails(mod):
     """systemctl failure path: should not raise, should return False."""
     # Probe always says down; systemctl raises — ensures we still return False.
-    with patch.object(mod, "_kokoro_probe", return_value=False), \
+    with patch.object(mod.tts, "_kokoro_probe", return_value=False), \
             patch.object(mod.subprocess, "run", side_effect=OSError("no systemd")):
         assert mod._ensure_kokoro_alive(boot_timeout=0.0) is False
 
 
 def test_ensure_kokoro_alive_timeout_when_boot_never_completes(mod):
     """systemctl runs cleanly but probe never flips → False after boot timeout."""
-    with patch.object(mod, "_kokoro_probe", return_value=False), \
+    with patch.object(mod.tts, "_kokoro_probe", return_value=False), \
             patch.object(mod.subprocess, "run", return_value=MagicMock(returncode=0)):
         assert mod._ensure_kokoro_alive(boot_timeout=0.0) is False
 
@@ -382,11 +382,11 @@ def test_ensure_kokoro_alive_timeout_when_boot_never_completes(mod):
 def test_mark_tts_activity_updates_timestamp(mod, monkeypatch):
     """_last_tts_ts moves forward after _mark_tts_activity."""
     # Reset.
-    with mod._last_tts_lock:
-        mod._last_tts_ts = 0.0
+    with mod.tts._last_tts_lock:
+        mod.tts._last_tts_ts = 0.0
     mod._mark_tts_activity()
-    with mod._last_tts_lock:
-        assert mod._last_tts_ts > 0.0
+    with mod.tts._last_tts_lock:
+        assert mod.tts._last_tts_ts > 0.0
 
 
 # ─── Audiobook export helpers ───────────────────────────────
