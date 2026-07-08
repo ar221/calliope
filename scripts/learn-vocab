@@ -71,9 +71,11 @@ except ImportError:
 
 # ─── Constants ───────────────────────────────────────────────────────
 
-DEFAULT_CHATS_DIR = pathlib.Path(
-    "/mnt/hdd/AI/SillyTavern/data/default-user/chats"
-)
+# Honors DICTATION_ST_DATA_ROOT (same env var the server uses) so relocated
+# SillyTavern installs need only one override; --chats-dir still wins.
+DEFAULT_CHATS_DIR = pathlib.Path(os.environ.get(
+    "DICTATION_ST_DATA_ROOT", "/mnt/hdd/AI/SillyTavern/data/default-user"
+)) / "chats"
 DEFAULT_VOCAB_YAML = pathlib.Path(
     "~/.local/share/dictation-server/vocab.yaml"
 ).expanduser()

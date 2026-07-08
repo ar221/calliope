@@ -25,6 +25,7 @@ import secrets
 import shutil
 import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -208,14 +209,32 @@ DEFAULT_MODEL = "large-v3-turbo"
 TRANSCRIPT_CONTEXT_LIMIT = 3000  # max chars of transcript to include in RP+ prompt
 PERSONAS_DIR = Path(os.environ.get("DICTATION_PERSONAS_DIR", Path.home() / "STWork/personas"))
 RULES_DIR = Path(os.environ.get("DICTATION_RULES_DIR", Path.home() / "STWork/rules"))
+# SillyTavern data root. `DICTATION_ST_DATA_ROOT` relocates the whole
+# default-user tree in one shot; the per-directory env vars below still win
+# individually when set. Default preserves the historical hardcoded path.
+ST_DATA_ROOT = Path(os.environ.get(
+    "DICTATION_ST_DATA_ROOT",
+    "/mnt/hdd/AI/SillyTavern/data/default-user",
+))
 CHARACTERS_DIR = Path(os.environ.get(
     "DICTATION_CHARACTERS_DIR",
-    "/mnt/hdd/AI/SillyTavern/data/default-user/characters",
+    str(ST_DATA_ROOT / "characters"),
 ))
-ST_CHATS_DIR = Path("/mnt/hdd/AI/SillyTavern/data/default-user/chats")
-ST_GROUPS_DIR = Path("/mnt/hdd/AI/SillyTavern/data/default-user/groups")
-ST_GROUP_CHATS_DIR = Path("/mnt/hdd/AI/SillyTavern/data/default-user/group chats")
+ST_CHATS_DIR = Path(os.environ.get(
+    "DICTATION_ST_CHATS_DIR", str(ST_DATA_ROOT / "chats")))
+ST_GROUPS_DIR = Path(os.environ.get(
+    "DICTATION_ST_GROUPS_DIR", str(ST_DATA_ROOT / "groups")))
+ST_GROUP_CHATS_DIR = Path(os.environ.get(
+    "DICTATION_ST_GROUP_CHATS_DIR", str(ST_DATA_ROOT / "group chats")))
 CHAT_CONTEXT_WINDOW = 8  # number of recent messages to include
+
+# Request body caps (2026-07 security audit). Oversized Content-Length is
+# rejected with HTTP 413 BEFORE the body is read; malformed/negative values
+# get a 400. Env-overridable for unusual deployments.
+MAX_JSON_BODY_BYTES = int(os.environ.get(
+    "DICTATION_MAX_JSON_BODY_BYTES", str(1 * 1024 * 1024)))     # 1 MB
+MAX_AUDIO_BODY_BYTES = int(os.environ.get(
+    "DICTATION_MAX_AUDIO_BODY_BYTES", str(25 * 1024 * 1024)))   # 25 MB
 
 # Phase 2 — Modes + Vocab persistence. YAML preferred, JSON fallback if PyYAML missing.
 _CONFIG_EXT = "yaml" if _HAVE_YAML else "json"
@@ -541,13 +560,50 @@ def discover_personas() -> list[dict]:
     return personas
 
 
+def _token_matches(presented: str, expected: str) -> bool:
+    """Timing-safe token compare tolerant of non-ASCII input.
+
+    `secrets.compare_digest` raises TypeError on non-ASCII *str* operands;
+    comparing UTF-8 bytes never does, so a garbage `?token=%C3%A9` cannot
+    crash the handler on the auth-exempt `/` and `/health` surface.
+    """
+    if not presented or not expected:
+        return False
+    return secrets.compare_digest(presented.encode("utf-8"), expected.encode("utf-8"))
+
+
+def _safe_child(base_dir: Path, name: str, suffix: str = "") -> Path | None:
+    """Resolve `base_dir / (name + suffix)` only if `name` is a safe leaf.
+
+    Guards every site where a request-supplied ID (persona, character, chat,
+    model name, …) becomes a filename. Returns None when `name` is empty or
+    contains a path separator or NUL byte, is itself a dot component, or
+    when the resolved candidate escapes `base_dir` (e.g. via symlink
+    tricks). Names merely *containing* `..` (ellipses like `Hmm..`) are
+    legitimate leaf names — containment is enforced by the resolve check.
+    """
+    if not name or "\x00" in name or "/" in name or "\\" in name:
+        return None
+    if name in (".", ".."):
+        return None
+    candidate = base_dir / f"{name}{suffix}"
+    try:
+        if not candidate.resolve().is_relative_to(base_dir.resolve()):
+            return None
+    except (OSError, ValueError):
+        return None
+    return candidate
+
+
 def load_persona_voice(persona_id: str) -> str:
     """Load condensed voice guide for a persona. Prefers .voice.md sidecar."""
     if not persona_id or persona_id == "none":
         return ""
 
     # Try sidecar first
-    voice_file = PERSONAS_DIR / f"{persona_id}.voice.md"
+    voice_file = _safe_child(PERSONAS_DIR, persona_id, ".voice.md")
+    if voice_file is None:
+        return ""
     if voice_file.exists():
         try:
             text = voice_file.read_text(encoding="utf-8").strip()
@@ -557,8 +613,8 @@ def load_persona_voice(persona_id: str) -> str:
             pass
 
     # Fallback: auto-extract from full persona file
-    full_file = PERSONAS_DIR / f"{persona_id}.md"
-    if not full_file.exists():
+    full_file = _safe_child(PERSONAS_DIR, persona_id, ".md")
+    if full_file is None or not full_file.exists():
         return ""
 
     try:
@@ -592,11 +648,13 @@ def load_persona_full(persona_id: str, max_chars: int = 2000) -> dict:
     if not persona_id or persona_id == "none":
         return {}
 
+    full_file = _safe_child(PERSONAS_DIR, persona_id, ".md")
+    voice_file = _safe_child(PERSONAS_DIR, persona_id, ".voice.md")
+    if full_file is None or voice_file is None:
+        return {}
+
     name = persona_id.replace("-", " ").replace("_", " ").title()
     description = ""
-
-    full_file = PERSONAS_DIR / f"{persona_id}.md"
-    voice_file = PERSONAS_DIR / f"{persona_id}.voice.md"
 
     if full_file.exists():
         try:
@@ -661,7 +719,9 @@ def load_character_card(char_id: str) -> dict:
     import struct
     import base64
 
-    card_path = CHARACTERS_DIR / f"{char_id}.png"
+    card_path = _safe_child(CHARACTERS_DIR, char_id, ".png")
+    if card_path is None:
+        return {}
     if not card_path.exists():
         # Disambiguate: a UUID-ish id with no PNG → could be a group id
         # the bridge sent before the addressee picker shipped.
@@ -730,6 +790,10 @@ def build_character_context(char_id: str) -> str:
 
 # ─── ST Chat Reader ──────────────────────────────────────
 _recent_chats_cache: dict = {"data": [], "ts": 0.0}
+# Guards _recent_chats_cache under ThreadingHTTPServer (audit fix 6). The
+# filesystem scan itself runs unlocked (slow, idempotent); only cache
+# read/write is serialized.
+_recent_chats_lock = threading.Lock()
 
 
 class ChatReader:
@@ -798,7 +862,9 @@ class ChatReader:
         chat_id = group.get("chat_id", "")
         if not chat_id:
             return None
-        chat_file = ST_GROUP_CHATS_DIR / f"{chat_id}.jsonl"
+        chat_file = _safe_child(ST_GROUP_CHATS_DIR, str(chat_id), ".jsonl")
+        if chat_file is None:
+            return None
         if chat_file.exists():
             return chat_file
         return None
@@ -812,8 +878,9 @@ class ChatReader:
         import time
 
         now = time.time()
-        if _recent_chats_cache["data"] and (now - _recent_chats_cache["ts"]) < 5.0:
-            return _recent_chats_cache["data"][:limit]
+        with _recent_chats_lock:
+            if _recent_chats_cache["data"] and (now - _recent_chats_cache["ts"]) < 5.0:
+                return list(_recent_chats_cache["data"][:limit])
 
         chats: list[dict] = []
 
@@ -865,8 +932,9 @@ class ChatReader:
         for c in chats:
             c.pop("_mtime", None)
 
-        _recent_chats_cache["data"] = chats
-        _recent_chats_cache["ts"] = now
+        with _recent_chats_lock:
+            _recent_chats_cache["data"] = chats
+            _recent_chats_cache["ts"] = now
         return chats[:limit]
 
     @staticmethod
@@ -886,7 +954,9 @@ class ChatReader:
         chat_file: Path | None = None
 
         if chat_type == "individual":
-            chat_dir = ST_CHATS_DIR / chat_name
+            chat_dir = _safe_child(ST_CHATS_DIR, chat_name)
+            if chat_dir is None:
+                return []
             chat_file = ChatReader._find_newest_jsonl(chat_dir)
         elif chat_type == "group":
             for group in ChatReader._load_group_defs():
@@ -1342,6 +1412,8 @@ if not CORS_ALLOW_WILDCARD and _CORS_RAW:
             continue
 
 _token_cache: dict = {"value": "", "loaded": False}
+# Guards _token_cache mutation under ThreadingHTTPServer (audit fix 6).
+_token_lock = threading.Lock()
 
 
 def _write_token_file(tok: str) -> None:
@@ -1355,33 +1427,39 @@ def _write_token_file(tok: str) -> None:
 
 
 def ensure_token(*, log_new_token: bool = True) -> str:
-    """Mint or load the bearer token. First-run: optionally log it once for pairing."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if TOKEN_FILE.exists():
+    """Mint or load the bearer token. First-run: optionally log a redacted hint."""
+    with _token_lock:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if TOKEN_FILE.exists():
+            try:
+                tok = TOKEN_FILE.read_text(encoding="utf-8").strip()
+                if tok:
+                    _token_cache["value"] = tok
+                    _token_cache["loaded"] = True
+                    return tok
+            except Exception as e:
+                log.warning(f"Could not read existing token file: {e}")
+        tok = secrets.token_urlsafe(32)
         try:
-            tok = TOKEN_FILE.read_text(encoding="utf-8").strip()
-            if tok:
-                _token_cache["value"] = tok
-                _token_cache["loaded"] = True
-                return tok
+            _write_token_file(tok)
         except Exception as e:
-            log.warning(f"Could not read existing token file: {e}")
-    tok = secrets.token_urlsafe(32)
-    try:
-        _write_token_file(tok)
-    except Exception as e:
-        log.error(f"Failed to persist bearer token: {e}")
-    if log_new_token:
-        log.info(f"Bearer token: {tok}")
-    log.info(f"Token saved to {TOKEN_FILE} (mode 0600)")
-    _token_cache["value"] = tok
-    _token_cache["loaded"] = True
-    return tok
+            log.error(f"Failed to persist bearer token: {e}")
+        if log_new_token:
+            # Never log the full secret (journald persists it otherwise).
+            log.info(
+                f"Bearer token minted: {tok[:8]}… (redacted; run "
+                f"`dictation-server --show-token` or read {TOKEN_FILE} for the full value)"
+            )
+        log.info(f"Token saved to {TOKEN_FILE} (mode 0600)")
+        _token_cache["value"] = tok
+        _token_cache["loaded"] = True
+        return tok
 
 
 def get_token() -> str:
-    if _token_cache["loaded"]:
-        return _token_cache["value"]
+    with _token_lock:
+        if _token_cache["loaded"]:
+            return _token_cache["value"]
     return ensure_token()
 
 
@@ -1401,12 +1479,13 @@ def _redact_sensitive_url_params(text: str) -> str:
 def regenerate_token(*, log_new_token: bool = True) -> str:
     """Rotate the bearer token unconditionally (wizard --force / rotation)."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        TOKEN_FILE.unlink(missing_ok=True)
-    except Exception as e:
-        log.warning(f"Could not remove existing token file: {e}")
-    _token_cache["value"] = ""
-    _token_cache["loaded"] = False
+    with _token_lock:
+        try:
+            TOKEN_FILE.unlink(missing_ok=True)
+        except Exception as e:
+            log.warning(f"Could not remove existing token file: {e}")
+        _token_cache["value"] = ""
+        _token_cache["loaded"] = False
     return ensure_token(log_new_token=log_new_token)
 
 
@@ -1653,7 +1732,9 @@ def _transcribe_subprocess_fallback(audio_path: Path, model: str = DEFAULT_MODEL
     is unreachable. Mirrors the original Phase 1 invocation but with the
     Phase 2 flag corrections (ADR-2) so the fallback is also flag-correct.
     """
-    model_file = MODEL_DIR / f"ggml-{model}.bin"
+    model_file = _safe_child(MODEL_DIR, f"ggml-{model}", ".bin")
+    if model_file is None:
+        raise ValueError(f"Invalid model name: {model!r}")
     if not model_file.exists():
         raise FileNotFoundError(f"Model not found: {model_file}")
 
@@ -8622,6 +8703,10 @@ PWA_MANIFEST = json.dumps({
 
 # ─── HTTP Handler ─────────────────────────────────────────
 # Endpoints exempt from bearer-token auth (still loopback-bypassed).
+# NOTE (2026-07 audit): `/` and `/health` remain reachable without auth so the
+# phone pairing bootstrap keeps working, but their *content* is gated inside
+# do_GET — non-loopback callers without a valid token get a minimal pairing
+# page / minimal health payload (see _serve_root / _health_payload).
 _AUTH_EXEMPT_PATHS = frozenset({
     "/",                # Embedded phone UI HTML — bootstrap surface;
                         # JS wraps fetch/EventSource to attach token from
@@ -8629,6 +8714,56 @@ _AUTH_EXEMPT_PATHS = frozenset({
     "/health",
     "/manifest.json",
 })
+
+# Served on `/` to non-loopback clients that present no valid token. Two jobs:
+#  1. Recover the paired-session reload path: after pairing, the full UI scrubs
+#     ?token= from the URL and stashes it in sessionStorage — a reload arrives
+#     tokenless, so this page re-attaches the stored token and redirects.
+#  2. Otherwise, tell the user how to pair. No server details are disclosed.
+PAIRING_BOOTSTRAP_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Calliope — pairing required</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #16120c; color: #e8ddc8;
+         display: flex; align-items: center; justify-content: center;
+         min-height: 100vh; margin: 0; padding: 1.5rem; text-align: center; }
+  .card { max-width: 26rem; }
+  h1 { font-size: 1.2rem; }
+  p { line-height: 1.5; color: #bfae8f; }
+</style>
+<script>
+(function () {
+  try {
+    var params = new URLSearchParams(location.search);
+    if (params.get('token')) {
+      // A token was presented and rejected — drop any stale stored copy so
+      // we don't redirect-loop.
+      try { sessionStorage.removeItem('dictationToken'); } catch (e) {}
+      return;
+    }
+    var stored = '';
+    try { stored = sessionStorage.getItem('dictationToken') || ''; } catch (e) {}
+    if (stored) {
+      params.set('token', stored);
+      location.replace(location.pathname + '?' + params.toString() + location.hash);
+    }
+  } catch (e) { /* fall through to the static message */ }
+})();
+</script>
+</head>
+<body>
+<div class="card">
+  <h1>Calliope — pairing required</h1>
+  <p>This device isn't paired. Open the dictation page from the SillyTavern
+  Dictation Bridge extension (<em>Pair phone</em> &rarr; scan the QR code or
+  copy the pairing URL), or browse from the server machine itself.</p>
+</div>
+</body>
+</html>
+"""
 
 
 def _is_icon_path(path: str) -> bool:
@@ -8683,6 +8818,27 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
 
+    def _request_is_privileged(self) -> bool:
+        """Loopback client OR request carrying a valid bearer/query token.
+
+        Used to gate the *content* of the auth-exempt endpoints (`/`,
+        `/health`): they stay reachable for the pairing bootstrap, but
+        non-loopback callers without the token only get minimal responses.
+        """
+        if _is_loopback_address(self._client_addr()):
+            return True
+        tok = get_token()
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            presented = auth[len("Bearer "):].strip()
+            if _token_matches(presented, tok):
+                return True
+        parsed = urllib.parse.urlparse(self.path)
+        qtok = urllib.parse.parse_qs(parsed.query).get("token", [""])[0]
+        if _token_matches(qtok, tok):
+            return True
+        return False
+
     def require_auth(self) -> bool:
         """Gate every request unless loopback or exempt endpoint.
 
@@ -8707,7 +8863,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         if path in ("/events", "/pair"):
             qs = urllib.parse.parse_qs(parsed.query)
             qtok = qs.get("token", [""])[0]
-            if qtok and secrets.compare_digest(qtok, get_token()):
+            if _token_matches(qtok, get_token()):
                 return True
             # Header-bearer fall-through is allowed for /pair (phone may
             # send Authorization: Bearer instead of ?token=).
@@ -8715,7 +8871,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 auth = self.headers.get("Authorization", "")
                 if auth.startswith("Bearer "):
                     presented = auth[len("Bearer "):].strip()
-                    if presented and secrets.compare_digest(presented, get_token()):
+                    if _token_matches(presented, get_token()):
                         return True
             self._send_unauthorized("token required (query param or Bearer header)")
             return False
@@ -8723,7 +8879,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         auth = self.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
             presented = auth[len("Bearer "):].strip()
-            if presented and secrets.compare_digest(presented, get_token()):
+            if _token_matches(presented, get_token()):
                 return True
         self._send_unauthorized("bearer token required")
         return False
@@ -8957,10 +9113,49 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _reject_oversized_body(self, limit: int) -> bool:
+        """413/400 gate on Content-Length BEFORE any body byte is read.
+
+        Returns True when a response has been sent and the caller must stop:
+        malformed or negative Content-Length → 400, over `limit` → 413.
+        A missing header passes (handlers treat it as an empty body).
+        """
+        raw = self.headers.get("Content-Length")
+        if raw is None:
+            return False
+        try:
+            length = int(raw)
+        except (TypeError, ValueError):
+            self.send_error_json("Malformed Content-Length header",
+                                 code="bad_content_length", status=400)
+            return True
+        if length < 0:
+            self.send_error_json("Malformed Content-Length header",
+                                 code="bad_content_length", status=400)
+            return True
+        if length > limit:
+            self.send_error_json(
+                f"Request body too large (limit {limit} bytes)",
+                code="payload_too_large", status=413,
+                details={"limit_bytes": limit},
+            )
+            return True
+        return False
+
     def read_json_body(self) -> dict:
-        content_length = int(self.headers.get("Content-Length", 0))
+        # Defense in depth: do_POST already 413s oversized bodies up front,
+        # but every caller wraps this in try/except → 400, so raising here
+        # keeps malformed/oversized input from ever being read.
+        try:
+            content_length = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            raise ValueError("malformed Content-Length")
+        if content_length < 0:
+            raise ValueError("negative Content-Length")
         if content_length == 0:
             return {}
+        if content_length > MAX_JSON_BODY_BYTES:
+            raise ValueError("JSON body exceeds MAX_JSON_BODY_BYTES")
         return json.loads(self.rfile.read(content_length))
 
     def send_error_json(self, error: str, code: str = "error", status: int = 400,
@@ -9003,6 +9198,36 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         # </head> is deterministic and unique in WEB_UI
         return WEB_UI.replace("</head>", injection, 1)
 
+    def _serve_root(self, query: dict) -> None:
+        """Serve `/`: full UI for loopback/tokened callers, else pairing page.
+
+        The pairing flow (extension `buildPairedPhoneUrl`) opens `/?token=…`,
+        so a valid query token gets the full UI. Tokenless LAN reloads land on
+        PAIRING_BOOTSTRAP_HTML, which re-attaches a sessionStorage token and
+        redirects — keeping the paired phone working across reloads.
+        """
+        if self._request_is_privileged():
+            self.send_html(self._render_html_with_embed(query))
+        else:
+            self.send_html(PAIRING_BOOTSTRAP_HTML)
+
+    def _health_payload(self, privileged: bool) -> dict:
+        """Full health payload for loopback/tokened callers, bare otherwise."""
+        if not privileged:
+            # 2026-07 audit: no provider list, mode count, or cert expiry for
+            # unauthenticated non-loopback probes.
+            return {"status": "ok"}
+        days = cert_days_remaining()
+        payload = {
+            "status": "ok",
+            "providers": sorted(_VALID_PROVIDERS),
+            "default_provider": DEFAULT_FORMATTER_PROVIDER,
+            "mode_count": len(load_modes()),
+        }
+        if days is not None:
+            payload["cert_expires_days"] = days
+        return payload
+
     def do_GET(self):
         if not self.require_auth():
             return
@@ -9010,7 +9235,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
         if path == "/":
-            self.send_html(self._render_html_with_embed(query))
+            self._serve_root(query)
         elif path == "/manifest.json":
             body = PWA_MANIFEST.encode()
             self.send_response(200)
@@ -9019,18 +9244,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif path == "/health":
-            # Trimmed: no default_provider, no provider URLs, no cert_warning.
-            # Goal: minimum surface for a public probe.
-            days = cert_days_remaining()
-            payload = {
-                "status": "ok",
-                "providers": sorted(_VALID_PROVIDERS),
-                "default_provider": DEFAULT_FORMATTER_PROVIDER,
-                "mode_count": len(load_modes()),
-            }
-            if days is not None:
-                payload["cert_expires_days"] = days
-            self.send_json(payload)
+            self.send_json(self._health_payload(self._request_is_privileged()))
         elif path == "/transcript":
             # Optional ?chat=<id> filter scopes the session log to a single chat.
             # Empty filter returns everything (legacy behavior).
@@ -9256,6 +9470,12 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         params = urllib.parse.parse_qs(parsed.query)
+
+        # Body-size gate BEFORE any handler reads the body (2026-07 audit).
+        # /transcribe carries audio; everything else is JSON.
+        body_limit = MAX_AUDIO_BODY_BYTES if path == "/transcribe" else MAX_JSON_BODY_BYTES
+        if self._reject_oversized_body(body_limit):
+            return
 
         if path == "/transcribe":
             self._handle_transcribe(params)
@@ -9896,10 +10116,20 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         if chat_source and chat_source != "manual":
             chat_context = self._build_chat_context(chat_source)
 
-        # Read audio body
-        content_length = int(self.headers.get("Content-Length", 0))
-        if content_length == 0:
+        # Read audio body (do_POST has already 400/413'd malformed or
+        # oversized Content-Length; re-check defensively).
+        try:
+            content_length = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            content_length = 0
+        if content_length <= 0:
             self.send_error_json("No audio data", code="missing_audio", status=400)
+            return
+        if content_length > MAX_AUDIO_BODY_BYTES:
+            self.send_error_json(
+                f"Audio body too large (limit {MAX_AUDIO_BODY_BYTES} bytes)",
+                code="payload_too_large", status=413,
+            )
             return
 
         audio_data = self.rfile.read(content_length)
@@ -11115,6 +11345,8 @@ def main():
                         help="Issue a Tailscale (Let's Encrypt via MagicDNS) cert for this node and exit (MVP-24).")
     parser.add_argument("--rotate-token", action="store_true",
                         help="Rotate the bearer token and exit; prints the token path, not the secret value.")
+    parser.add_argument("--show-token", action="store_true",
+                        help="Print the bearer token from the token file to stdout and exit.")
     parser.add_argument("--force", action="store_true",
                         help="Re-run wizard stages even when artifacts exist (rotates cert+token, re-downloads model).")
     parser.add_argument("--install-systemd", dest="install_systemd",
@@ -11136,6 +11368,15 @@ def main():
         return run_setup_wizard(args)
     if args.tailscale_cert:
         return run_tailscale_cert(args)
+    if args.show_token:
+        if TOKEN_FILE.exists():
+            tok = TOKEN_FILE.read_text(encoding="utf-8").strip()
+            if tok:
+                print(tok)
+                return 0
+        print(f"No token minted yet (expected at {TOKEN_FILE}). "
+              "Start the server or run --setup first.", file=sys.stderr)
+        return 1
     if args.rotate_token:
         regenerate_token(log_new_token=False)
         print("Bearer token rotated.")
@@ -11253,4 +11494,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

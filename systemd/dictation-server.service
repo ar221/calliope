@@ -10,6 +10,11 @@ Restart=on-failure
 RestartSec=5
 Environment=WHISPER_BIN=whisper-cli
 Environment=WHISPER_IDLE_SHUTDOWN_DISABLED=1
+# SillyTavern data root — chats/groups/"group chats"/characters dirs derive
+# from it (DICTATION_CHARACTERS_DIR etc. still override individually). This
+# matches the server's built-in default; if you relocate ST, change this AND
+# the ReadOnlyPaths= sandbox line below to match.
+Environment=DICTATION_ST_DATA_ROOT=/mnt/hdd/AI/SillyTavern/data/default-user
 Environment=DICTATION_FORMATTER_PROVIDER=omniroute
 Environment=DICTATION_OPENAI_PROXY_URL=http://127.0.0.1:10531/v1
 Environment=DICTATION_OPENAI_RP_MODEL=gpt-5.4
