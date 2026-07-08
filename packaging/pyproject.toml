@@ -1,10 +1,13 @@
 # Calliope — pipx packaging definition.
 #
-# Current shape: the canonical source remains the single-file Python script at
-# `server/calliope-server` (no `.py` extension, no runtime package layout).
-# Hatch copies that exact artifact into the wheel as `calliope_dictation/_server.py`
-# so `pipx install ./packaging` exposes the intended `calliope-server` command
-# without lifting the embedded PWA out of the single-file server source.
+# Current shape: the canonical sources are the executable wrapper at
+# `server/calliope-server` plus the `server/calliope_server/` package.
+# Hatch copies the wrapper into the wheel as `calliope_dictation/_server.py`
+# and nests the package as `calliope_dictation/calliope_server/`; the
+# wrapper's bootstrap adds its own directory to sys.path, so the nested
+# package resolves, and tts.py finds voice_catalog.json one level above
+# the package dir (`calliope_dictation/voice_catalog.json`). This keeps
+# `pipx install ./packaging` exposing the intended `calliope-server` command.
 #
 # Publication note: keep this as a packaging adapter only. Do not move WEB_UI or
 # other runtime assets into a separate browser bundle as part of pipx packaging.
@@ -53,4 +56,5 @@ packages = ["calliope_dictation"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "../server/calliope-server" = "calliope_dictation/_server.py"
+"../server/calliope_server" = "calliope_dictation/calliope_server"
 "../server/voice_catalog.json" = "calliope_dictation/voice_catalog.json"
