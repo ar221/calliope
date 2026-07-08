@@ -55,12 +55,12 @@ _DATA_PARENT = Path(
     or Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
     / "dictation-server"
 )
+_PKG_DIR = None
 for _candidate in (_PKG_PARENT, _DATA_PARENT):
     if (_candidate / "calliope_server" / "__init__.py").is_file():
-        if str(_candidate) not in sys.path:
-            sys.path.insert(0, str(_candidate))
+        _PKG_DIR = _candidate / "calliope_server"
         break
-else:
+if _PKG_DIR is None:
     import importlib.util as _ilu
 
     if _ilu.find_spec("calliope_server") is None:
@@ -73,8 +73,42 @@ else:
         sys.exit(1)
 for _stale in [m for m in list(sys.modules) if m.split(".", 1)[0] == "calliope_server"]:
     del sys.modules[_stale]
+if _PKG_DIR is not None:
+    if _PKG_DIR.parent == _PKG_PARENT:
+        # Repo/wheel layout: package sits next to this file (code-controlled
+        # directory) — normal sys.path import.
+        if str(_PKG_PARENT) not in sys.path:
+            sys.path.insert(0, str(_PKG_PARENT))
+    else:
+        # Installed layout: load via explicit spec instead of putting the
+        # user-writable data dir on sys.path, where a stray *.py would
+        # shadow stdlib/site-packages for the whole process.
+        import importlib.util as _ilu
+
+        _spec = _ilu.spec_from_file_location(
+            "calliope_server",
+            _PKG_DIR / "__init__.py",
+            submodule_search_locations=[str(_PKG_DIR)],
+        )
+        assert _spec is not None and _spec.loader is not None
+        _pkg_mod = _ilu.module_from_spec(_spec)
+        sys.modules["calliope_server"] = _pkg_mod
+        _spec.loader.exec_module(_pkg_mod)
 
 from calliope_server import config  # noqa: E402, F401
+from calliope_server import __version__ as _pkg_version  # noqa: E402
+
+# Wrapper and package ship together; a mismatch means a stale install
+# (e.g. raw `install -m 755` of the wrapper without re-running
+# scripts/install-server). Mixed-revision code is worse than a hard stop.
+_EXPECTED_PKG_VERSION = "0.1.0"
+if _pkg_version != _EXPECTED_PKG_VERSION:
+    sys.stderr.write(
+        f"error: calliope_server package version {_pkg_version} does not match "
+        f"this executable (expects {_EXPECTED_PKG_VERSION}).\n"
+        "Re-run scripts/install-server from the calliope checkout.\n"
+    )
+    sys.exit(1)
 # Back-compat re-exports: tests (and code below) reference these as
 # module-level globals on this file. Code that still lives in this file
 # reads THIS module's globals, so monkeypatching them here keeps working.

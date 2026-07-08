@@ -21,7 +21,7 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, NamedTuple
 
-from calliope_server import config
+from . import config
 
 log = logging.getLogger("dictation-server")
 
@@ -459,10 +459,14 @@ def _wizard_stage_3(args, deps: WizardDeps) -> str:
 # ----- Stage 4: systemd units ----------------------------------------
 def _wizard_dotfiles_unit(name: str) -> Path | None:
     """Locate the canonical unit file in this repo, if reachable."""
-    candidates = [
-        Path.home() / "Github/dotfiles/systemd/user" / name,
-        Path(__file__).resolve().parents[2] / "systemd/user" / name,
-    ]
+    candidates = [Path.home() / "Github/dotfiles/systemd/user" / name]
+    # Repo-relative candidate only when actually running from a checkout —
+    # in the installed layout parents[2] is ~/.local/share, and
+    # ~/.local/share/systemd/user is a real systemd load path whose stale
+    # units must not masquerade as repo-canonical.
+    repo_root = Path(__file__).resolve().parents[2]
+    if (repo_root / "server" / "calliope-server").is_file():
+        candidates.append(repo_root / "systemd/user" / name)
     for c in candidates:
         if c.is_file():
             return c
