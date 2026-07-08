@@ -28,9 +28,11 @@ jobs:
       - name: Check embedded phone UI JS syntax
         run: scripts/check-web-ui-js
       - name: Check Python syntax
-        run: python -m py_compile server/calliope-server scripts/learn-vocab scripts/kokoro-server.py
+        run: python -m py_compile server/calliope-server server/calliope_server/*.py scripts/learn-vocab scripts/kokoro-server.py
+      - name: Import smoke — calliope_server package
+        run: python -c "import sys; sys.path.insert(0, 'server'); import calliope_server.formatter"
       - name: Check packaging shell syntax
-        run: bash -n packaging/PKGBUILD packaging/PKGBUILD-stable
+        run: bash -n packaging/PKGBUILD packaging/PKGBUILD-stable scripts/install-server
       - name: Verify systemd user units
         run: |
           # systemd-analyze verify checks that ExecStart binaries exist;
