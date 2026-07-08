@@ -79,9 +79,9 @@ def group_fixture(mod, tmp_path, monkeypatch):
         "\n".join(chat_lines) + "\n", encoding="utf-8",
     )
 
-    monkeypatch.setattr(mod, "ST_GROUPS_DIR", groups_dir)
-    monkeypatch.setattr(mod, "ST_GROUP_CHATS_DIR", group_chats_dir)
-    monkeypatch.setattr(mod, "CHARACTERS_DIR", chars_dir)
+    monkeypatch.setattr(mod.config, "ST_GROUPS_DIR", groups_dir)
+    monkeypatch.setattr(mod.config, "ST_GROUP_CHATS_DIR", group_chats_dir)
+    monkeypatch.setattr(mod.config, "CHARACTERS_DIR", chars_dir)
     # Clear last-speaker cache between tests.
     with mod._group_last_speaker_lock:
         mod._group_last_speaker_cache.clear()

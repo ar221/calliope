@@ -172,13 +172,13 @@ def test_safe_child_accepts_ellipsis_names(mod, tmp_path, name):
 
 
 def test_load_character_card_traversal_returns_empty(mod, monkeypatch, tmp_path):
-    monkeypatch.setattr(mod, "CHARACTERS_DIR", tmp_path)
+    monkeypatch.setattr(mod.config, "CHARACTERS_DIR", tmp_path)
     assert mod.load_character_card("../../etc/passwd") == {}
     assert mod.load_character_card("..") == {}
 
 
 def test_load_persona_voice_traversal_returns_empty(mod, monkeypatch, tmp_path):
-    monkeypatch.setattr(mod, "PERSONAS_DIR", tmp_path / "personas")
+    monkeypatch.setattr(mod.config, "PERSONAS_DIR", tmp_path / "personas")
     (tmp_path / "personas").mkdir()
     # Secret sibling outside the personas dir must not be readable via traversal.
     (tmp_path / "secret.md").write_text("## QUICK REFERENCE\nTOP SECRET\n")
@@ -186,21 +186,21 @@ def test_load_persona_voice_traversal_returns_empty(mod, monkeypatch, tmp_path):
 
 
 def test_load_persona_full_traversal_returns_empty(mod, monkeypatch, tmp_path):
-    monkeypatch.setattr(mod, "PERSONAS_DIR", tmp_path / "personas")
+    monkeypatch.setattr(mod.config, "PERSONAS_DIR", tmp_path / "personas")
     (tmp_path / "personas").mkdir()
     (tmp_path / "secret.md").write_text("# Secret\nTOP SECRET\n")
     assert mod.load_persona_full("../secret") == {}
 
 
 def test_load_persona_voice_legit_still_works(mod, monkeypatch, tmp_path):
-    monkeypatch.setattr(mod, "PERSONAS_DIR", tmp_path)
+    monkeypatch.setattr(mod.config, "PERSONAS_DIR", tmp_path)
     (tmp_path / "ayaz.voice.md").write_text("Speaks tersely.")
     out = mod.load_persona_voice("ayaz")
     assert "Speaks tersely." in out
 
 
 def test_read_chat_messages_traversal_returns_empty(mod, monkeypatch, tmp_path):
-    monkeypatch.setattr(mod, "ST_CHATS_DIR", tmp_path / "chats")
+    monkeypatch.setattr(mod.config, "ST_CHATS_DIR", tmp_path / "chats")
     (tmp_path / "chats").mkdir()
     outside = tmp_path / "outside"
     outside.mkdir()
