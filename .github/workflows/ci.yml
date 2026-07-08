@@ -33,6 +33,18 @@ jobs:
         run: bash -n packaging/PKGBUILD packaging/PKGBUILD-stable
       - name: Verify systemd user units
         run: |
+          # systemd-analyze verify checks that ExecStart binaries exist;
+          # stub the install-time paths so unit *syntax* is what's tested.
+          mkdir -p /home/runner/.local/bin \
+                   /home/runner/.local/share/calliope-tts/venv/bin \
+                   /home/runner/Github/calliope/scripts
+          for stub in \
+            /home/runner/.local/bin/dictation-server \
+            /home/runner/.local/bin/whisper-server \
+            /home/runner/.local/share/calliope-tts/venv/bin/python \
+            /home/runner/Github/calliope/scripts/learn-vocab; do
+            printf '#!/bin/sh\n' > "$stub" && chmod +x "$stub"
+          done
           HOME=/home/runner systemd-analyze --user verify \
             systemd/dictation-server.service \
             systemd/whisper-server.service \
