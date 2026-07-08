@@ -12,7 +12,6 @@ Usage:
 
 import argparse
 import collections
-import difflib
 import http.server
 import io
 import ipaddress

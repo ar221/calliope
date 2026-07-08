@@ -9,7 +9,7 @@ Local-first voice dictation server for SillyTavern. Hold-to-talk audio is transc
 - systemd user unit for the server; niri/GNOME/KDE hotkey (`Mod+Shift+M`).
 
 ## Layout
-- `server/` — `calliope-server` (the server), `rp_eval.py`, `voice_catalog.json`.
+- `server/` — `calliope-server` (executable wrapper: HTTP handler, auth, cert/token, main/CLI) + `calliope_server/` package (`config`, `events`, `formatter`, `sillytavern`, `transcribe`, `tts`, `web_ui`, `wizard` — see package `__init__.py` for the module map), `rp_eval.py`, `voice_catalog.json`.
 - `extension/` — SillyTavern `dictation-bridge` extension (JS, CSS, manifest, QR lib).
 - `systemd/` — user service unit(s) for the dictation server.
 - `scripts/` — helper/install scripts.
