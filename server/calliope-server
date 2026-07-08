@@ -43,13 +43,36 @@ except ImportError:  # pragma: no cover — fallback to JSON-only persistence
 
 # ─── Package bootstrap ─────────────────────────────────────
 # This file is the executable entry point; the importable package lives in
-# calliope_server/ alongside it. Put that directory on sys.path, then purge
-# any cached calliope_server modules so config.py re-reads the environment
-# every time this file is (re)executed — tests load this file repeatedly
-# via SourceFileLoader with env overrides.
-_PKG_PARENT = str(Path(__file__).resolve().parent)
-if _PKG_PARENT not in sys.path:
-    sys.path.insert(0, _PKG_PARENT)
+# calliope_server/. Search order:
+#   1. alongside this file (repo checkout / wheel: calliope_dictation/),
+#   2. the installed data dir (~/.local/share/dictation-server/, populated
+#      by scripts/install-server; honors CALLIOPE_DATA_DIR / XDG_DATA_HOME).
+# Put the winning parent on sys.path, then purge any cached calliope_server
+# modules so config.py re-reads the environment every time this file is
+# (re)executed — tests load this file repeatedly via SourceFileLoader with
+# env overrides.
+_PKG_PARENT = Path(__file__).resolve().parent
+_DATA_PARENT = Path(
+    os.environ.get("CALLIOPE_DATA_DIR")
+    or Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+    / "dictation-server"
+)
+for _candidate in (_PKG_PARENT, _DATA_PARENT):
+    if (_candidate / "calliope_server" / "__init__.py").is_file():
+        if str(_candidate) not in sys.path:
+            sys.path.insert(0, str(_candidate))
+        break
+else:
+    import importlib.util as _ilu
+
+    if _ilu.find_spec("calliope_server") is None:
+        sys.stderr.write(
+            "error: calliope_server package not found. Searched:\n"
+            f"  {_PKG_PARENT / 'calliope_server'}\n"
+            f"  {_DATA_PARENT / 'calliope_server'}\n"
+            "Install it with: scripts/install-server (from a calliope checkout)\n"
+        )
+        sys.exit(1)
 for _stale in [m for m in list(sys.modules) if m.split(".", 1)[0] == "calliope_server"]:
     del sys.modules[_stale]
 
