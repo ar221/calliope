@@ -373,6 +373,9 @@ async function postState(reason) {
             method: 'POST',
             mode: 'cors',
             cache: 'no-store',
+            // keepalive lets this small payload survive pagehide/visibilitychange
+            // teardown (mobile lifecycle push) instead of being aborted mid-flight.
+            keepalive: true,
             headers: { 'Content-Type': 'application/json', ...authHeaders() },
             body: JSON.stringify(payload),
         });
@@ -861,7 +864,7 @@ function buildLowConfPopover(word, alternatives, anchorRect) {
         el.addEventListener('click', () => {
             const alt = el.getAttribute('data-alt') || '';
             if (alt && replaceWordInTextarea(word, alt)) {
-                toast('success', `Replaced &ldquo;${word}&rdquo; → &ldquo;${alt}&rdquo;`);
+                toast('success', `Replaced &ldquo;${escapeHtml(word)}&rdquo; → &ldquo;${escapeHtml(alt)}&rdquo;`);
             }
             closeLowConfPopover();
             // Remove the chip whose word we resolved.
@@ -1034,7 +1037,11 @@ function appendToTextarea(extra) {
     const ta = document.getElementById('send_textarea');
     if (!ta) return;
     pushUndoSnapshot('append');
-    const sep = ta.value && !/\s$/.test(ta.value) ? '' : '';
+    // Insert a space when appending onto existing non-whitespace-terminated
+    // content so words don't run together (was a dead no-op ternary).
+    // Skip when the appended text itself starts with whitespace (paragraph
+    // breaks, scene breaks) so we don't pad or double-space.
+    const sep = ta.value && !/\s$/.test(ta.value) && !/^\s/.test(extra) ? ' ' : '';
     ta.value = (ta.value || '') + sep + extra;
     ta.dispatchEvent(new Event('input', { bubbles: true }));
     try { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
@@ -1198,7 +1205,7 @@ function handleDictationCommand(data) {
         }
         case 'append': {
             if (residual) {
-                appendToTextarea((residual.startsWith(' ') ? '' : ' ') + residual);
+                appendToTextarea(residual);
                 toast('success', 'Appended');
             } else {
                 toast('warning', 'Append: no text');
@@ -1361,6 +1368,10 @@ function connectSSE() {
                     appendMode: cfg.appendMode,
                 };
                 if (cfg.appendMode !== 'append') {
+                    // Snapshot before clearing so a user's in-progress draft is
+                    // recoverable via undo — this branch runs once per stream
+                    // (only on first-token-of-new-request, guarded above).
+                    pushUndoSnapshot('dictation-token-stream-clear');
                     // Clear textarea so the streamed text shows from a clean slate.
                     ta.value = '';
                     ta.dispatchEvent(new Event('input', { bubbles: true }));
@@ -3933,7 +3944,7 @@ function buildSettingsPanel() {
                     saveSettings();
                     paintTtsRoster();
                     paintTtsProfileHint();
-                    toast('info', `Removed voice profile for ${key}`);
+                    toast('info', `Removed voice profile for ${escapeHtml(key)}`);
                 }
             });
         });
@@ -4013,7 +4024,7 @@ function buildSettingsPanel() {
             const profileName = rememberTtsVoiceForCurrentProfile(s.ttsVoice);
             saveSettings();
             paintTtsProfileHint();
-            if (profileName) toast('success', `Saved TTS voice for ${profileName}`);
+            if (profileName) toast('success', `Saved TTS voice for ${escapeHtml(profileName)}`);
         });
         paintTtsProfileHint();
     }
@@ -4051,7 +4062,7 @@ function buildSettingsPanel() {
             const profileName = rememberTtsVoiceForCurrentProfile(ttsVoiceEl.value || settings().ttsVoice || 'af_heart');
             saveSettings();
             paintTtsProfileHint();
-            if (profileName) toast('success', `Saved TTS voice for ${profileName}`);
+            if (profileName) toast('success', `Saved TTS voice for ${escapeHtml(profileName)}`);
             else toast('success', 'Saved global fallback TTS voice');
         });
     }
@@ -4065,7 +4076,7 @@ function buildSettingsPanel() {
                 saveSettings();
                 ttsVoiceEl.value = settings().ttsVoice || 'af_heart';
                 paintTtsProfileHint();
-                toast('info', `Reset TTS voice profile for ${name}`);
+                toast('info', `Reset TTS voice profile for ${escapeHtml(name)}`);
             } else {
                 toast('info', 'No active target voice profile to reset');
             }
@@ -4077,7 +4088,7 @@ function buildSettingsPanel() {
             const profileName = rememberTtsVoiceForPersona(ttsVoiceEl.value || settings().ttsVoice || 'af_heart');
             saveSettings();
             paintTtsProfileHint();
-            if (profileName) toast('success', `Saved TTS voice for persona ${profileName}`);
+            if (profileName) toast('success', `Saved TTS voice for persona ${escapeHtml(profileName)}`);
         });
     }
 
@@ -4140,7 +4151,7 @@ function buildSettingsPanel() {
                             const profileName = rememberTtsVoiceForCurrentProfile(voice);
                             saveSettings();
                             paintTtsProfileHint();
-                            if (profileName) toast('success', `Voice set for ${profileName}`);
+                            if (profileName) toast('success', `Voice set for ${escapeHtml(profileName)}`);
                         }
                         ttsSuggestionPanelEl.style.display = 'none';
                     });
