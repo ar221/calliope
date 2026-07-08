@@ -20,6 +20,7 @@ from importlib.machinery import SourceFileLoader
 import pytest
 
 SRC = pathlib.Path(__file__).resolve().parents[1] / "server" / "calliope-server"
+WEB_UI_SRC = SRC.parent / "calliope_server" / "web_ui.py"
 
 
 @pytest.fixture(scope="module")
@@ -278,7 +279,7 @@ def test_reformat_endpoint_returns_repair_trace_without_storing_trace(monkeypatc
 
 
 def test_repair_trace_ui_escapes_html_and_does_not_post_full_trace():
-    source = SRC.read_text()
+    source = WEB_UI_SRC.read_text()
     render_start = source.index("function renderRepairTrace()")
     render_end = source.index("async function acceptRepairAsVocab()")
     render_src = source[render_start:render_end]
