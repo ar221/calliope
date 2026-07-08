@@ -279,3 +279,30 @@ CERT_FINGERPRINT_FILE = DATA_DIR / "cert.fingerprint"
 CERT_VALIDITY_DAYS = 90  # was 3650 — see ADR-7 / Agent 5 §7.
                           # Lower validity exercises the auto-renew code
                           # path quarterly instead of in 2036.
+
+
+# ─── Path-safety guard ────────────────────────────────────
+def _safe_child(base_dir: Path, name: str, suffix: str = "") -> Path | None:
+    """Resolve `base_dir / (name + suffix)` only if `name` is a safe leaf.
+
+    Guards every site where a request-supplied ID (persona, character, chat,
+    model name, …) becomes a filename. Returns None when `name` is empty or
+    contains a path separator or NUL byte, is itself a dot component, or
+    when the resolved candidate escapes `base_dir` (e.g. via symlink
+    tricks). Names merely *containing* `..` (ellipses like `Hmm..`) are
+    legitimate leaf names — containment is enforced by the resolve check.
+
+    Lives here (neutral home) because both the SillyTavern reader layer and
+    the whisper model-name guard depend on it.
+    """
+    if not name or "\x00" in name or "/" in name or "\\" in name:
+        return None
+    if name in (".", ".."):
+        return None
+    candidate = base_dir / f"{name}{suffix}"
+    try:
+        if not candidate.resolve().is_relative_to(base_dir.resolve()):
+            return None
+    except (OSError, ValueError):
+        return None
+    return candidate

@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import config
+from .config import _safe_child
 
 log = logging.getLogger("dictation-server")
 
@@ -42,29 +43,6 @@ def discover_personas() -> list[dict]:
             pass
         personas.append({"id": f.stem, "name": name})
     return personas
-
-
-def _safe_child(base_dir: Path, name: str, suffix: str = "") -> Path | None:
-    """Resolve `base_dir / (name + suffix)` only if `name` is a safe leaf.
-
-    Guards every site where a request-supplied ID (persona, character, chat,
-    model name, …) becomes a filename. Returns None when `name` is empty or
-    contains a path separator or NUL byte, is itself a dot component, or
-    when the resolved candidate escapes `base_dir` (e.g. via symlink
-    tricks). Names merely *containing* `..` (ellipses like `Hmm..`) are
-    legitimate leaf names — containment is enforced by the resolve check.
-    """
-    if not name or "\x00" in name or "/" in name or "\\" in name:
-        return None
-    if name in (".", ".."):
-        return None
-    candidate = base_dir / f"{name}{suffix}"
-    try:
-        if not candidate.resolve().is_relative_to(base_dir.resolve()):
-            return None
-    except (OSError, ValueError):
-        return None
-    return candidate
 
 
 def load_persona_voice(persona_id: str) -> str:
