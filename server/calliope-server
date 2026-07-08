@@ -9190,8 +9190,9 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             "character": character or None,
             "mode": mode or None,
         }
-        # json.dumps produces a safe JS object literal. No user-supplied HTML.
-        cfg_json = json.dumps(cfg, ensure_ascii=True)
+        # Values are user-supplied query params: escape "<" so a crafted
+        # ?chat=</script><script>… link can't break out of the script tag.
+        cfg_json = json.dumps(cfg, ensure_ascii=True).replace("<", "\\u003c")
         meta = '\n<meta name="dictation-embed" content="1">'
         script = f'\n<script>window.DICTATION_EMBED_CONFIG = {cfg_json};</script>'
         injection = meta + script + "\n</head>"

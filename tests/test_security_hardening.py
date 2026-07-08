@@ -380,3 +380,17 @@ def test_cache_locks_exist(mod):
         # Sanity: usable as context manager and not held.
         with lock:
             pass
+
+
+# ─── 7. HTML embed injection ─────────────────────────────────────────
+
+def test_render_html_embed_escapes_script_breakout(mod):
+    # A crafted ?chat=</script><script>… must not break out of the
+    # injected config <script> tag (reflected XSS on the embed page).
+    payload = "</script><script>alert(1)</script>"
+    fh = FakeHandler(client="127.0.0.1")
+    html = mod.DictationHandler._render_html_with_embed(
+        fh, {"embed": ["1"], "chat": [payload]}
+    )
+    assert payload not in html
+    assert "\\u003c/script>" in html
