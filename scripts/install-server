@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Install the Calliope dictation server for the current user.
+#
+# Copies:
+#   server/calliope-server        -> $BINDIR/dictation-server        (mode 755)
+#   server/calliope_server/       -> $DATADIR/calliope_server/       (synced)
+#   server/voice_catalog.json     -> $DATADIR/voice_catalog.json
+#
+# The wrapper finds the package via its bootstrap search order:
+# alongside itself first, then $DATADIR (CALLIOPE_DATA_DIR /
+# XDG_DATA_HOME aware). tts.py resolves voice_catalog.json one level
+# above the package dir, which is $DATADIR here.
+#
+# Overrides (mainly for tests): BINDIR, DATADIR.
+# Idempotent: safe to re-run; only the calliope_server/ subtree is
+# sync-deleted — cert.pem/key.pem/token in $DATADIR are never touched.
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+src_wrapper="$repo_root/server/calliope-server"
+src_pkg="$repo_root/server/calliope_server"
+src_catalog="$repo_root/server/voice_catalog.json"
+
+BINDIR="${BINDIR:-$HOME/.local/bin}"
+DATADIR="${DATADIR:-${CALLIOPE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/dictation-server}}"
+
+[[ -f "$src_wrapper" && -d "$src_pkg" ]] || {
+    echo "error: run from a calliope checkout ($src_wrapper / $src_pkg missing)" >&2
+    exit 1
+}
+
+mkdir -p "$BINDIR" "$DATADIR"
+
+install -m 755 "$src_wrapper" "$BINDIR/dictation-server"
+echo "installed $BINDIR/dictation-server"
+
+if command -v rsync >/dev/null 2>&1; then
+    rsync -a --delete --exclude '__pycache__' \
+        "$src_pkg/" "$DATADIR/calliope_server/"
+else
+    rm -rf "$DATADIR/calliope_server"  # scoped: only the synced package subtree
+    cp -r "$src_pkg" "$DATADIR/calliope_server"
+    rm -rf "$DATADIR/calliope_server/__pycache__"
+fi
+echo "synced    $DATADIR/calliope_server/"
+
+install -m 644 "$src_catalog" "$DATADIR/voice_catalog.json"
+echo "installed $DATADIR/voice_catalog.json"
+
+echo "done. Next: dictation-server --setup (first install) or restart the service."
