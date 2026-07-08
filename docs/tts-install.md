@@ -111,7 +111,7 @@ End-to-end against Calliope (substitute your bearer token):
 TOKEN=$(cat ~/.local/share/dictation-server/token)
 curl -k -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"text":"Hello Lord Rashid.","voice":"af_heart"}' \
+  -d '{"text":"Hello there.","voice":"af_heart"}' \
   https://127.0.0.1:8384/tts -o /tmp/test.wav
 mpv /tmp/test.wav
 ```

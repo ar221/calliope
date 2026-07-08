@@ -55,7 +55,7 @@ Status date: 2026-06-26.
 6. **Packaging**
    - Done: AUR `calliope-git` packaging now follows the repo layout, installs the single-file server through package wrappers, includes the adjacent voice catalog, and keeps runtime state/certs/tokens/models out of the package.
    - Done: pipx packaging remains a thin adapter around the single-file server source; Hatch copies `server/calliope-server` into the wheel as the `calliope-server` entry point without lifting out the embedded PWA.
-   - Pending: publish/tag/release steps remain blocked until Ayaz explicitly cuts a release.
+   - Pending: publish/tag/release steps remain blocked until a release is explicitly cut.
 
 7. **Docs/publication hygiene**
    - Done: public-path scan completed; generic runtime paths stay as examples and Ayaz-local SillyTavern paths remain documented as local operational defaults.

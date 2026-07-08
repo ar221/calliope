@@ -45,7 +45,8 @@ node --check extension/qrcodegen.min.js
 scripts/check-web-ui-js
 python -m py_compile server/calliope-server scripts/learn-vocab scripts/kokoro-server.py
 pytest -q
-HOME=/home/ayaz systemd-analyze --user verify systemd/dictation-server.service systemd/whisper-server.service systemd/kokoro-server.service systemd/learn-vocab-nightly.service
+# pin HOME explicitly if your agent sandbox overrides it, e.g. HOME=/home/<user>
+systemd-analyze --user verify systemd/dictation-server.service systemd/whisper-server.service systemd/kokoro-server.service systemd/learn-vocab-nightly.service
 ```
 
 For targeted changes, run the specific pytest file(s) and any relevant smoke. If live services are not restarted, say so.
@@ -58,7 +59,7 @@ For behavioral fixes, validate the layer that changed:
 - bridge: button/state UI, SSE events, textarea insertion, ST settings compatibility;
 - phone/PWA: token bootstrap, cert trust, recording lifecycle, visible pairing state;
 - formatter: provider selection, prompt shaping, fallback behavior, no audio cloud leakage;
-- systemd: unit verification with `HOME=/home/ayaz`, no sandbox-HOME false failures.
+- systemd: unit verification with the real `$HOME` pinned explicitly, no sandbox-HOME false failures.
 
 ## Stop conditions
 

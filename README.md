@@ -2,8 +2,6 @@
 
 > Voice for SillyTavern. Local-first. Persona-aware.
 
-![demo](docs/demo.gif)
-
 Calliope is a local-first voice dictation server built specifically for
 [SillyTavern](https://sillytavernai.com). Hold a mic button on your phone or
 hit a hotkey on your desktop, talk, release — your audio is transcribed by
@@ -24,8 +22,12 @@ network.
 - Output is shaped by your active character and persona — actions wrapped
   in asterisks, dialogue in quotes, written in your persona's voice and
   matched to the addressee's tone.
-- Five pipeline modes: `plain`, `grammar_clean`, `rp_format`, `rp_enhance`,
-  `persona_pov`. The mode is remembered per character.
+- Eight pipeline modes: `plain`, `grammar_clean`, `rp_format`, `rp_enhance`,
+  `persona_pov`, `narrator_past`, `narrator_present`, `command`. The mode is
+  remembered per character.
+- Model attribution: the RP/format response carries which model in the
+  formatter's fallback chain actually produced it, shown as a small caption
+  in both the extension and the phone PWA.
 - Live state-machine bar above the textarea: `idle → listening →
   transcribing → cleaning → done`. Streaming partials so you see words
   solidify as the pipeline finishes.
@@ -44,7 +46,7 @@ network.
 | Maintained? | Active 2026 | **Deprecated April 24, 2024** | Active |
 | Local STT? | whisper.cpp + GPU (ROCm/CUDA) | whisper / faster-whisper, but stale | Cloud only (OpenAI / Mistral / Groq / Z.AI). Browser Web Speech API hits Google. |
 | GPU acceleration | HIP/ROCm + CUDA | partial | n/a |
-| Persona-aware formatting | Five-mode pipeline (plain → rp_enhance → persona_pov) | plain transcript only | plain transcript only |
+| Persona-aware formatting | Eight-mode pipeline (plain → rp_enhance → persona_pov → narrator/command) | plain transcript only | plain transcript only |
 | Character vocab biasing | per-character `vocab.yaml` → whisper `--prompt` | none | none |
 | Phone push-to-talk | embedded PWA, MediaRecorder + VAD | terminal only | none |
 | Desktop hotkey | `dictate` bash + niri/GNOME/KDE keybinds, smart-paste detection | none | none |
@@ -111,9 +113,13 @@ The wizard prints the cert SHA-256 fingerprint and stores the bearer token.
 Save the fingerprint somewhere — you will match it on first phone connect.
 Pair phones from the SillyTavern extension after it is installed.
 
-**6. Install the SillyTavern extension.** Drop `dictation-bridge/` under
-`<ST install>/data/default-user/extensions/third-party/` (or symlink from
-the canonical copy in `~/Github/dotfiles/sillytavern/extensions/dictation-bridge/`).
+**6. Install the SillyTavern extension.** Copy or symlink `extension/` into
+ST's third-party extensions tree:
+
+```bash
+ln -s "$PWD/extension" <ST install>/data/default-user/extensions/third-party/dictation-bridge
+```
+
 Hard-refresh ST. A mic button appears in the send bar.
 
 **7. First desktop hotkey** (niri shown, GNOME / KDE in
@@ -142,10 +148,15 @@ install as PWA, then test recording.
                                         │  ├── shell ──▶ [whisper-server :9001]
                                         │  │                   (whisper.cpp / GPU)
                                         │  │
-                                        │  ├── HTTPS ──▶ [claude-code-proxy :42069]
+                                        │  ├── HTTP  ──▶ [OmniRoute proxy :20128]  (default)
+                                        │  │                   model-chain fallback across
+                                        │  │                   Claude Code / Codex / Kimi /
+                                        │  │                   Grok / NanoGPT subscriptions
+                                        │  │
+                                        │  ├── HTTPS ──▶ [claude-code-proxy :42069]  (alt provider)
                                         │  │                   (rp_enhance / pyrite)
                                         │  │
-                                        │  ├── HTTP  ──▶ [OpenAI proxy :10531]
+                                        │  ├── HTTP  ──▶ [OpenAI-compatible proxy :10531]  (alt provider)
                                         │  │                   (grammar / disfluency)
                                         │  │
                                         │  └── reads ──▶ [SillyTavern data/]
@@ -165,7 +176,7 @@ Runtime data and config live under `~/.local/share/dictation-server/`:
 
 - `cert.pem` / `key.pem` — self-signed TLS cert (90-day rotation,
   auto-renewed at startup).
-- `token` — 32-byte bearer token, mode 0600. Rotate with `dictation-server --rotate-token`; the command prints the token path and live-service next steps, not the token value. Live rotation sequence: stop the user service, rotate, update the ST bridge token setting from the token file, restart the service, hard-refresh SillyTavern, then re-pair the phone.
+- `token` — 32-byte bearer token, mode 0600. Rotate with `dictation-server --rotate-token`; the command prints the token path and live-service next steps, not the token value. Live rotation sequence: stop the user service, rotate, update the ST bridge token setting from the token file, restart the service, hard-refresh SillyTavern, then re-pair the phone. `dictation-server --show-token` prints the current token to stdout for manual re-pairing.
 - `cert.fingerprint` — SHA-256, also printed at startup.
 - `vocab.yaml` — character/term biasing for whisper `--prompt`.
 - `modes.yaml` — pipeline mode definitions.
@@ -179,7 +190,21 @@ Environment-variable overrides (set in `~/.config/systemd/user/dictation-server.
 - TLS cert/key live under `~/.local/share/dictation-server/`; Tailscale/mkcert flows should write `cert.pem` and `key.pem` there. See [`docs/tailscale.md`](docs/tailscale.md).
 - `WHISPER_BIN`, `WHISPER_SERVER_BIN`, `WHISPER_MODEL` — override binary
   and model paths.
-- `DICTATION_FORMATTER_PROVIDER`, `DICTATION_CLAUDE_RP_MODEL`, `DICTATION_RP_MODEL`, `DICTATION_OPENAI_RP_MODEL`, `DICTATION_OPENAI_CLEAN_MODEL` — formatter routing.
+- `DICTATION_FORMATTER_PROVIDER` — `claude`, `openai`, or `omniroute`
+  (default). OmniRoute is a local OpenAI-shape aggregator that fronts
+  several model subscriptions behind one endpoint and walks a fallback
+  chain (`DICTATION_OMNIROUTE_RP_CHAIN`, `DICTATION_OMNIROUTE_CLEAN_CHAIN`)
+  so one un-credentialed model doesn't block dictation. `DICTATION_CLAUDE_RP_MODEL`
+  / `DICTATION_RP_MODEL`, `DICTATION_OPENAI_RP_MODEL`, `DICTATION_OPENAI_CLEAN_MODEL`
+  configure the other two providers.
+- `DICTATION_ST_DATA_ROOT` — SillyTavern `data/default-user` directory;
+  relocates the whole ST data tree in one shot. `DICTATION_CHARACTERS_DIR`,
+  `DICTATION_ST_CHATS_DIR`, `DICTATION_ST_GROUPS_DIR`, and
+  `DICTATION_ST_GROUP_CHATS_DIR` override individual subdirectories and
+  still win over `DICTATION_ST_DATA_ROOT` when set.
+- `DICTATION_MAX_JSON_BODY_BYTES` (default 1 MB), `DICTATION_MAX_AUDIO_BODY_BYTES`
+  (default 25 MB) — request body caps; oversized `Content-Length` is
+  rejected with 413 before the body is read.
 
 Full reference: [`docs/config.md`](docs/config.md).
 

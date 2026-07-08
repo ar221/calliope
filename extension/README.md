@@ -19,7 +19,7 @@ When dictation completes, the server now has two delivery paths:
 
 Both paths can optionally fire the Send button automatically.
 
-This closes the loop on Ayaz's primary dictation flow: dictate on the phone
+This closes the loop on the primary dictation flow: dictate on the phone
 at `https://<pc-ip>:8384`, format/enhance in-persona on the PC, land in ST
 with one click — no clipboard round-trip.
 

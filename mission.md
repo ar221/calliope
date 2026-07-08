@@ -29,7 +29,7 @@ Audio should stay local. Plain mode should not send audio or transcript text to 
 
 ## Operating posture
 
-Calliope is live-service software. Repository changes are not automatically live. Agents may edit and test the repo, but must not restart or redeploy Ayaz's running dictation service without explicit approval.
+Calliope is live-service software. Repository changes are not automatically live. Agents may edit and test the repo, but must not restart or redeploy the operator's running dictation service without explicit approval.
 
 ## Success criteria
 

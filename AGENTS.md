@@ -10,7 +10,7 @@ Read these root files before implementation work:
 - `factory_rules.md` — live-service safety, validation gates, and stop conditions.
 - `AGENTS.md` — this repo-local work manual.
 
-Do not create `claud.md`; use `AGENTS.md` for cross-agent context and add `CLAUDE.md` only if Claude Code-specific compatibility becomes necessary.
+`CLAUDE.md` is committed at the repo root for Claude Code-specific compatibility; keep it and `AGENTS.md` in sync when cross-agent conventions change.
 
 ## Source map
 
@@ -25,7 +25,7 @@ Do not create `claud.md`; use `AGENTS.md` for cross-agent context and add `CLAUD
 ## Operating rules
 
 - Do not print or commit bearer tokens, tokenized URLs, private keys, cookies, cert keys, SillyTavern session data, or chat logs.
-- Do not restart, stop, or redeploy live user services without Ayaz's approval.
+- Do not restart, stop, or redeploy live user services without the operator's approval.
 - Repo edits are not live until the appropriate service copy/symlink/restart path is explicitly applied.
 - Distinguish server health, SillyTavern bridge health, phone pairing, SSE state, and formatter provider routing. Do not collapse them into one vague “works” claim.
 - Treat local audio as sensitive. Do not preserve test audio unless it is an explicit fixture with consent and documentation.
@@ -41,7 +41,8 @@ node --check extension/qrcodegen.min.js
 scripts/check-web-ui-js
 python -m py_compile server/calliope-server scripts/learn-vocab scripts/kokoro-server.py
 pytest -q
-HOME=/home/ayaz systemd-analyze --user verify systemd/dictation-server.service systemd/whisper-server.service systemd/kokoro-server.service systemd/learn-vocab-nightly.service
+# pin HOME explicitly if your agent sandbox overrides it, e.g. HOME=/home/<user>
+systemd-analyze --user verify systemd/dictation-server.service systemd/whisper-server.service systemd/kokoro-server.service systemd/learn-vocab-nightly.service
 ```
 
 For narrow changes, run targeted tests instead of the full suite when appropriate, then state what was not tested.

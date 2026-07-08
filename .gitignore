@@ -7,6 +7,8 @@ node_modules/
 
 # Local runtime/cache
 .cache/
+.pytest_cache/
+.ruff_cache/
 *.log
 *.tmp
 
