@@ -29,9 +29,34 @@
     animation: dictation-bridge-pulse 1.4s ease-in-out infinite;
 }
 
+.dictation-bridge-mic--recording {
+    opacity: 1;
+    color: #FF5A4E;
+    background-color: rgba(255, 90, 78, 0.12);
+    animation: dictation-bridge-recording-pulse 900ms ease-in-out infinite;
+}
+
+.dictation-bridge-mic--transcribing {
+    opacity: 1;
+    color: #FFB648;
+    background-color: rgba(255, 182, 72, 0.10);
+    cursor: progress;
+    animation: dictation-bridge-transcribing-pulse 1.2s ease-in-out infinite;
+}
+
 @keyframes dictation-bridge-pulse {
     0%, 100% { box-shadow: 0 0 0 0 rgba(160, 224, 255, 0.45); }
     50%      { box-shadow: 0 0 0 6px rgba(160, 224, 255, 0); }
+}
+
+@keyframes dictation-bridge-recording-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255, 90, 78, 0.55); }
+    50%      { box-shadow: 0 0 0 7px rgba(255, 90, 78, 0); }
+}
+
+@keyframes dictation-bridge-transcribing-pulse {
+    0%, 100% { opacity: 0.65; }
+    50%      { opacity: 1; }
 }
 
 /* Modal iframe overlay (used when openStyle === 'iframe'). */
@@ -247,7 +272,9 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-    .dictation-bridge-tts-btn.dbb-tts-playing {
+    .dictation-bridge-tts-btn.dbb-tts-playing,
+    .dictation-bridge-mic--recording,
+    .dictation-bridge-mic--transcribing {
         animation: none;
     }
 }

@@ -56,6 +56,7 @@ const DEFAULTS = {
     serverToken: '',             // MVP-1: bearer token from ~/.local/share/dictation-server/token
     autoSend: false,
     appendMode: 'replace',       // 'replace' | 'append'
+    captureMode: 'phone-popup',  // 'phone-popup' | 'desktop-push-to-talk' | 'desktop-toggle'
     openStyle: 'popup',          // 'popup' | 'iframe'
     liveMirror: false,           // dictation-edit -> textarea while typing on phone
     pushContext: true,           // send last AI message to server on ready
@@ -97,6 +98,18 @@ let activeIsIframe = false;
 let activeModal = null;
 let popupWatcher = null;
 
+// Slice B — direct desktop microphone capture. Audio exists only in this
+// in-memory session object and the request body; it is never persisted here.
+const DESKTOP_CAPTURE_MAX_MS = 60_000;
+const DESKTOP_AUDIO_FORMATS = [
+    { mimeType: 'audio/webm;codecs=opus', extension: '.webm' },
+    { mimeType: 'audio/webm', extension: '.webm' },
+];
+const DESKTOP_CAPTURE_MODES = new Set(['phone-popup', 'desktop-push-to-talk', 'desktop-toggle']);
+let desktopCapture = null;
+let desktopPttHeld = false;
+const appliedDictationRequestIds = [];
+
 function settings() {
     if (!extension_settings[MODULE] || typeof extension_settings[MODULE] !== 'object') {
         extension_settings[MODULE] = structuredClone(DEFAULTS);
@@ -107,6 +120,9 @@ function settings() {
         if (shouldMigrateServerUrl(extension_settings[MODULE].serverUrl)) {
             extension_settings[MODULE].serverUrl = defaultServerUrl();
             try { saveSettings(); } catch {}
+        }
+        if (!DESKTOP_CAPTURE_MODES.has(extension_settings[MODULE].captureMode)) {
+            extension_settings[MODULE].captureMode = DEFAULTS.captureMode;
         }
     }
     return extension_settings[MODULE];
@@ -1603,76 +1619,8 @@ function connectSSE() {
         let data;
         try { data = JSON.parse(e.data); }
         catch { WARN('SSE dictation-result: bad JSON'); return; }
-        let text = String(data.text || '').trim();
-        if (!text) { WARN('SSE dictation-result: empty text'); endStreamingSession(); return; }
-        // MVP-16: remember the mode for "Done · <mode>" labelling on the
-        // state bar's terminal frame.
-        if (data.mode && typeof data.mode === 'string') lastDoneMode = data.mode;
-        // Model attribution — which formatter model won the chain (and whether
-        // an earlier tier was skipped). Surfaces on the "Done" bar + Diagnostics.
-        if (typeof data.model === 'string') lastDoneModel = data.model;
-        lastModelFallback = !!data.model_fallback;
-        const cfg = settings();
-        // Per-event auto_send overrides setting when explicitly true; otherwise setting applies.
-        const doAutoSend = data.auto_send === true ? true : !!cfg.autoSend;
-
-        // POL-1: server strips the 'OOC:' prefix and signals via mode_override.
-        // Prepend the OOC tag back so the chat displays the convention ST
-        // readers expect (OOC chunks are routed differently downstream).
-        const modeOverride = String(data.mode_override || data.modeOverride || '').toLowerCase();
-        if ((modeOverride === 'ooc' || modeOverride === 'grammar_clean')
-                && data.is_ooc === true) {
-            if (!/^\s*ooc\b/i.test(text)) text = `OOC: ${text}`;
-        }
-
-        // MVP-13: if we streamed deltas for this request, replace the streamed
-        // span with the canonical text. The session captured the original
-        // textarea base, so we can rebuild deterministically regardless of
-        // appendMode.
-        if (streamingSession && (!data.requestId || streamingSession.requestId === String(data.requestId))) {
-            const ta = document.getElementById('send_textarea');
-            const sessAppendMode = streamingSession.appendMode;
-            const base = streamingSession.base;
-            endStreamingSession();
-            if (ta) {
-                pushUndoSnapshot('dictation-result-stream');
-                const sep = (sessAppendMode === 'append' && base) ? '\n\n' : '';
-                ta.value = (sessAppendMode === 'append' ? base + sep : '') + text;
-                ta.dispatchEvent(new Event('input', { bubbles: true }));
-                try { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
-                if (doAutoSend) {
-                    const btn = document.getElementById('send_but');
-                    if (btn) btn.click(); else WARN('send_but not found, cannot auto-send');
-                    setTimeout(() => maybeReadDictatedPersonaText(text), 200);
-                }
-            }
-        } else {
-            writeToTextarea(text, { autoSend: doAutoSend, appendMode: cfg.appendMode });
-            if (doAutoSend) setTimeout(() => maybeReadDictatedPersonaText(text), 200);
-        }
-
-        renderRepairTraceFromPayload(data, text);
-
-        if (data.formatting_skipped && window.toastr) {
-            const reason = data.formatting_reason ? `: ${escapeHtml(data.formatting_reason)}` : '';
-            window.toastr.warning(`RP formatting skipped${reason}. Raw transcript used.`, 'Dictation Bridge');
-        } else if (window.toastr) {
-            const repair = data.has_repair_trace === true
-                ? ' · repair trace available on phone'
-                : '';
-            window.toastr.success(`Received from phone${repair}`, 'Dictation Bridge', { timeOut: 1500 });
-        }
-
-        // POL-3: render low-confidence "did you mean?" banner if the server
-        // tagged any spans below the confidence threshold. Banner auto-hides
-        // on textarea input, Esc, or after 10s.
-        if (Array.isArray(data.low_confidence_spans) && data.low_confidence_spans.length) {
-            try { renderLowConfBanner(data.low_confidence_spans); }
-            catch (err) { WARN('lowconf banner render failed', err?.message || err); }
-        } else if (Array.isArray(data.lowConfidenceSpans) && data.lowConfidenceSpans.length) {
-            // Tolerate camelCase server payload as well.
-            try { renderLowConfBanner(data.lowConfidenceSpans); }
-            catch (err) { WARN('lowconf banner render failed', err?.message || err); }
+        if (!applyDictationResult(data, { source: desktopCapture ? 'desktop' : 'phone' })) {
+            if (!String(data?.text ?? '').trim()) endStreamingSession();
         }
     });
 
@@ -1715,6 +1663,78 @@ function disconnectSSE() {
     // MVP-13: drop any in-flight stream — caller will reconnect and the next
     // dictation-result will land via the batch path.
     endStreamingSession();
+}
+
+function rememberAppliedDictationRequest(requestId) {
+    if (!requestId || appliedDictationRequestIds.includes(requestId)) return;
+    appliedDictationRequestIds.push(requestId);
+    if (appliedDictationRequestIds.length > 32) appliedDictationRequestIds.shift();
+}
+
+function dictationRequestWasApplied(requestId) {
+    return !!requestId && appliedDictationRequestIds.includes(requestId);
+}
+
+/** Apply the canonical server result through the shared textarea/result path.
+ *  Desktop HTTP and SSE may deliver the same request; request-id dedupe keeps
+ *  that single recording from being inserted twice. */
+function applyDictationResult(data, { source = 'phone' } = {}) {
+    const requestId = String(data?.requestId || data?.request_id || '');
+    if (dictationRequestWasApplied(requestId)) return false;
+    let text = String(data?.text ?? '').trim();
+    if (!text) return false;
+    rememberAppliedDictationRequest(requestId);
+
+    if (data.mode && typeof data.mode === 'string') lastDoneMode = data.mode;
+    if (typeof data.model === 'string') lastDoneModel = data.model;
+    lastModelFallback = !!data.model_fallback;
+    const cfg = settings();
+    const doAutoSend = data.auto_send === true ? true : !!cfg.autoSend;
+
+    const modeOverride = String(data.mode_override || data.modeOverride || '').toLowerCase();
+    if ((modeOverride === 'ooc' || modeOverride === 'grammar_clean')
+            && data.is_ooc === true && !/^\s*ooc\b/i.test(text)) {
+        text = `OOC: ${text}`;
+    }
+
+    if (streamingSession && (!requestId || streamingSession.requestId === requestId)) {
+        const ta = document.getElementById('send_textarea');
+        const sessAppendMode = streamingSession.appendMode;
+        const base = streamingSession.base;
+        endStreamingSession();
+        if (ta) {
+            pushUndoSnapshot('dictation-result-stream');
+            const sep = (sessAppendMode === 'append' && base) ? '\n\n' : '';
+            ta.value = (sessAppendMode === 'append' ? base + sep : '') + text;
+            ta.dispatchEvent(new Event('input', { bubbles: true }));
+            try { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
+            if (doAutoSend) {
+                const btn = document.getElementById('send_but');
+                if (btn) btn.click(); else WARN('send_but not found, cannot auto-send');
+                setTimeout(() => maybeReadDictatedPersonaText(text), 200);
+            }
+        }
+    } else {
+        writeToTextarea(text, { autoSend: doAutoSend, appendMode: cfg.appendMode });
+        if (doAutoSend) setTimeout(() => maybeReadDictatedPersonaText(text), 200);
+    }
+
+    renderRepairTraceFromPayload(data, text);
+    if (data.formatting_skipped && window.toastr) {
+        const reason = data.formatting_reason ? `: ${escapeHtml(data.formatting_reason)}` : '';
+        window.toastr.warning(`RP formatting skipped${reason}. Raw transcript used.`, 'Dictation Bridge');
+    } else if (window.toastr) {
+        const repair = data.has_repair_trace === true ? ' · repair trace available on phone' : '';
+        const label = source === 'desktop' ? 'Desktop dictation ready' : `Received from phone${repair}`;
+        window.toastr.success(label, 'Dictation Bridge', { timeOut: 1500 });
+    }
+
+    const spans = data.low_confidence_spans || data.lowConfidenceSpans;
+    if (Array.isArray(spans) && spans.length) {
+        try { renderLowConfBanner(spans); }
+        catch (err) { WARN('lowconf banner render failed', err?.message || err); }
+    }
+    return true;
 }
 
 function buildPairedPhoneUrl({ embed = true } = {}) {
@@ -1909,10 +1929,37 @@ function injectMicButton() {
     btn.className = 'fa-solid fa-microphone interactable dictation-bridge-mic';
     btn.setAttribute('title', 'Dictation bridge (open dictation UI)');
     btn.setAttribute('tabindex', '0');
-    btn.addEventListener('click', onMicClick);
-    btn.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onMicClick(); }
+    btn.setAttribute('role', 'button');
+    btn.setAttribute('aria-label', 'Open phone dictation popup');
+    btn.addEventListener('pointerdown', onMicPointerDown);
+    btn.addEventListener('pointerup', onMicPointerStop);
+    btn.addEventListener('pointercancel', onMicPointerStop);
+    btn.addEventListener('lostpointercapture', onMicPointerStop);
+    btn.addEventListener('click', (e) => {
+        if (settings().captureMode === 'desktop-push-to-talk') {
+            e.preventDefault();
+            return;
+        }
+        activateMic();
     });
+    btn.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        e.preventDefault();
+        if (settings().captureMode === 'desktop-push-to-talk') {
+            if (e.repeat) return;
+            desktopPttHeld = true;
+            startDesktopRecording('keyboard').catch(showDesktopCaptureError);
+        } else if (!e.repeat) {
+            activateMic();
+        }
+    });
+    btn.addEventListener('keyup', (e) => {
+        if ((e.key === 'Enter' || e.key === ' ') && desktopPttHeld) {
+            e.preventDefault();
+            releaseDesktopPushToTalk('keyboard-release');
+        }
+    });
+    btn.addEventListener('blur', () => releaseDesktopPushToTalk('keyboard-blur'));
 
     // Sit to the left of the paper-plane send button if present, otherwise at the end.
     const sendBut = document.getElementById('send_but');
@@ -1921,6 +1968,7 @@ function injectMicButton() {
     } else {
         host.appendChild(btn);
     }
+    setMicState('idle');
 }
 
 function setMicActive(active) {
@@ -1928,7 +1976,244 @@ function setMicActive(active) {
     if (btn) btn.classList.toggle('dictation-bridge-mic--active', !!active);
 }
 
+function setMicState(state) {
+    const btn = document.getElementById('dictation_bridge_mic');
+    if (!btn) return;
+    btn.classList.toggle('dictation-bridge-mic--recording', state === 'recording');
+    btn.classList.toggle('dictation-bridge-mic--transcribing', state === 'transcribing');
+    btn.dataset.state = state;
+    const labels = {
+        idle: settings().captureMode === 'phone-popup'
+            ? 'Open phone dictation popup'
+            : (settings().captureMode === 'desktop-push-to-talk'
+                ? 'Hold to dictate'
+                : 'Start desktop dictation'),
+        recording: 'Recording — release or activate again to stop',
+        transcribing: 'Transcribing desktop recording',
+    };
+    const label = labels[state] || labels.idle;
+    btn.setAttribute('title', label);
+    btn.setAttribute('aria-label', label);
+    btn.setAttribute('aria-busy', state === 'transcribing' ? 'true' : 'false');
+}
+
+function desktopAudioFormat() {
+    if (typeof MediaRecorder === 'undefined') return null;
+    return DESKTOP_AUDIO_FORMATS.find(format => MediaRecorder.isTypeSupported(format.mimeType)) || null;
+}
+
+function cleanupDesktopCaptureHardware(capture) {
+    if (!capture) return;
+    if (capture.maxTimer) {
+        clearTimeout(capture.maxTimer);
+        capture.maxTimer = null;
+    }
+    if (capture.stream) {
+        for (const track of capture.stream.getTracks()) {
+            try { track.stop(); } catch {}
+        }
+        capture.stream = null;
+    }
+}
+
+function finishDesktopCapture(capture) {
+    cleanupDesktopCaptureHardware(capture);
+    if (capture?.chunks) capture.chunks.length = 0;
+    if (capture) capture.abortController = null;
+    if (desktopCapture === capture) {
+        desktopCapture = null;
+        setMicState('idle');
+    }
+}
+
+function cancelDesktopCapture(capture = desktopCapture) {
+    if (!capture) return;
+    capture.cancelled = true;
+    capture.stopRequested = true;
+    capture.abortController?.abort();
+    if (capture.recorder && capture.recorder.state !== 'inactive') {
+        try { capture.recorder.stop(); } catch {}
+    }
+    finishDesktopCapture(capture);
+}
+
+function showDesktopCaptureError(error) {
+    const message = escapeHtml(error?.message || 'Desktop microphone failed');
+    toast('error', `Desktop dictation failed: ${message}`, { timeOut: 4000 });
+}
+
+function activateMic() {
+    onMicClick().catch((error) => {
+        if (settings().captureMode === 'phone-popup') WARN('mic activation failed', error?.message || error);
+        else showDesktopCaptureError(error);
+    });
+}
+
+function onMicPointerDown(e) {
+    if (settings().captureMode !== 'desktop-push-to-talk' || e.button !== 0) return;
+    e.preventDefault();
+    desktopPttHeld = true;
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}
+    startDesktopRecording('pointer').catch(showDesktopCaptureError);
+}
+
+function onMicPointerStop(e) {
+    if (!desktopPttHeld) return;
+    e.preventDefault();
+    releaseDesktopPushToTalk(e.type);
+}
+
+function releaseDesktopPushToTalk(reason) {
+    if (!desktopPttHeld) return;
+    desktopPttHeld = false;
+    stopDesktopRecording(reason);
+}
+
+async function startDesktopRecording(trigger) {
+    if (desktopCapture) return false;
+    const format = desktopAudioFormat();
+    if (!format || !navigator.mediaDevices?.getUserMedia) {
+        throw new Error('This browser cannot record server-compatible WebM audio');
+    }
+
+    const capture = {
+        trigger,
+        format,
+        stream: null,
+        recorder: null,
+        chunks: [],
+        maxTimer: null,
+        abortController: null,
+        stopRequested: false,
+        cancelled: false,
+        phase: 'acquiring',
+        submissionStarted: false,
+        recorderErrorHandled: false,
+    };
+    desktopCapture = capture;
+    setMicState('recording');
+
+    try {
+        capture.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        if (desktopCapture !== capture || capture.cancelled || capture.stopRequested
+                || (settings().captureMode === 'desktop-push-to-talk' && !desktopPttHeld)) {
+            finishDesktopCapture(capture);
+            return false;
+        }
+
+        const recorder = capture.recorder = new MediaRecorder(capture.stream, {
+            mimeType: format.mimeType,
+        });
+        recorder.addEventListener('dataavailable', (event) => {
+            if (!capture.cancelled && event.data?.size) capture.chunks.push(event.data);
+        });
+        recorder.addEventListener('error', () => {
+            if (capture.recorderErrorHandled) return;
+            capture.recorderErrorHandled = true;
+            showDesktopCaptureError(new Error('Browser recording error'));
+            cancelDesktopCapture(capture);
+        }, { once: true });
+        recorder.addEventListener('stop', () => {
+            if (capture.cancelled || capture.recorderErrorHandled || capture.submissionStarted) return;
+            capture.submissionStarted = true;
+            submitDesktopRecording(capture).catch((error) => {
+                if (!capture.cancelled && error?.name !== 'AbortError') showDesktopCaptureError(error);
+            });
+        }, { once: true });
+        recorder.start();
+        capture.phase = 'recording';
+        capture.maxTimer = setTimeout(() => {
+            toast('warning', 'Desktop recording stopped at the 60-second privacy limit.');
+            stopDesktopRecording('max-duration', capture);
+        }, DESKTOP_CAPTURE_MAX_MS);
+        return true;
+    } catch (error) {
+        const wasCancelled = capture.cancelled || desktopCapture !== capture;
+        capture.cancelled = true;
+        finishDesktopCapture(capture);
+        if (wasCancelled) return false;
+        throw error;
+    }
+}
+
+function stopDesktopRecording(reason, capture = desktopCapture) {
+    if (!capture || capture.cancelled) return false;
+    capture.stopRequested = true;
+    if (capture.phase === 'acquiring' || capture.phase === 'transcribing') {
+        cancelDesktopCapture(capture);
+        return true;
+    }
+    if (capture.recorder?.state === 'recording') {
+        try { capture.recorder.stop(); } catch (error) {
+            cancelDesktopCapture(capture);
+            showDesktopCaptureError(error);
+        }
+    }
+    return true;
+}
+
+async function submitDesktopRecording(capture) {
+    cleanupDesktopCaptureHardware(capture);
+    if (desktopCapture !== capture || capture.cancelled) return;
+    const blob = new Blob(capture.chunks, { type: capture.format.mimeType });
+    capture.chunks.length = 0;
+    if (!blob.size) {
+        finishDesktopCapture(capture);
+        throw new Error('No microphone audio was captured');
+    }
+
+    capture.phase = 'transcribing';
+    setMicState('transcribing');
+    capture.abortController = new AbortController();
+    try {
+        const cfg = settings();
+        const ctx = currentContext();
+        const character = currentReformatCharacterKey();
+        let modeId = String(formatterModeEl?.value || '').trim();
+        if (!modeId && character) modeId = await fetchCharMode(character);
+        if (capture.cancelled) return;
+
+        const requestedLanguage = String(cfg.language || 'auto').trim().toLowerCase() || 'auto';
+        const language = /^(?:[a-z]{2,4}|auto)$/.test(requestedLanguage) ? requestedLanguage : 'auto';
+        const params = new URLSearchParams();
+        params.set('mode', modeId);
+        params.set('context', cfg.pushContext ? (ctx.lastAi || '') : '');
+        params.set('persona', ctx.personaId || '');
+        params.set('character', character);
+        params.set('language', language);
+        const url = `${cfg.serverUrl.replace(/\/+$/, '')}/transcribe?${params.toString()}`;
+        const res = await fetch(url, {
+            method: 'POST',
+            mode: 'cors',
+            cache: 'no-store',
+            headers: { 'Content-Type': capture.format.mimeType, ...authHeaders() },
+            body: blob,
+            signal: capture.abortController.signal,
+        });
+        let data = null;
+        try { data = await res.json(); } catch {}
+        if (capture.cancelled) return;
+        if (!res.ok || data?.error) {
+            throw new Error(String(data?.error || `transcribe_http_${res.status}`));
+        }
+        if (!applyDictationResult(data, { source: 'desktop' })) {
+            if (!dictationRequestWasApplied(String(data?.request_id || data?.requestId || ''))) {
+                throw new Error('Server returned no transcript');
+            }
+        }
+    } finally {
+        finishDesktopCapture(capture);
+    }
+}
+
 async function onMicClick() {
+    const captureMode = settings().captureMode || 'phone-popup';
+    if (captureMode === 'desktop-push-to-talk') return;
+    if (captureMode === 'desktop-toggle') {
+        if (desktopCapture) stopDesktopRecording('toggle');
+        else await startDesktopRecording('toggle');
+        return;
+    }
     if (activeTarget) {
         // Toggle: already open -> focus or close.
         if (activeIsIframe) {
@@ -3785,6 +4070,14 @@ function buildSettingsPanel() {
                         <option value="iframe" data-desktop-only="1">Modal iframe (desktop only — phone needs popup)</option>
                     </select>
 
+                    <label for="dictation_bridge_capture_mode">Microphone action</label>
+                    <select id="dictation_bridge_capture_mode" class="text_pole" title="Choose whether the send-bar microphone opens the phone workflow or records directly in this browser.">
+                        <option value="phone-popup">Phone popup (default)</option>
+                        <option value="desktop-push-to-talk">Desktop push-to-talk (hold)</option>
+                        <option value="desktop-toggle">Desktop toggle (click to start/stop)</option>
+                    </select>
+                    <small class="notes" style="margin-top:0">Desktop audio is sent directly to Calliope for transcription and is not stored by the extension. Recording stops after 60 seconds.</small>
+
                     <label for="dictation_bridge_append_mode">Text handling</label>
                     <select id="dictation_bridge_append_mode" class="text_pole">
                         <option value="replace">Replace textarea</option>
@@ -3953,6 +4246,7 @@ function buildSettingsPanel() {
     const pairQrCopyEl = host.querySelector('#dictation_bridge_pair_qr_copy');
     const pairQrHideEl = host.querySelector('#dictation_bridge_pair_qr_hide');
     const openEl = host.querySelector('#dictation_bridge_open_style');
+    const captureModeEl = host.querySelector('#dictation_bridge_capture_mode');
     const appendEl = host.querySelector('#dictation_bridge_append_mode');
     const autoEl = host.querySelector('#dictation_bridge_autosend');
     const pushEl = host.querySelector('#dictation_bridge_push_context');
@@ -3981,6 +4275,7 @@ function buildSettingsPanel() {
     urlEl.value = s.serverUrl;
     tokenEl.value = s.serverToken || '';
     openEl.value = s.openStyle;
+    captureModeEl.value = s.captureMode || DEFAULTS.captureMode;
     appendEl.value = s.appendMode;
     autoEl.checked = !!s.autoSend;
     pushEl.checked = !!s.pushContext;
@@ -4016,6 +4311,16 @@ function buildSettingsPanel() {
     if (pairQrCopyEl) pairQrCopyEl.addEventListener('click', () => copyPairedPhoneUrl().catch(() => {}));
     if (pairQrHideEl) pairQrHideEl.addEventListener('click', () => hidePairQrPanel(host));
     openEl.addEventListener('change', () => { s.openStyle = openEl.value; saveSettings(); });
+    captureModeEl.addEventListener('change', () => {
+        const fresh = settings();
+        desktopPttHeld = false;
+        cancelDesktopCapture();
+        fresh.captureMode = DESKTOP_CAPTURE_MODES.has(captureModeEl.value)
+            ? captureModeEl.value
+            : DEFAULTS.captureMode;
+        saveSettings();
+        setMicState('idle');
+    });
     appendEl.addEventListener('change', () => { s.appendMode = appendEl.value; saveSettings(); });
     autoEl.addEventListener('change', () => { s.autoSend = !!autoEl.checked; saveSettings(); });
     pushEl.addEventListener('change', () => { s.pushContext = !!pushEl.checked; saveSettings(); });
@@ -4556,6 +4861,10 @@ export async function init() {
     initialized = true;
     settings();
     window.addEventListener('message', onWindowMessage);
+    window.addEventListener('pagehide', () => {
+        desktopPttHeld = false;
+        cancelDesktopCapture();
+    });
     buildQuickLaunchPanel();
     buildSettingsPanel();
     // Inject now if DOM is ready, otherwise on app_ready.
