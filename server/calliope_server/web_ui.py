@@ -1702,6 +1702,9 @@ let pillTickTimer = null;
 // Embed mode (ST extension iframe)
 const isEmbed = document.querySelector('meta[name="dictation-embed"]')?.content === '1';
 const embedConfig = window.DICTATION_EMBED_CONFIG || {};
+const transcriptionLanguage = String(
+  embedConfig.language || new URLSearchParams(location.search).get('language') || 'auto'
+).trim().toLowerCase() || 'auto';
 const embedParentOrigin = (() => {
   try { return new URL(document.referrer).origin || ''; }
   catch { return ''; }
@@ -2528,6 +2531,7 @@ async function sendAudio() {
   const mode = getMode(currentMode);
   const params = new URLSearchParams({ model });
   params.set('provider', currentProvider);
+  params.set('language', transcriptionLanguage);
   if (currentMode) params.set('mode', currentMode);
   if (context) params.set('context', context);
 

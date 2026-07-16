@@ -578,25 +578,30 @@ def load_char_modes() -> dict:
 
 
 def save_char_mode(character_id: str, mode_id: str) -> dict:
-    """Persist `{character_id: mode_id}` into the char-modes file. Returns full dict."""
-    if not character_id or not mode_id:
-        return load_char_modes()
-    current = dict(load_char_modes())  # copy
-    if current.get(character_id) == mode_id:
-        return current
-    current[character_id] = mode_id
-    try:
-        _atomic_write(config.CHAR_MODES_FILE, _serialize_config(current))
-    except Exception as e:
-        log.warning(f"Failed to write {config.CHAR_MODES_FILE}: {e}")
+    """Persist or clear a character mode. Returns the full persisted mapping."""
+    if not character_id:
         return load_char_modes()
     with char_modes_lock:
+        current = dict(load_char_modes())  # copy
+        if mode_id:
+            if current.get(character_id) == mode_id:
+                return current
+            current[character_id] = mode_id
+        else:
+            if character_id not in current:
+                return current
+            del current[character_id]
+        try:
+            _atomic_write(config.CHAR_MODES_FILE, _serialize_config(current))
+        except Exception as e:
+            log.warning(f"Failed to write {config.CHAR_MODES_FILE}: {e}")
+            return load_char_modes()
         _char_modes_cache["data"] = current
         try:
             _char_modes_cache["mtime"] = config.CHAR_MODES_FILE.stat().st_mtime
         except Exception:
             _char_modes_cache["mtime"] = 0.0
-    return current
+        return current
 
 
 def get_char_mode(character_id: str) -> str:

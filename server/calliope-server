@@ -1262,9 +1262,10 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         persona = query.get("persona", [""])[0]
         character = query.get("character", [""])[0]
         mode = query.get("mode", [""])[0]
+        language = query.get("language", ["auto"])[0] or "auto"
 
 
-        if not embed and not (chat or persona or character or mode):
+        if not embed and not (chat or persona or character or mode or language != "auto"):
             return WEB_UI
 
         cfg = {
@@ -1273,6 +1274,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             "persona": persona or None,
             "character": character or None,
             "mode": mode or None,
+            "language": language,
         }
         # Values are user-supplied query params: escape "<" so a crafted
         # ?chat=</script><script>… link can't break out of the script tag.
@@ -1668,9 +1670,10 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                                      code="unknown_mode", status=400)
                 return
             updated = save_char_mode(char, mode_id)
+            persisted_mode = str(updated.get(char, ""))
             self.send_json({
                 "character": char,
-                "mode": mode_id,
+                "mode": persisted_mode,
                 "modes": updated,
             })
         elif path == "/pair":
@@ -1991,7 +1994,10 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             self.send_error_json("Invalid JSON", code="bad_json", status=400)
             return
 
-        text = data.get("text", "").strip()
+        text = data.get("text", "")
+        if not isinstance(text, str):
+            text = str(text or "")
+        persist_transcript = data.get("persist_transcript", True) is not False
         # Mode resolution: body wins over query; then legacy rp.
         mode_id = (data.get("mode")
                    or params.get("mode", [""])[0]
@@ -2026,7 +2032,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         if chat_source and chat_source != "manual":
             chat_context = self._build_chat_context(chat_source)
 
-        if not text:
+        if not text.strip():
             self.send_error_json("No text to reformat", code="missing_param", status=400)
             return
 
@@ -2039,7 +2045,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             entry_id = None
 
         target_index: int | None = None
-        if entry_id is not None:
+        if persist_transcript and entry_id is not None:
             with transcript_lock:
                 for i, e in enumerate(session_transcript):
                     if e.get("id") == entry_id:
@@ -2060,7 +2066,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
 
         # Legacy path: walk backwards and pop the most recent user entry so the
         # new reformatted version appends at the tail.
-        if target_index is None:
+        if persist_transcript and target_index is None:
             with transcript_lock:
                 for i in range(len(session_transcript) - 1, -1, -1):
                     if session_transcript[i]["role"] == "user":
@@ -2086,7 +2092,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         result_entry_id: str | None = None
         chat_id_tag = ""
         with transcript_lock:
-            if is_enhancement and not formatting_skipped:
+            if persist_transcript and is_enhancement and not formatting_skipped:
                 if target_index is not None and target_index < len(session_transcript):
                     # In-place replacement: keep id + starred, update text + timestamp.
                     existing = session_transcript[target_index]

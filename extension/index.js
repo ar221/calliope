@@ -62,6 +62,8 @@ const DEFAULTS = {
     broadcastState: true,        // POST /state on chat/char/persona change + 30s heartbeat
     sseEnabled: true,            // Phase 2: subscribe to /events for direct-inject from phone
     voiceCommandsEnabled: true,  // POL-1: server-emitted dictation-command SSE dispatcher
+    language: 'auto',            // QW2: ?language= for transcription ('auto' = Whisper detect)
+    reformatMode: '',            // QW3: last-chosen "Reformat as…" mode id
     // ─── TTS read-back (Calliope Kokoro backend) ───────────────────────────
     ttsAutoReadAi: false,        // auto-fire TTS on every new AI message
     ttsAutoReadPersonaQuoted: true, // auto-fire TTS on new user messages, quoted dialogue only
@@ -122,6 +124,10 @@ function serverOrigin() {
     } catch {
         return null;
     }
+}
+
+function canonicalCharacterKey(value) {
+    return String(value || '').trim().replace(/\.png$/i, '');
 }
 
 /** Best-effort current-context snapshot for query params. */
@@ -646,35 +652,181 @@ function handleDictationStateEvent(data) {
 // ─── POL-6: group-chat addressee picker (extension side) ──────────────────
 // When chatType === 'group', render a chip row in the settings panel:
 // member chips with the last-speaker highlighted, plus an "All members"
-// joint-context chip. Click = persist the choice to the server's
-// /state/mode-memory, keyed by `<groupId>:<characterName>` so the next
-// dictation request can resolve the addressee server-side. The phone UI
-// renders an equivalent picker via the /state contract.
+// Click = keep an explicit extension-local addressee selection for character-
+// dependent ad-hoc reformat requests. The phone UI has its own picker through
+// the /state contract; this does not overload the character-mode schema.
 
 let activeAddressee = null; // { groupId, characterName | '*all' }
 
-async function persistAddresseeChoice(groupId, characterName) {
-    if (!groupId) return;
+// ─── QW1: formatter mode picker ────────────────────────────────────────────
+// Fetches the pipeline modes from GET /modes and reads/writes the per-
+// character remembered mode through /state/mode-memory so the ST side stays
+// consistent with the phone UI (server persists into char-modes.yaml).
+let cachedModes = null; // [{id,label,...}] cached for the session
+let formatterModeEl = null;
+let formatterModeHintEl = null;
+let formatterModeRefreshSeq = 0;
+
+/** Character key used for per-character mode memory. Matches the id the
+ *  server resolves from broadcast /state (characterId). In group chats no
+ *  single character resolves, so this returns '' and callers must warn
+ *  instead of mis-saving under the group id. */
+function currentModeMemoryKey() {
+    if (selected_group) return '';
+    return canonicalCharacterKey(currentContext().characterId);
+}
+
+function currentReformatCharacterKey() {
+    if (!selected_group) return currentModeMemoryKey();
+    if (activeAddressee?.groupId !== String(selected_group)) return '';
+    const name = activeAddressee.characterName || '';
+    return name === '*all' ? '' : canonicalCharacterKey(name);
+}
+
+async function fetchModes() {
+    if (Array.isArray(cachedModes) && cachedModes.length) return cachedModes;
+    const cfg = settings();
+    const url = `${cfg.serverUrl.replace(/\/+$/, '')}/modes`;
+    const res = await fetch(url, {
+        method: 'GET',
+        mode: 'cors',
+        cache: 'no-store',
+        headers: { ...authHeaders() },
+    });
+    if (!res.ok) {
+        const err = new Error(`modes_http_${res.status}`);
+        err.status = res.status;
+        throw err;
+    }
+    const data = await res.json();
+    const modes = Array.isArray(data?.modes) ? data.modes : [];
+    if (modes.length) cachedModes = modes;
+    return modes;
+}
+
+/** GET the remembered mode id for a character, or '' when none/unresolved. */
+async function fetchCharMode(characterId) {
+    const char = String(characterId || '').trim();
+    if (!char) return '';
+    const cfg = settings();
+    const url = `${cfg.serverUrl.replace(/\/+$/, '')}/state/mode-memory?character=${encodeURIComponent(char)}`;
+    try {
+        const res = await fetch(url, {
+            method: 'GET',
+            mode: 'cors',
+            cache: 'no-store',
+            headers: { ...authHeaders() },
+        });
+        if (!res.ok) return '';
+        const data = await res.json();
+        return String(data?.mode || '').trim();
+    } catch (e) {
+        WARN('fetchCharMode failed', e?.message || e);
+        return '';
+    }
+}
+
+async function refreshFormatterModeForContext() {
+    const seq = ++formatterModeRefreshSeq;
+    const char = currentModeMemoryKey();
+    if (!formatterModeEl) return;
+    if (!char) {
+        formatterModeEl.value = '';
+        formatterModeEl.disabled = true;
+        if (formatterModeHintEl) formatterModeHintEl.textContent = selected_group
+            ? 'Per-character mode is unavailable in group chats.'
+            : 'No character resolved yet.';
+        return;
+    }
+    formatterModeEl.disabled = false;
+    if (formatterModeHintEl) formatterModeHintEl.textContent = `Loading remembered mode for ${char}…`;
+    const remembered = await fetchCharMode(char);
+    if (seq !== formatterModeRefreshSeq || char !== currentModeMemoryKey()) return;
+    formatterModeEl.value = cachedModes?.some(m => m.id === remembered) ? remembered : '';
+    if (formatterModeHintEl) formatterModeHintEl.textContent = remembered
+        ? `Remembered for ${char}.`
+        : `Using server default for ${char}.`;
+}
+
+/** POST a per-character mode selection. The server validates the mode id and
+ *  persists it so the next dictation resolves it server-side. */
+async function persistCharMode(characterId, modeId) {
+    const char = String(characterId || '').trim();
+    if (!char) return false;
     const cfg = settings();
     const url = `${cfg.serverUrl.replace(/\/+$/, '')}/state/mode-memory`;
-    const key = `${groupId}:${characterName || ''}`;
     try {
-        await fetch(url, {
+        const res = await fetch(url, {
             method: 'POST',
             mode: 'cors',
             cache: 'no-store',
             headers: { 'Content-Type': 'application/json', ...authHeaders() },
             body: JSON.stringify({
-                key,
-                groupId,
-                addressee: characterName || '',
-                jointContext: characterName === '*all',
-                ts: Date.now(),
+                character: char,
+                mode: String(modeId || '').trim(),
             }),
         });
+        let data = null;
+        try { data = await res.json(); } catch {}
+        return res.ok && String(data?.character || '') === char
+            && String(data?.mode || '') === String(modeId || '').trim();
     } catch (e) {
-        WARN('persistAddresseeChoice failed', e?.message || e);
+        WARN('persistCharMode failed', e?.message || e);
+        return false;
     }
+}
+
+// ─── QW3: "Reformat as…" — re-run the formatter on existing textarea text ───
+// Calls POST /reformat with the chosen mode and replaces the textarea with
+// the result (undo snapshot happens inside writeToTextarea). All server-
+// derived strings shown in toasts pass through escapeHtml.
+async function reformatCurrentText(modeId) {
+    const ta = document.getElementById('send_textarea');
+    const source = String(ta?.value || '');
+    if (!source.trim()) {
+        toast('info', 'Nothing to reformat — the message box is empty');
+        return;
+    }
+    const cfg = settings();
+    const ctx = currentContext();
+    const url = `${cfg.serverUrl.replace(/\/+$/, '')}/reformat`;
+    const res = await fetch(url, {
+        method: 'POST',
+        mode: 'cors',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({
+            text: source,
+            mode: String(modeId || '').trim(),
+            context: ctx.lastAi || '',
+            persona: ctx.personaId || '',
+            character: currentReformatCharacterKey(),
+            persist_transcript: false,
+        }),
+    });
+    let data = null;
+    try { data = await res.json(); } catch {}
+    if (!res.ok) {
+        const detail = data?.error || data?.message || `HTTP ${res.status}`;
+        const err = new Error(String(detail));
+        err.status = res.status;
+        throw err;
+    }
+    if (data.formatting_skipped) {
+        const reason = data.formatting_reason ? `: ${escapeHtml(data.formatting_reason)}` : '';
+        toast('warning', `Reformat skipped${reason}. Original text kept.`);
+        return data;
+    }
+    const out = String(data?.text || '');
+    if (!out.trim()) throw new Error('server returned empty text');
+    if (!ta || ta.value !== source) {
+        toast('warning', 'Message changed while reformatting — server result was not applied');
+        return data;
+    }
+    writeToTextarea(out, { autoSend: false, appendMode: 'replace' });
+    if (typeof data?.mode === 'string' && data.mode) lastDoneMode = data.mode;
+    toast('success', `Reformatted as ${escapeHtml(data?.mode || modeId || 'mode')}`);
+    return data;
 }
 
 function renderAddresseePicker() {
@@ -692,11 +844,11 @@ function renderAddresseePicker() {
     const lastSpeaker = resolveLastSpeaker();
     const groupId = String(selected_group);
 
-    // Default selection: persisted choice if it matches, else last speaker,
-    // else nothing.
+    // Only an explicit click selects an addressee. Last speaker stays a visual
+    // hint but must not silently become character context for ad-hoc reformat.
     const cur = activeAddressee && activeAddressee.groupId === groupId
         ? activeAddressee.characterName
-        : (lastSpeaker || '');
+        : '';
 
     if (members.length === 0) {
         host.style.display = 'block';
@@ -734,7 +886,6 @@ function renderAddresseePicker() {
         chip.addEventListener('click', () => {
             const name = chip.getAttribute('data-name') || '';
             activeAddressee = { groupId, characterName: name };
-            persistAddresseeChoice(groupId, name);
             renderAddresseePicker(); // repaint with the new selection.
         });
     });
@@ -1576,6 +1727,9 @@ function buildPairedPhoneUrl({ embed = true } = {}) {
     if (ctx.chatId) qp.set('chat', String(ctx.chatId));
     if (ctx.personaId) qp.set('persona', String(ctx.personaId));
     if (ctx.characterId) qp.set('character', String(ctx.characterId));
+    // QW2: always carry transcription language; 'auto' prevents a silent en fallback.
+    const lang = String(cfg.language || 'auto').trim().toLowerCase() || 'auto';
+    qp.set('language', lang);
     // Pass bearer token via query so the phone UI can stash it in
     // sessionStorage and attach to its own fetch + EventSource calls. The
     // server scrubs ?token= from browser history on load and redacts request
@@ -3676,6 +3830,45 @@ function buildSettingsPanel() {
                     <!-- POL-6: addressee picker (group chats only). Hidden on solo. -->
                     <div id="dictation_bridge_addressee" style="display:none;margin:6px 0 4px 0"></div>
 
+                    <!-- QW1/QW2/QW3: formatter mode + language + reformat ── -->
+                    <div class="dbb-formatter-settings" style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(201, 178, 139, 0.18)">
+                        <div style="font-size:11px;letter-spacing:0.06em;text-transform:uppercase;color:#FFB648;margin-bottom:4px">Formatter</div>
+
+                        <label for="dictation_bridge_mode">Formatter mode (per character)</label>
+                        <select id="dictation_bridge_mode" class="text_pole" title="Formatter pipeline mode for the active character. Fetched from the server's /modes; saved per-character so the phone UI stays in sync.">
+                            <option value="">— server default —</option>
+                        </select>
+                        <small id="dictation_bridge_mode_hint" class="notes" style="margin-top:0">Modes populate from <code>/modes</code>. Saved to per-character memory (<code>/state/mode-memory</code>).</small>
+
+                        <label for="dictation_bridge_language">Transcription language</label>
+                        <select id="dictation_bridge_language" class="text_pole" title="Passed as ?language= to transcription. 'auto' lets Whisper detect the spoken language.">
+                            <option value="auto">Auto-detect</option>
+                            <option value="en">English (en)</option>
+                            <option value="es">Spanish (es)</option>
+                            <option value="fr">French (fr)</option>
+                            <option value="de">German (de)</option>
+                            <option value="it">Italian (it)</option>
+                            <option value="pt">Portuguese (pt)</option>
+                            <option value="nl">Dutch (nl)</option>
+                            <option value="ru">Russian (ru)</option>
+                            <option value="ja">Japanese (ja)</option>
+                            <option value="zh">Chinese (zh)</option>
+                            <option value="ko">Korean (ko)</option>
+                            <option value="ar">Arabic (ar)</option>
+                            <option value="hi">Hindi (hi)</option>
+                            <option value="pl">Polish (pl)</option>
+                            <option value="tr">Turkish (tr)</option>
+                        </select>
+
+                        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:6px 0 0 0">
+                            <select id="dictation_bridge_reformat_mode" class="text_pole" style="flex:1;min-width:120px" title="Mode to reformat the current message box text with">
+                                <option value="">Reformat as…</option>
+                            </select>
+                            <button id="dictation_bridge_reformat_go" type="button" class="menu_button" title="Re-run the formatter on the current message box text with the chosen mode" style="padding:3px 10px;font-size:12px;border:1px solid rgba(255,182,72,0.55);background:rgba(255,182,72,0.08);color:#FFB648;border-radius:2px;cursor:pointer">Reformat</button>
+                        </div>
+                        <small class="notes" style="margin-top:0">Reruns <code>/reformat</code> on the message box text; the original is undo-able.</small>
+                    </div>
+
                     <!-- TTS read-back (Kokoro backend) ─────────────────── -->
                     <div class="dbb-tts-settings" style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(201, 178, 139, 0.18)">
                         <div style="font-size:11px;letter-spacing:0.06em;text-transform:uppercase;color:#FFB648;margin-bottom:4px">TTS (read-back)</div>
@@ -3847,6 +4040,122 @@ function buildSettingsPanel() {
         voiceCmdEl.addEventListener('change', () => {
             s.voiceCommandsEnabled = !!voiceCmdEl.checked;
             saveSettings();
+        });
+    }
+
+    // ─── QW1/QW2/QW3: formatter mode + language + reformat wiring ───────────
+    const modeEl = formatterModeEl = host.querySelector('#dictation_bridge_mode');
+    const modeHintEl = formatterModeHintEl = host.querySelector('#dictation_bridge_mode_hint');
+    const languageEl = host.querySelector('#dictation_bridge_language');
+    const reformatModeEl = host.querySelector('#dictation_bridge_reformat_mode');
+    const reformatGoEl = host.querySelector('#dictation_bridge_reformat_go');
+
+    // QW2: language selector — persisted in extension settings, applied to
+    // the paired-phone URL as ?language= (omitted for 'auto').
+    if (languageEl) {
+        languageEl.value = s.language || 'auto';
+        // Tolerate a persisted value not in the pinned list.
+        if (languageEl.value !== (s.language || 'auto') && (s.language || '').trim()) {
+            const opt = document.createElement('option');
+            opt.value = s.language;
+            opt.textContent = s.language;
+            languageEl.appendChild(opt);
+            languageEl.value = s.language;
+        }
+        languageEl.addEventListener('change', () => {
+            s.language = languageEl.value || 'auto';
+            saveSettings();
+        });
+    }
+
+    // Mode picker + "Reformat as…" dropdown share the /modes list.
+    const populateModeSelectors = async () => {
+        let modes;
+        try {
+            modes = await fetchModes();
+        } catch (e) {
+            if (modeHintEl) modeHintEl.textContent = 'Could not load modes from /modes — check server + token.';
+            WARN('fetchModes failed', e?.message || e);
+            return;
+        }
+        if (!modes || !modes.length) return;
+        // Mode picker: leading "server default" option is kept.
+        if (modeEl) {
+            modeEl.querySelectorAll('option:not([value=""])').forEach(o => o.remove());
+            for (const m of modes) {
+                const opt = document.createElement('option');
+                opt.value = m.id || '';
+                opt.textContent = m.label || m.id || '';
+                modeEl.appendChild(opt);
+            }
+            await refreshFormatterModeForContext();
+        }
+        // Reformat dropdown: leading "Reformat as…" placeholder is kept.
+        if (reformatModeEl) {
+            reformatModeEl.querySelectorAll('option:not([value=""])').forEach(o => o.remove());
+            for (const m of modes) {
+                const opt = document.createElement('option');
+                opt.value = m.id || '';
+                opt.textContent = m.label || m.id || '';
+                reformatModeEl.appendChild(opt);
+            }
+            if (s.reformatMode && modes.some(m => m.id === s.reformatMode)) {
+                reformatModeEl.value = s.reformatMode;
+            }
+        }
+    };
+    populateModeSelectors().catch(e => WARN('populateModeSelectors', e?.message || e));
+
+    if (modeEl) {
+        modeEl.addEventListener('change', async () => {
+            const char = currentModeMemoryKey();
+            const modeId = modeEl.value || '';
+            if (!char) {
+                toast('warning', 'No character resolved yet — open a solo character chat to save a mode');
+                return;
+            }
+            const ok = await persistCharMode(char, modeId);
+            if (ok) {
+                lastDoneMode = modeId || lastDoneMode;
+                toast('success', modeId
+                    ? `Formatter mode set to ${escapeHtml(modeId)}`
+                    : 'Formatter mode cleared (server default)');
+                try { paintQuickLaunchStatus(); } catch {}
+            } else {
+                toast('error', 'Could not save mode — check server + token');
+            }
+        });
+    }
+
+    if (reformatModeEl) {
+        reformatModeEl.addEventListener('change', () => {
+            s.reformatMode = reformatModeEl.value || '';
+            saveSettings();
+        });
+    }
+    if (reformatGoEl) {
+        reformatGoEl.addEventListener('click', async () => {
+            const modeId = reformatModeEl?.value || s.reformatMode || '';
+            if (!modeId) {
+                toast('info', 'Pick a mode to reformat as first');
+                return;
+            }
+            const mode = cachedModes?.find(m => m.id === modeId);
+            if (selected_group && mode?.use_character && !currentReformatCharacterKey()) {
+                toast('warning', 'Choose a specific group addressee before using this character-dependent mode');
+                return;
+            }
+            const prev = reformatGoEl.textContent;
+            reformatGoEl.textContent = 'Reformatting…';
+            reformatGoEl.setAttribute('disabled', 'disabled');
+            try {
+                await reformatCurrentText(modeId);
+            } catch (e) {
+                toast('error', `Reformat failed: ${escapeHtml(e?.message || 'unknown')}`);
+            } finally {
+                reformatGoEl.textContent = prev;
+                reformatGoEl.removeAttribute('disabled');
+            }
         });
     }
 
@@ -4279,6 +4588,9 @@ export async function init() {
             // POL-6: chat/character switches may flip group status — repaint
             // the addressee picker (no-op when not in a group).
             try { renderAddresseePicker(); } catch (e) { WARN('addressee repaint failed', e?.message || e); }
+            if (evt === event_types.APP_READY || evt === event_types.CHAT_CHANGED || evt === event_types.CHAT_LOADED) {
+                refreshFormatterModeForContext().catch(e => WARN('formatter mode refresh failed', e?.message || e));
+            }
             // WOW-2: group switch changes the cast — refresh the roster if open.
             try { if (repaintTtsRoster) repaintTtsRoster(); } catch (e) { WARN('roster repaint failed', e?.message || e); }
         });
