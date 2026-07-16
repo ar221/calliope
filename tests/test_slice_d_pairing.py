@@ -16,6 +16,13 @@ EXTENSION_SRC = ROOT / "extension" / "index.js"
 DURABLE_TOKEN = "durable-bearer-must-never-enter-pairing-url"
 
 
+def test_send_to_st_mints_opaque_request_id_for_multitab_ownership():
+    server = SERVER_SRC.read_text(encoding="utf-8")
+    start = server.index('elif path == "/send-to-st":')
+    block = server[start:server.index('elif path == "/state/mode-memory":', start)]
+    assert '"requestId": secrets.token_urlsafe(8)' in block
+
+
 def _load_server(tmp_path, monkeypatch):
     monkeypatch.setenv("CALLIOPE_DATA_DIR", str(tmp_path))
     name = f"calliope_server_slice_d_{uuid.uuid4().hex}"

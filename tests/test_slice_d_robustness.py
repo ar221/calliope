@@ -23,7 +23,9 @@ def test_streaming_session_has_refreshable_inactivity_timeout():
 
 def test_mismatched_canonical_result_cannot_overwrite_active_stream():
     js = source()
-    assert "if (streamingSession && requestId && streamingSession.requestId !== requestId) return false;" in js
+    assert "return queuePendingCanonicalResult(data, source);" in js
+    assert "if (streamingSession && !requestId) return false;" in js
+    assert "function flushPendingCanonicalResults()" in js
     assert "if (streamingSession) {" in js
 
 
@@ -41,6 +43,7 @@ def test_cross_tab_claims_carry_only_opaque_ids_and_timestamps():
     assert "ownIncomingSideEffect('result'" in js
     assert "data.requestId || data.ts || e.lastEventId" in js
     assert "data.requestId || data.request_id || data.ts || e.lastEventId" in js
+    assert "if (!id) return false;" in block
 
 
 def test_server_url_migration_runs_once_outside_settings_hot_path():
@@ -75,7 +78,17 @@ def test_manual_reconnect_resets_backoff_but_automatic_reconnect_does_not():
 
 def test_stale_popup_watcher_cannot_close_newer_target():
     js = source()
-    assert "if (activeTarget !== win) return;" in js
+    assert "if (activeTarget !== win) { clearInterval(watcher); return; }" in js
     assert "if (win.closed) closeActive(win);" in js
     assert "function closeActive(expectedTarget = null)" in js
     assert "if (expectedTarget && activeTarget !== expectedTarget) return;" in js
+    assert "if (phoneLaunchPromise) return phoneLaunchPromise;" in js
+
+
+def test_ownership_is_marked_only_after_effect_is_applicable():
+    js = source()
+    assert "const ta = document.getElementById('send_textarea');" in js
+    assert "if (!ta) return false;" in js
+    assert "return handleDictationCommand(data);" in js
+    assert "unknown voice command intent" in js
+    assert "return false;\n    }\n    return true;" in js

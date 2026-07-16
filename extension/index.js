@@ -108,8 +108,11 @@ const DESKTOP_AUDIO_FORMATS = [
 const DESKTOP_CAPTURE_MODES = new Set(['phone-popup', 'desktop-push-to-talk', 'desktop-toggle']);
 let desktopCapture = null;
 let desktopPttHeld = false;
+let phoneLaunchPromise = null;
 const appliedDictationRequestIds = [];
 let settingsInitialized = false;
+const pendingCanonicalResults = [];
+const PENDING_CANONICAL_RESULT_CAP = 16;
 
 // Cross-tab side-effect ownership. Only opaque server event/request IDs and
 // timestamps cross the tab boundary; transcript text, commands, and tokens do not.
@@ -151,7 +154,7 @@ function markIncomingHandled(key) {
 
 async function ownIncomingSideEffect(kind, opaqueId, action) {
     const id = String(opaqueId || '').trim();
-    if (!id) return action();
+    if (!id) return false;
     const key = `${kind}:${id}`;
     if (incomingWasHandled(key)) return false;
 
@@ -166,37 +169,34 @@ async function ownIncomingSideEffect(kind, opaqueId, action) {
         });
     }
 
-    // Privacy-safe fallback: arbitrate BroadcastChannel claims briefly. When
-    // BroadcastChannel is unavailable, localStorage provides an atomic-enough
-    // opaque claim for the synchronous main-thread storage API.
-    if (!incomingClaimChannel) {
-        const claimKey = `calliope:claim:${key}`;
-        let claimed = false;
-        try {
-            const existing = localStorage.getItem(claimKey);
-            if (existing) return false;
-            localStorage.setItem(claimKey, TAB_INSTANCE_ID);
-            claimed = true;
-            if (localStorage.getItem(claimKey) !== TAB_INSTANCE_ID || incomingWasHandled(key)) return false;
-            const result = await action();
-            if (result !== false) markIncomingHandled(key);
-            return result;
-        } catch {
-            return false;
-        } finally {
-            if (claimed) try { localStorage.removeItem(claimKey); } catch {}
+    // Privacy-safe fallback: contend for one opaque localStorage claim. The
+    // settle-and-verify step prevents two tabs that both observed an empty key
+    // from acting; a delayed contender sees the completion timestamp before it
+    // can execute. Actions passed here are deliberately synchronous DOM effects.
+    const claimKey = `calliope:claim:${key}`;
+    const claim = `${TAB_INSTANCE_ID}:${Date.now()}`;
+    let claimed = false;
+    try {
+        if (localStorage.getItem(claimKey)) return false;
+        localStorage.setItem(claimKey, claim);
+        claimed = true;
+        try { incomingClaimChannel?.postMessage({ type: 'claim', key, claimant: TAB_INSTANCE_ID }); } catch {}
+        await new Promise(resolve => setTimeout(resolve, 100));
+        if (incomingWasHandled(key) || localStorage.getItem(claimKey) !== claim) return false;
+        const result = action();
+        if (result instanceof Promise) throw new Error('cross-tab side effect must be synchronous');
+        if (result !== false) markIncomingHandled(key);
+        return result;
+    } catch (err) {
+        WARN('cross-tab fallback ownership failed', err?.message || err);
+        return false;
+    } finally {
+        if (claimed) {
+            try {
+                if (localStorage.getItem(claimKey) === claim) localStorage.removeItem(claimKey);
+            } catch {}
         }
     }
-    if (!incomingClaims.has(key)) incomingClaims.set(key, new Set());
-    incomingClaims.get(key).add(TAB_INSTANCE_ID);
-    incomingClaimChannel.postMessage({ type: 'claim', key, claimant: TAB_INSTANCE_ID });
-    await new Promise(resolve => setTimeout(resolve, 80));
-    const winner = [...(incomingClaims.get(key) || [])].sort()[0];
-    incomingClaims.delete(key);
-    if (winner !== TAB_INSTANCE_ID || incomingWasHandled(key)) return false;
-    const result = await action();
-    if (result !== false) markIncomingHandled(key);
-    return result;
 }
 
 function settings() {
@@ -572,6 +572,7 @@ function endStreamingSession() {
     }
     if (streamingSession?.inactivityTimer) clearTimeout(streamingSession.inactivityTimer);
     streamingSession = null;
+    if (pendingCanonicalResults.length) queueMicrotask(flushPendingCanonicalResults);
 }
 
 // ─── MVP-16: state-machine bar above #send_textarea ───────────────────────
@@ -1353,12 +1354,52 @@ function lastMessageEl() {
     return list.length ? list[list.length - 1] : null;
 }
 
+function commandCanExecute(data) {
+    const intent = String(data?.intent || '').toLowerCase().trim();
+    const residual = typeof data?.residual === 'string' ? data.residual : '';
+    switch (intent) {
+        case 'send': return !!document.querySelector('#send_but');
+        case 'swipe': return !!lastMessageEl();
+        case 'regenerate': return !!document.querySelector('#option_regenerate');
+        case 'clear':
+        case 'delete that':
+        case 'delete_that':
+        case 'delete last':
+        case 'delete_last':
+        case 'scratch that':
+        case 'scratch_that':
+        case 'undo':
+        case 'new paragraph':
+        case 'new_paragraph':
+        case 'scene break':
+        case 'scene_break':
+            return !!document.getElementById('send_textarea');
+        case 'append':
+        case 'replace':
+            return !!document.getElementById('send_textarea') && !!residual;
+        case 'stop':
+        case 'cancel':
+        case 'read last':
+        case 'read_last':
+        case 'read':
+        case 'read all':
+        case 'read_all':
+        case 'toggle read':
+        case 'toggle_read':
+        case 'auto read':
+        case 'auto_read':
+            return true;
+        default:
+            return false;
+    }
+}
+
 function handleDictationCommand(data) {
-    if (!settings().voiceCommandsEnabled) return;
+    if (!settings().voiceCommandsEnabled) return false;
     const intent = String(data.intent || '').toLowerCase().trim();
     const args = (data.args && typeof data.args === 'object') ? data.args : {};
     const residual = typeof data.residual === 'string' ? data.residual : '';
-    if (!intent) return;
+    if (!intent) return false;
 
     switch (intent) {
         case 'send': {
@@ -1523,8 +1564,9 @@ function handleDictationCommand(data) {
         }
         default:
             WARN(`unknown voice command intent: ${intent}`);
-            break;
+            return false;
     }
+    return true;
 }
 
 // ─── Phase 2: SSE direct-inject from phone ─────────────────────────────────
@@ -1699,8 +1741,9 @@ function connectSSE() {
         if (!settings().voiceCommandsEnabled) return;
         try {
             const data = JSON.parse(e.data);
+            if (!commandCanExecute(data)) return;
             ownIncomingSideEffect('command', data.requestId || data.ts || e.lastEventId, () => {
-                handleDictationCommand(data);
+                return handleDictationCommand(data);
             }).catch(err => WARN('dictation-command ownership failed', err?.message || err));
         } catch (err) {
             WARN('SSE dictation-command: bad JSON', err?.message || err);
@@ -1803,6 +1846,27 @@ function dictationRequestWasApplied(requestId) {
     return !!requestId && appliedDictationRequestIds.includes(requestId);
 }
 
+function queuePendingCanonicalResult(data, source) {
+    const requestId = String(data?.requestId || data?.request_id || '');
+    if (!requestId) return false;
+    const existing = pendingCanonicalResults.find(item => item.requestId === requestId);
+    if (existing) {
+        existing.data = data;
+        existing.source = source;
+        return false;
+    }
+    pendingCanonicalResults.push({ requestId, data, source });
+    while (pendingCanonicalResults.length > PENDING_CANONICAL_RESULT_CAP) pendingCanonicalResults.shift();
+    return false;
+}
+
+function flushPendingCanonicalResults() {
+    if (streamingSession || !pendingCanonicalResults.length) return;
+    const next = pendingCanonicalResults.shift();
+    applyDictationResult(next.data, { source: next.source });
+    if (!streamingSession && pendingCanonicalResults.length) queueMicrotask(flushPendingCanonicalResults);
+}
+
 /** Apply the canonical server result through the shared textarea/result path.
  *  Desktop HTTP and SSE may deliver the same request; request-id dedupe keeps
  *  that single recording from being inserted twice. */
@@ -1810,10 +1874,15 @@ function applyDictationResult(data, { source = 'phone' } = {}) {
     const requestId = String(data?.requestId || data?.request_id || '');
     if (dictationRequestWasApplied(requestId)) return false;
     // A canonical result for another request must never replace or append over
-    // the active streamed request. The matching result (or timeout) owns it.
-    if (streamingSession && requestId && streamingSession.requestId !== requestId) return false;
+    // the active streamed request. Defer it until that stream resolves.
+    if (streamingSession && requestId && streamingSession.requestId !== requestId) {
+        return queuePendingCanonicalResult(data, source);
+    }
+    if (streamingSession && !requestId) return false;
     let text = String(data?.text ?? '').trim();
     if (!text) return false;
+    const ta = document.getElementById('send_textarea');
+    if (!ta) return false;
     rememberAppliedDictationRequest(requestId);
 
     if (data.mode && typeof data.mode === 'string') lastDoneMode = data.mode;
@@ -1829,21 +1898,18 @@ function applyDictationResult(data, { source = 'phone' } = {}) {
     }
 
     if (streamingSession) {
-        const ta = document.getElementById('send_textarea');
         const sessAppendMode = streamingSession.appendMode;
         const base = streamingSession.base;
         endStreamingSession();
-        if (ta) {
-            pushUndoSnapshot('dictation-result-stream');
-            const sep = (sessAppendMode === 'append' && base) ? '\n\n' : '';
-            ta.value = (sessAppendMode === 'append' ? base + sep : '') + text;
-            ta.dispatchEvent(new Event('input', { bubbles: true }));
-            try { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
-            if (doAutoSend) {
-                const btn = document.getElementById('send_but');
-                if (btn) btn.click(); else WARN('send_but not found, cannot auto-send');
-                setTimeout(() => maybeReadDictatedPersonaText(text), 200);
-            }
+        pushUndoSnapshot('dictation-result-stream');
+        const sep = (sessAppendMode === 'append' && base) ? '\n\n' : '';
+        ta.value = (sessAppendMode === 'append' ? base + sep : '') + text;
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+        try { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
+        if (doAutoSend) {
+            const btn = document.getElementById('send_but');
+            if (btn) btn.click(); else WARN('send_but not found, cannot auto-send');
+            setTimeout(() => maybeReadDictatedPersonaText(text), 200);
         }
     } else {
         writeToTextarea(text, { autoSend: doAutoSend, appendMode: cfg.appendMode });
@@ -1865,6 +1931,7 @@ function applyDictationResult(data, { source = 'phone' } = {}) {
         try { renderLowConfBanner(spans); }
         catch (err) { WARN('lowconf banner render failed', err?.message || err); }
     }
+    queueMicrotask(flushPendingCanonicalResults);
     return true;
 }
 
@@ -2356,6 +2423,14 @@ async function onMicClick() {
         return;
     }
 
+    if (phoneLaunchPromise) return phoneLaunchPromise;
+    phoneLaunchPromise = launchPhoneDictation();
+    try { return await phoneLaunchPromise; }
+    finally { phoneLaunchPromise = null; }
+}
+
+async function launchPhoneDictation() {
+
     const ok = await probeServer();
     if (!ok) {
         const toast = window.toastr;
@@ -2413,11 +2488,12 @@ function openPopup(url) {
     }
     activeTarget = win;
     activeIsIframe = false;
-    popupWatcher = setInterval(() => {
+    const watcher = setInterval(() => {
         // Capture this popup: a stale watcher must not close a newer iframe or popup.
-        if (activeTarget !== win) return;
+        if (activeTarget !== win) { clearInterval(watcher); return; }
         if (win.closed) closeActive(win);
     }, 500);
+    popupWatcher = watcher;
 }
 
 function openIframe(url) {

@@ -1717,6 +1717,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 self.send_error_json("Missing 'text'", code="missing_param", status=400)
                 return
             payload = {
+                "requestId": secrets.token_urlsafe(8),
                 "text": text,
                 "raw": str(body.get("raw", "")),
                 "cleaned": str(body.get("cleaned", "")),
