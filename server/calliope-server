@@ -772,13 +772,59 @@ def get_token() -> str:
     return ensure_token()
 
 
+PAIRING_CODE_TTL_SECONDS = 120
+_pairing_codes: dict[str, dict] = {}
+_pairing_codes_lock = threading.Lock()
+
+
+def create_pairing_code(token: str, *, now: float | None = None) -> tuple[str, int]:
+    """Mint a short-lived, one-use phone bootstrap code in process RAM."""
+    issued_at = time.monotonic() if now is None else now
+    expires_at = issued_at + PAIRING_CODE_TTL_SECONDS
+    with _pairing_codes_lock:
+        expired = [code for code, entry in _pairing_codes.items()
+                   if entry["expires_at"] <= issued_at]
+        for code in expired:
+            del _pairing_codes[code]
+        while True:
+            code = secrets.token_urlsafe(24)
+            if code not in _pairing_codes:
+                break
+        _pairing_codes[code] = {"expires_at": expires_at, "token": token}
+    return code, PAIRING_CODE_TTL_SECONDS
+
+
+def pairing_code_is_valid(code: str, *, now: float | None = None) -> bool:
+    """Check whether a bootstrap code may load the phone page without consuming it."""
+    if not code:
+        return False
+    checked_at = time.monotonic() if now is None else now
+    with _pairing_codes_lock:
+        entry = _pairing_codes.get(code)
+        return bool(entry and entry["expires_at"] > checked_at)
+
+
+def consume_pairing_code(code: str, *, now: float | None = None) -> tuple[str, str]:
+    """Atomically consume a bootstrap code, returning (token, status)."""
+    if not code:
+        return "", "invalid"
+    consumed_at = time.monotonic() if now is None else now
+    with _pairing_codes_lock:
+        entry = _pairing_codes.pop(code, None)
+    if entry is None:
+        return "", "invalid"
+    if entry["expires_at"] <= consumed_at:
+        return "", "expired"
+    return str(entry["token"]), "ok"
+
+
 def _redact_sensitive_url_params(text: str) -> str:
     """Redact bearer-like query parameters before request lines reach the journal."""
     # BaseHTTPRequestHandler log lines include the raw request target, so
     # EventSource/pairing URLs such as /events?token=... otherwise persist the
     # bearer token in journalctl. Keep the path useful while removing secrets.
     return re.sub(
-        r"([?&](?:token|access_token|auth|authorization)=)([^\s&]+)",
+        r"([?&](?:token|pair|access_token|auth|authorization)=)([^\s&]+)",
         r"\1[REDACTED]",
         text,
         flags=re.IGNORECASE,
@@ -841,11 +887,10 @@ def _origin_allowed(origin: str) -> bool:
 # do_GET — non-loopback callers without a valid token get a minimal pairing
 # page / minimal health payload (see _serve_root / _health_payload).
 _AUTH_EXEMPT_PATHS = frozenset({
-    "/",                # Embedded phone UI HTML — bootstrap surface;
-                        # JS wraps fetch/EventSource to attach token from
-                        # ?token= query or sessionStorage on every API call.
+    "/",                # Embedded phone UI / one-time bootstrap surface.
     "/health",
     "/manifest.json",
+    "/pair/exchange",   # One-time code is the credential for this endpoint.
 })
 
 
@@ -923,6 +968,16 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             return True
         return False
 
+    def _request_bearer_token(self) -> str:
+        """Return the durable bearer only when explicitly header-authenticated."""
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return ""
+        presented = auth[len("Bearer "):].strip()
+        token = get_token()
+        return token if _token_matches(presented, token) else ""
+
+
     def require_auth(self) -> bool:
         """Gate every request unless loopback or exempt endpoint.
 
@@ -940,9 +995,9 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         # OPTIONS preflight handled separately (no auth needed for CORS probes)
         if self.command == "OPTIONS":
             return True
-        # SSE (/events) and pairing (/pair) accept ?token=<token> via query
-        # param: browser EventSource cannot set headers, and the QR pairing
-        # flow naturally encodes the token in the URL.
+        # SSE (/events) and legacy cert pairing (/pair) accept ?token=<token>
+        # because browser EventSource cannot set headers. Phone bootstrap URLs
+        # use a separate short-lived code and never carry this durable bearer.
         # TODO: revisit query-param auth once we support a secure cookie flow.
         if path in ("/events", "/pair"):
             qs = urllib.parse.parse_qs(parsed.query)
@@ -1286,14 +1341,14 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         return WEB_UI.replace("</head>", injection, 1)
 
     def _serve_root(self, query: dict) -> None:
-        """Serve `/`: full UI for loopback/tokened callers, else pairing page.
+        """Serve `/`: full UI for privileged/valid-bootstrap callers, else pairing page.
 
-        The pairing flow (extension `buildPairedPhoneUrl`) opens `/?token=…`,
-        so a valid query token gets the full UI. Tokenless LAN reloads land on
-        PAIRING_BOOTSTRAP_HTML, which re-attaches a sessionStorage token and
-        redirects — keeping the paired phone working across reloads.
+        A one-time code may load the UI but is consumed only by the phone page's
+        POST /pair/exchange. Tokenless LAN reloads use sessionStorage from the
+        pairing page to fetch the full UI without putting the bearer in a URL.
         """
-        if self._request_is_privileged():
+        pairing_code = query.get("pair", [""])[0]
+        if self._request_is_privileged() or pairing_code_is_valid(pairing_code):
             self.send_html(self._render_html_with_embed(query))
         else:
             self.send_html(PAIRING_BOOTSTRAP_HTML)
@@ -1564,7 +1619,35 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         if self._reject_oversized_body(body_limit):
             return
 
-        if path == "/transcribe":
+        if path == "/pair/bootstrap":
+            # Loopback normally bypasses auth, but minting a transferable phone
+            # credential always requires the valid durable bearer in the header.
+            token = self._request_bearer_token()
+            expected_token = get_token()
+            if not token or not expected_token or not secrets.compare_digest(token, expected_token):
+                self._send_unauthorized("valid bearer token required")
+                return
+            code, expires_in = create_pairing_code(expected_token)
+            self.send_json({"code": code, "expires_in": expires_in}, status=201)
+        elif path == "/pair/exchange":
+            try:
+                body = self.read_json_body()
+            except Exception:
+                self.send_error_json("Invalid JSON", code="bad_json", status=400)
+                return
+            code = str((body or {}).get("code", "")).strip() if isinstance(body, dict) else ""
+            token, state = consume_pairing_code(code)
+            if state == "expired":
+                self.send_error_json("Pairing code expired", code="pairing_code_expired",
+                                     status=410, retry_ok=False)
+                return
+            if state != "ok":
+                self.send_error_json("Pairing code invalid or already used",
+                                     code="pairing_code_invalid", status=404,
+                                     retry_ok=False)
+                return
+            self.send_json({"token": token})
+        elif path == "/transcribe":
             self._handle_transcribe(params)
         elif path == "/reformat":
             self._handle_reformat(params)

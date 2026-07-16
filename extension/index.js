@@ -1737,45 +1737,54 @@ function applyDictationResult(data, { source = 'phone' } = {}) {
     return true;
 }
 
-function buildPairedPhoneUrl({ embed = true } = {}) {
+async function buildPairedPhoneUrl({ embed = true } = {}) {
     const cfg = settings();
     const ctx = currentContext();
     const base = cfg.serverUrl.replace(/\/+$/, '');
+    const response = await fetch(`${base}/pair/bootstrap`, {
+        method: 'POST',
+        mode: 'cors',
+        cache: 'no-store',
+        headers: { ...authHeaders() },
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.code) {
+        throw new Error(data?.error || `Pairing bootstrap failed (${response.status})`);
+    }
+
     const qp = new URLSearchParams();
     if (embed) qp.set('embed', '1');
-
     if (ctx.chatId) qp.set('chat', String(ctx.chatId));
     if (ctx.personaId) qp.set('persona', String(ctx.personaId));
     if (ctx.characterId) qp.set('character', String(ctx.characterId));
     // QW2: always carry transcription language; 'auto' prevents a silent en fallback.
     const lang = String(cfg.language || 'auto').trim().toLowerCase() || 'auto';
     qp.set('language', lang);
-    // Pass bearer token via query so the phone UI can stash it in
-    // sessionStorage and attach to its own fetch + EventSource calls. The
-    // server scrubs ?token= from browser history on load and redacts request
-    // logs, but users should still avoid screenshots of the copied URL.
-    const token = (cfg.serverToken || '').trim();
-    if (token) qp.set('token', token);
+    qp.set('pair', String(data.code));
     return `${base}/?${qp.toString()}`;
 }
 
-function buildEmbedUrl() {
+async function buildEmbedUrl() {
     return buildPairedPhoneUrl({ embed: true });
 }
 
 async function copyPairedPhoneUrl() {
-    const url = buildPairedPhoneUrl({ embed: false });
     try {
+        const url = await buildPairedPhoneUrl({ embed: false });
         await navigator.clipboard.writeText(url);
-        toast('success', 'Paired phone URL copied. Treat it like a password.');
+        toast('success', 'One-time pairing URL copied. It expires in two minutes.');
     } catch (e) {
-        window.prompt('Copy paired phone URL (contains bearer token):', url);
+        toast('error', `Could not copy pairing URL: ${escapeHtml(e?.message || 'clipboard unavailable')}`);
     }
 }
 
-function openPairedPhoneUrl() {
-    const url = buildPairedPhoneUrl({ embed: false });
-    window.open(url, 'calliope_pair_phone', 'width=500,height=900,menubar=no,toolbar=no,location=yes,status=no,scrollbars=yes,resizable=yes');
+async function openPairedPhoneUrl() {
+    try {
+        const url = await buildPairedPhoneUrl({ embed: false });
+        window.open(url, 'calliope_pair_phone', 'width=500,height=900,menubar=no,toolbar=no,location=yes,status=no,scrollbars=yes,resizable=yes');
+    } catch (e) {
+        toast('error', `Could not create pairing URL: ${escapeHtml(e?.message || 'request failed')}`);
+    }
 }
 
 function drawQrToCanvas(text, canvas) {
@@ -1814,8 +1823,6 @@ function clearPairQrPanel(host = document) {
         canvas.width = 0;
         canvas.height = 0;
     }
-    const urlNode = host.querySelector?.('#dictation_bridge_pair_qr_url');
-    if (urlNode) urlNode.remove();
 }
 
 function hidePairQrPanel(host = document) {
@@ -1829,17 +1836,11 @@ async function showPairQrPanel(host = document) {
     const canvas = host.querySelector?.('#dictation_bridge_pair_qr_canvas');
     if (!panel || !canvas) return;
     hidePairQrPanel(host);
-    const url = buildPairedPhoneUrl({ embed: false });
-    const urlNode = document.createElement('span');
-    urlNode.id = 'dictation_bridge_pair_qr_url';
-    urlNode.hidden = true;
-    urlNode.textContent = url;
     try {
+        const url = await buildPairedPhoneUrl({ embed: false });
         drawQrToCanvas(url, canvas);
-        panel.appendChild(urlNode);
         panel.style.display = 'block';
     } catch (e) {
-        urlNode.remove();
         clearPairQrPanel(host);
         WARN('local QR render failed; falling back to copy URL', e?.message || e);
         toast('warning', 'QR render failed; copying pairing URL instead.');
@@ -2250,7 +2251,15 @@ async function onMicClick() {
     // the normal 30s heartbeat gets another chance to run.
     await postState('mic-open');
 
-    const url = buildEmbedUrl();
+    let url;
+    try {
+        url = await buildEmbedUrl();
+    } catch (e) {
+        const msg = `Could not create one-time phone pairing: ${escapeHtml(e?.message || 'request failed')}`;
+        if (window.toastr?.error) window.toastr.error(msg, 'Dictation Bridge');
+        else alert(msg);
+        return;
+    }
     if (settings().openStyle === 'iframe') {
         openIframe(url);
     } else {
@@ -4291,18 +4300,18 @@ function buildSettingsPanel() {
                     <small class="notes" style="margin-top:0">Found in <code>~/.local/share/dictation-server/token</code> on the dictation server.</small>
                     <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:4px 0 8px 0">
                         <button id="dictation_bridge_pair_open" type="button" class="menu_button" title="Open a fresh paired phone page for this active ST chat" style="padding:3px 10px;font-size:12px;border:1px solid rgba(255,182,72,0.55);background:rgba(255,182,72,0.08);color:#FFB648;border-radius:2px;cursor:pointer">Re-pair this phone</button>
-                        <button id="dictation_bridge_pair_copy" type="button" class="menu_button" title="Copy a tokenized pairing URL; use it as a fallback if QR pairing fails" style="padding:3px 10px;font-size:12px;border:1px solid rgba(201,178,139,0.45);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Copy pairing URL</button>
+                        <button id="dictation_bridge_pair_copy" type="button" class="menu_button" title="Copy a short-lived one-time pairing URL; use it as a fallback if QR pairing fails" style="padding:3px 10px;font-size:12px;border:1px solid rgba(201,178,139,0.45);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Copy pairing URL</button>
                         <button id="dictation_bridge_pair_qr_show" type="button" class="menu_button" title="Render a local QR code in this browser; no server round-trip or third-party service" style="padding:3px 10px;font-size:12px;border:1px solid rgba(168,201,123,0.55);background:rgba(168,201,123,0.08);color:#A8C97B;border-radius:2px;cursor:pointer">Show local QR</button>
-                        <small class="notes" style="margin:0 0 0 4px">URL/QR contains bearer token; avoid screenshots/logs.</small>
+                        <small class="notes" style="margin:0 0 0 4px">URL/QR contains a one-time code that expires in two minutes.</small>
                     </div>
                     <div id="dictation_bridge_pair_qr_panel" style="display:none;margin:0 0 8px 0;padding:8px;border:1px solid rgba(168,201,123,0.35);background:rgba(0,0,0,0.20);border-radius:3px;max-width:max-content">
-                        <canvas id="dictation_bridge_pair_qr_canvas" aria-label="Tokenized Calliope pairing QR code" style="display:block;background:#fffaf0;border:6px solid #fffaf0;border-radius:2px"></canvas>
+                        <canvas id="dictation_bridge_pair_qr_canvas" aria-label="One-time Calliope pairing QR code" style="display:block;background:#fffaf0;border:6px solid #fffaf0;border-radius:2px"></canvas>
                         <div style="margin-top:6px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
                             <button id="dictation_bridge_pair_qr_open" type="button" class="menu_button" style="padding:3px 10px;font-size:12px;border:1px solid rgba(255,182,72,0.55);background:rgba(255,182,72,0.08);color:#FFB648;border-radius:2px;cursor:pointer">Open</button>
                             <button id="dictation_bridge_pair_qr_copy" type="button" class="menu_button" style="padding:3px 10px;font-size:12px;border:1px solid rgba(201,178,139,0.45);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Copy URL</button>
                             <button id="dictation_bridge_pair_qr_hide" type="button" class="menu_button" style="padding:3px 10px;font-size:12px;border:1px solid rgba(201,178,139,0.30);background:transparent;color:#C9B28B;border-radius:2px;cursor:pointer">Hide + clear</button>
                         </div>
-                        <small class="notes" style="display:block;margin-top:6px;color:#FFB648">This QR encodes the bearer-token pairing URL. Treat it like a password; hide clears the canvas and removes the URL node.</small>
+                        <small class="notes" style="display:block;margin-top:6px;color:#FFB648">This QR encodes a short-lived one-time pairing URL. Hide clears the canvas.</small>
                     </div>
 
                     <label for="dictation_bridge_open_style">Open style</label>

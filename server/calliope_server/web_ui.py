@@ -1600,52 +1600,71 @@ WEB_UI = r"""<!DOCTYPE html>
 <div class="toast" id="toast"></div>
 
 <script>
-// Hotfix: token bootstrap. Read ?token= from URL OR sessionStorage; wrap
-// fetch + EventSource to attach Authorization: Bearer / ?token= for all
-// API calls. Loopback clients bypass auth server-side; this is for LAN
-// access (phone, ST popup at LAN IP).
+// Safe phone bootstrap. Pairing URLs carry only a short-lived one-time code;
+// the durable bearer is returned once to this same-origin page and kept in
+// sessionStorage for the existing authenticated fetch/EventSource behavior.
 (function () {
   const params = new URLSearchParams(location.search);
-  const url_tok = params.get('token') || '';
-  const stored = sessionStorage.getItem('dictationToken') || '';
-  const TOKEN = url_tok || stored;
+  const pairingCode = params.get('pair') || '';
+  let TOKEN = sessionStorage.getItem('dictationToken') || '';
+  const _origFetch = window.fetch.bind(window);
   window.calliopeAuthStatus = {
     hasToken: !!TOKEN,
-    tokenSource: url_tok ? 'url' : (stored ? 'session' : 'missing'),
+    tokenSource: TOKEN ? 'session' : (pairingCode ? 'pairing' : 'missing'),
     unauthorized: false,
     lastStatus: 0,
     lastError: '',
   };
-  if (url_tok) {
-    sessionStorage.setItem('dictationToken', url_tok);
+  if (pairingCode) {
     try {
-      params.delete('token');
+      params.delete('pair');
       const clean = location.pathname + (params.toString() ? '?' + params.toString() : '') + location.hash;
       history.replaceState(null, '', clean);
     } catch (e) { /* best-effort URL scrub */ }
   }
-  if (!TOKEN) return;
-  const _origFetch = window.fetch.bind(window);
+  const bootstrap = pairingCode
+    ? _origFetch('/pair/exchange', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: pairingCode }),
+      }).then(async (resp) => {
+        window.calliopeAuthStatus.lastStatus = resp.status;
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || !data.token) {
+          window.calliopeAuthStatus.lastError = data.code || 'pairing_failed';
+          try { sessionStorage.removeItem('dictationToken'); } catch (e) {}
+          TOKEN = '';
+          throw new Error(window.calliopeAuthStatus.lastError);
+        }
+        TOKEN = data.token;
+        sessionStorage.setItem('dictationToken', TOKEN);
+        window.calliopeAuthStatus.hasToken = true;
+        window.calliopeAuthStatus.tokenSource = 'pairing';
+      }).catch(() => {})
+    : Promise.resolve();
+  window.calliopeAuthReady = bootstrap;
   window.fetch = function (input, init) {
-    init = init || {};
-    const headers = new Headers(init.headers || {});
-    if (!headers.has('Authorization')) headers.set('Authorization', 'Bearer ' + TOKEN);
-    init.headers = headers;
-    return _origFetch(input, init).then((resp) => {
-      window.calliopeAuthStatus.lastStatus = resp.status;
-      if (resp.status === 401) {
-        window.calliopeAuthStatus.unauthorized = true;
-        window.calliopeAuthStatus.lastError = 'unauthorized';
-        try { sessionStorage.removeItem('dictationToken'); } catch (e) {}
-      }
-      return resp;
+    return bootstrap.then(() => {
+      init = init || {};
+      const headers = new Headers(init.headers || {});
+      if (TOKEN && !headers.has('Authorization')) headers.set('Authorization', 'Bearer ' + TOKEN);
+      init.headers = headers;
+      return _origFetch(input, init).then((resp) => {
+        window.calliopeAuthStatus.lastStatus = resp.status;
+        if (resp.status === 401) {
+          window.calliopeAuthStatus.unauthorized = true;
+          window.calliopeAuthStatus.lastError = 'unauthorized';
+          try { sessionStorage.removeItem('dictationToken'); } catch (e) {}
+        }
+        return resp;
+      });
     });
   };
   const _OrigES = window.EventSource;
   window.EventSource = function (url, opts) {
     try {
       const u = new URL(url, location.origin);
-      if (!u.searchParams.has('token')) u.searchParams.set('token', TOKEN);
+      if (TOKEN && !u.searchParams.has('token')) u.searchParams.set('token', TOKEN);
       url = u.toString();
     } catch (e) { /* fall through with original url */ }
     return new _OrigES(url, opts);
@@ -3873,10 +3892,13 @@ document.addEventListener('keydown', function (e) {
   closeCheatsheetModal();
 });
 
+function initAfterAuth() {
+  Promise.resolve(window.calliopeAuthReady).then(init);
+}
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', init);
+  document.addEventListener('DOMContentLoaded', initAfterAuth);
 } else {
-  init();
+  initAfterAuth();
 }
 </script>
 </body>
@@ -3904,10 +3926,9 @@ PWA_MANIFEST = json.dumps({
 })
 
 
-# Served on `/` to non-loopback clients that present no valid token. Two jobs:
-#  1. Recover the paired-session reload path: after pairing, the full UI scrubs
-#     ?token= from the URL and stashes it in sessionStorage — a reload arrives
-#     tokenless, so this page re-attaches the stored token and redirects.
+# Served on `/` to non-loopback clients that present no valid credential. Two jobs:
+#  1. Recover paired-session reloads by fetching the full UI with the bearer in
+#     an Authorization header. The durable token never re-enters the URL.
 #  2. Otherwise, tell the user how to pair. No server details are disclosed.
 PAIRING_BOOTSTRAP_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -3926,19 +3947,22 @@ PAIRING_BOOTSTRAP_HTML = """<!DOCTYPE html>
 <script>
 (function () {
   try {
-    var params = new URLSearchParams(location.search);
-    if (params.get('token')) {
-      // A token was presented and rejected — drop any stale stored copy so
-      // we don't redirect-loop.
-      try { sessionStorage.removeItem('dictationToken'); } catch (e) {}
-      return;
-    }
     var stored = '';
     try { stored = sessionStorage.getItem('dictationToken') || ''; } catch (e) {}
-    if (stored) {
-      params.set('token', stored);
-      location.replace(location.pathname + '?' + params.toString() + location.hash);
-    }
+    if (!stored) return;
+    fetch(location.pathname + location.search + location.hash, {
+      headers: { 'Authorization': 'Bearer ' + stored },
+      cache: 'no-store'
+    }).then(function (resp) {
+      if (!resp.ok) throw new Error('unauthorized');
+      return resp.text();
+    }).then(function (html) {
+      document.open();
+      document.write(html);
+      document.close();
+    }).catch(function () {
+      try { sessionStorage.removeItem('dictationToken'); } catch (e) {}
+    });
   } catch (e) { /* fall through to the static message */ }
 })();
 </script>
