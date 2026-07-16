@@ -55,7 +55,7 @@ def test_extension_streaming_partials_setting_is_user_toggle():
     assert "ttsReadStreamingPartials: false" in src  # default stays opt-in
     assert 'id="dictation_bridge_tts_stream_partials" type="checkbox" />' in src
     assert "Stream TTS while AI text is streaming" in src
-    assert "s.ttsReadStreamingPartials = !!ttsStreamEl.checked" in src
+    assert "fresh.ttsReadStreamingPartials = !!ttsStreamEl.checked" in src
     assert "Streaming partial TTS deferred" not in src
 
 

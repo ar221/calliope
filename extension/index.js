@@ -109,6 +109,95 @@ const DESKTOP_CAPTURE_MODES = new Set(['phone-popup', 'desktop-push-to-talk', 'd
 let desktopCapture = null;
 let desktopPttHeld = false;
 const appliedDictationRequestIds = [];
+let settingsInitialized = false;
+
+// Cross-tab side-effect ownership. Only opaque server event/request IDs and
+// timestamps cross the tab boundary; transcript text, commands, and tokens do not.
+const TAB_INSTANCE_ID = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+const incomingClaims = new Map();
+let incomingClaimChannel = null;
+try {
+    incomingClaimChannel = new BroadcastChannel('calliope-dictation-claims');
+    incomingClaimChannel.addEventListener('message', (event) => {
+        const { type, key, claimant } = event?.data || {};
+        if (!key) return;
+        if (type === 'done') incomingClaims.delete(key);
+        if (type === 'claim' && claimant) {
+            if (!incomingClaims.has(key)) incomingClaims.set(key, new Set());
+            incomingClaims.get(key).add(String(claimant));
+        }
+    });
+} catch {}
+
+function incomingStorageKey(key) {
+    return `calliope:handled:${key}`;
+}
+
+function incomingWasHandled(key) {
+    try {
+        const storedAt = Number(localStorage.getItem(incomingStorageKey(key)) || 0);
+        if (storedAt && Date.now() - storedAt < 10 * 60_000) return true;
+        if (storedAt) localStorage.removeItem(incomingStorageKey(key));
+        return false;
+    } catch {
+        return false;
+    }
+}
+
+function markIncomingHandled(key) {
+    try { localStorage.setItem(incomingStorageKey(key), String(Date.now())); } catch {}
+    try { incomingClaimChannel?.postMessage({ type: 'done', key }); } catch {}
+}
+
+async function ownIncomingSideEffect(kind, opaqueId, action) {
+    const id = String(opaqueId || '').trim();
+    if (!id) return action();
+    const key = `${kind}:${id}`;
+    if (incomingWasHandled(key)) return false;
+
+    // Web Locks provides atomic ownership where available. The completion
+    // marker prevents a later waiter from replaying after the winner releases.
+    if (navigator?.locks?.request) {
+        return navigator.locks.request(`calliope:${key}`, async () => {
+            if (incomingWasHandled(key)) return false;
+            const result = await action();
+            if (result !== false) markIncomingHandled(key);
+            return result;
+        });
+    }
+
+    // Privacy-safe fallback: arbitrate BroadcastChannel claims briefly. When
+    // BroadcastChannel is unavailable, localStorage provides an atomic-enough
+    // opaque claim for the synchronous main-thread storage API.
+    if (!incomingClaimChannel) {
+        const claimKey = `calliope:claim:${key}`;
+        let claimed = false;
+        try {
+            const existing = localStorage.getItem(claimKey);
+            if (existing) return false;
+            localStorage.setItem(claimKey, TAB_INSTANCE_ID);
+            claimed = true;
+            if (localStorage.getItem(claimKey) !== TAB_INSTANCE_ID || incomingWasHandled(key)) return false;
+            const result = await action();
+            if (result !== false) markIncomingHandled(key);
+            return result;
+        } catch {
+            return false;
+        } finally {
+            if (claimed) try { localStorage.removeItem(claimKey); } catch {}
+        }
+    }
+    if (!incomingClaims.has(key)) incomingClaims.set(key, new Set());
+    incomingClaims.get(key).add(TAB_INSTANCE_ID);
+    incomingClaimChannel.postMessage({ type: 'claim', key, claimant: TAB_INSTANCE_ID });
+    await new Promise(resolve => setTimeout(resolve, 80));
+    const winner = [...(incomingClaims.get(key) || [])].sort()[0];
+    incomingClaims.delete(key);
+    if (winner !== TAB_INSTANCE_ID || incomingWasHandled(key)) return false;
+    const result = await action();
+    if (result !== false) markIncomingHandled(key);
+    return result;
+}
 
 function settings() {
     if (!extension_settings[MODULE] || typeof extension_settings[MODULE] !== 'object') {
@@ -117,15 +206,22 @@ function settings() {
         for (const [k, v] of Object.entries(DEFAULTS)) {
             if (extension_settings[MODULE][k] === undefined) extension_settings[MODULE][k] = v;
         }
-        if (shouldMigrateServerUrl(extension_settings[MODULE].serverUrl)) {
-            extension_settings[MODULE].serverUrl = defaultServerUrl();
-            try { saveSettings(); } catch {}
-        }
         if (!DESKTOP_CAPTURE_MODES.has(extension_settings[MODULE].captureMode)) {
             extension_settings[MODULE].captureMode = DEFAULTS.captureMode;
         }
     }
     return extension_settings[MODULE];
+}
+
+function initializeSettings() {
+    if (settingsInitialized) return settings();
+    settingsInitialized = true;
+    const current = settings();
+    if (shouldMigrateServerUrl(current.serverUrl)) {
+        current.serverUrl = defaultServerUrl();
+        try { saveSettings(); } catch {}
+    }
+    return current;
 }
 
 function saveSettings() {
@@ -440,7 +536,25 @@ function setupMobileLifecycleStatePush() {
 // arrived) for perceived-latency wins. The terminal 'dictation-result' is
 // still source-of-truth; when it arrives, we replace the streamed span with
 // the canonical text.
-let streamingSession = null; // { requestId, base, accumulated, raf }
+const STREAMING_SESSION_TIMEOUT_MS = 45_000;
+let streamingSession = null; // { requestId, base, accumulated, raf, inactivityTimer }
+
+function refreshStreamingSessionTimeout() {
+    if (!streamingSession) return;
+    if (streamingSession.inactivityTimer) clearTimeout(streamingSession.inactivityTimer);
+    const requestId = streamingSession.requestId;
+    streamingSession.inactivityTimer = setTimeout(() => {
+        if (streamingSession?.requestId !== requestId) return;
+        const ta = document.getElementById('send_textarea');
+        if (ta) {
+            // Remove stale partials so a late batch result cannot duplicate an
+            // append-mode base or leave abandoned formatter text behind.
+            ta.value = streamingSession.base;
+            ta.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        endStreamingSession();
+    }, STREAMING_SESSION_TIMEOUT_MS);
+}
 
 function flushStreamingFrame() {
     if (!streamingSession) return;
@@ -456,6 +570,7 @@ function endStreamingSession() {
     if (streamingSession?.raf) {
         try { cancelAnimationFrame(streamingSession.raf); } catch {}
     }
+    if (streamingSession?.inactivityTimer) clearTimeout(streamingSession.inactivityTimer);
     streamingSession = null;
 }
 
@@ -1422,6 +1537,11 @@ let sseReconnectTimer = null;
 let sseStatus = { state: 'disconnected', lastEventAt: 0, lastError: '' };
 let serverAuthStatus = { health: 'unknown', token: 'unknown', lastCheckedAt: 0, lastError: '' };
 
+function reconnectSSEManually() {
+    sseReconnectDelay = 1000;
+    connectSSE();
+}
+
 function currentContextLabel() {
     const ctx = currentContext();
     const parts = [];
@@ -1533,6 +1653,7 @@ function connectSSE() {
                     accumulated: '',
                     raf: null,
                     appendMode: cfg.appendMode,
+                    inactivityTimer: null,
                 };
                 if (cfg.appendMode !== 'append') {
                     // Snapshot before clearing so a user's in-progress draft is
@@ -1545,6 +1666,7 @@ function connectSSE() {
                 }
             }
 
+            refreshStreamingSessionTimeout();
             if (delta) {
                 streamingSession.accumulated += delta;
                 if (!streamingSession.raf) {
@@ -1577,7 +1699,9 @@ function connectSSE() {
         if (!settings().voiceCommandsEnabled) return;
         try {
             const data = JSON.parse(e.data);
-            handleDictationCommand(data);
+            ownIncomingSideEffect('command', data.requestId || data.ts || e.lastEventId, () => {
+                handleDictationCommand(data);
+            }).catch(err => WARN('dictation-command ownership failed', err?.message || err));
         } catch (err) {
             WARN('SSE dictation-command: bad JSON', err?.message || err);
         }
@@ -1619,9 +1743,13 @@ function connectSSE() {
         let data;
         try { data = JSON.parse(e.data); }
         catch { WARN('SSE dictation-result: bad JSON'); return; }
-        if (!applyDictationResult(data, { source: desktopCapture ? 'desktop' : 'phone' })) {
-            if (!String(data?.text ?? '').trim()) endStreamingSession();
-        }
+        ownIncomingSideEffect('result', data.requestId || data.request_id || data.ts || e.lastEventId, () => {
+            const applied = applyDictationResult(data, { source: desktopCapture ? 'desktop' : 'phone' });
+            if (!applied) {
+                if (!String(data?.text ?? '').trim()) endStreamingSession();
+            }
+            return applied;
+        }).catch(err => WARN('dictation-result ownership failed', err?.message || err));
     });
 
     sseSource.addEventListener('error', (e) => {
@@ -1681,6 +1809,9 @@ function dictationRequestWasApplied(requestId) {
 function applyDictationResult(data, { source = 'phone' } = {}) {
     const requestId = String(data?.requestId || data?.request_id || '');
     if (dictationRequestWasApplied(requestId)) return false;
+    // A canonical result for another request must never replace or append over
+    // the active streamed request. The matching result (or timeout) owns it.
+    if (streamingSession && requestId && streamingSession.requestId !== requestId) return false;
     let text = String(data?.text ?? '').trim();
     if (!text) return false;
     rememberAppliedDictationRequest(requestId);
@@ -1697,7 +1828,7 @@ function applyDictationResult(data, { source = 'phone' } = {}) {
         text = `OOC: ${text}`;
     }
 
-    if (streamingSession && (!requestId || streamingSession.requestId === requestId)) {
+    if (streamingSession) {
         const ta = document.getElementById('send_textarea');
         const sessAppendMode = streamingSession.appendMode;
         const base = streamingSession.base;
@@ -2283,7 +2414,9 @@ function openPopup(url) {
     activeTarget = win;
     activeIsIframe = false;
     popupWatcher = setInterval(() => {
-        if (!activeTarget || activeTarget.closed) closeActive();
+        // Capture this popup: a stale watcher must not close a newer iframe or popup.
+        if (activeTarget !== win) return;
+        if (win.closed) closeActive(win);
     }, 500);
 }
 
@@ -2309,15 +2442,16 @@ function openIframe(url) {
 
     wrap.append(close, iframe);
     modal.append(backdrop, wrap);
-    backdrop.addEventListener('click', closeActive);
-    close.addEventListener('click', closeActive);
+    backdrop.addEventListener('click', () => closeActive(iframe.contentWindow));
+    close.addEventListener('click', () => closeActive(iframe.contentWindow));
     document.body.appendChild(modal);
     activeModal = modal;
     activeTarget = iframe.contentWindow;
     activeIsIframe = true;
 }
 
-function closeActive() {
+function closeActive(expectedTarget = null) {
+    if (expectedTarget && activeTarget !== expectedTarget) return;
     if (popupWatcher) { clearInterval(popupWatcher); popupWatcher = null; }
     if (activeIsIframe && activeModal) {
         try { activeModal.remove(); } catch {}
@@ -4548,24 +4682,26 @@ function buildSettingsPanel() {
     probeServer().then((ok) => { if (ok) return probeServerAuth(); }).catch(() => {});
 
     urlEl.addEventListener('change', () => {
-        s.serverUrl = urlEl.value.trim() || DEFAULTS.serverUrl;
+        const fresh = settings();
+        fresh.serverUrl = urlEl.value.trim() || DEFAULTS.serverUrl;
         serverAuthStatus = { health: 'unknown', token: 'unknown', lastCheckedAt: 0, lastError: '' };
         invalidateSessionTranscript();
         saveSettings();
         hidePairQrPanel(host);
         probeServer().then((ok) => { if (ok) return probeServerAuth(); }).catch(() => {});
-        // URL changed — if SSE is on, reconnect to the new host.
-        if (s.sseEnabled) connectSSE();
+        // URL changed — reconnect immediately with a fresh backoff budget.
+        if (fresh.sseEnabled) reconnectSSEManually();
     });
     tokenEl.addEventListener('change', () => {
-        s.serverToken = tokenEl.value.trim();
+        const fresh = settings();
+        fresh.serverToken = tokenEl.value.trim();
         serverAuthStatus.token = 'unknown';
         invalidateSessionTranscript();
         saveSettings();
         hidePairQrPanel(host);
         probeServerAuth().catch(() => {});
-        // Token changed — bounce SSE so the new query-string token takes effect.
-        if (s.sseEnabled) connectSSE();
+        // Token changed — bounce SSE immediately with a fresh backoff budget.
+        if (fresh.sseEnabled) reconnectSSEManually();
     });
     if (pairOpenEl) pairOpenEl.addEventListener('click', openPairedPhoneUrl);
     if (pairCopyEl) pairCopyEl.addEventListener('click', () => copyPairedPhoneUrl().catch(() => {}));
@@ -4573,7 +4709,7 @@ function buildSettingsPanel() {
     if (pairQrOpenEl) pairQrOpenEl.addEventListener('click', openPairedPhoneUrl);
     if (pairQrCopyEl) pairQrCopyEl.addEventListener('click', () => copyPairedPhoneUrl().catch(() => {}));
     if (pairQrHideEl) pairQrHideEl.addEventListener('click', () => hidePairQrPanel(host));
-    openEl.addEventListener('change', () => { s.openStyle = openEl.value; saveSettings(); });
+    openEl.addEventListener('change', () => { settings().openStyle = openEl.value; saveSettings(); });
     captureModeEl.addEventListener('change', () => {
         const fresh = settings();
         desktopPttHeld = false;
@@ -4584,14 +4720,15 @@ function buildSettingsPanel() {
         saveSettings();
         setMicState('idle');
     });
-    appendEl.addEventListener('change', () => { s.appendMode = appendEl.value; saveSettings(); });
-    autoEl.addEventListener('change', () => { s.autoSend = !!autoEl.checked; saveSettings(); });
-    pushEl.addEventListener('change', () => { s.pushContext = !!pushEl.checked; saveSettings(); });
-    mirrorEl.addEventListener('change', () => { s.liveMirror = !!mirrorEl.checked; saveSettings(); });
+    appendEl.addEventListener('change', () => { settings().appendMode = appendEl.value; saveSettings(); });
+    autoEl.addEventListener('change', () => { settings().autoSend = !!autoEl.checked; saveSettings(); });
+    pushEl.addEventListener('change', () => { settings().pushContext = !!pushEl.checked; saveSettings(); });
+    mirrorEl.addEventListener('change', () => { settings().liveMirror = !!mirrorEl.checked; saveSettings(); });
     broadcastEl.addEventListener('change', () => {
-        s.broadcastState = !!broadcastEl.checked;
+        const fresh = settings();
+        fresh.broadcastState = !!broadcastEl.checked;
         saveSettings();
-        if (s.broadcastState) {
+        if (fresh.broadcastState) {
             startStateHeartbeat();
             postState('toggle-on');
         } else {
@@ -4599,14 +4736,15 @@ function buildSettingsPanel() {
         }
     });
     sseEl.addEventListener('change', () => {
-        s.sseEnabled = !!sseEl.checked;
+        const fresh = settings();
+        fresh.sseEnabled = !!sseEl.checked;
         saveSettings();
-        if (s.sseEnabled) connectSSE();
+        if (fresh.sseEnabled) reconnectSSEManually();
         else disconnectSSE();
     });
     if (voiceCmdEl) {
         voiceCmdEl.addEventListener('change', () => {
-            s.voiceCommandsEnabled = !!voiceCmdEl.checked;
+            settings().voiceCommandsEnabled = !!voiceCmdEl.checked;
             saveSettings();
         });
     }
@@ -4631,7 +4769,7 @@ function buildSettingsPanel() {
             languageEl.value = s.language;
         }
         languageEl.addEventListener('change', () => {
-            s.language = languageEl.value || 'auto';
+            settings().language = languageEl.value || 'auto';
             saveSettings();
         });
     }
@@ -4697,13 +4835,13 @@ function buildSettingsPanel() {
 
     if (reformatModeEl) {
         reformatModeEl.addEventListener('change', () => {
-            s.reformatMode = reformatModeEl.value || '';
+            settings().reformatMode = reformatModeEl.value || '';
             saveSettings();
         });
     }
     if (reformatGoEl) {
         reformatGoEl.addEventListener('click', async () => {
-            const modeId = reformatModeEl?.value || s.reformatMode || '';
+            const modeId = reformatModeEl?.value || settings().reformatMode || '';
             if (!modeId) {
                 toast('info', 'Pick a mode to reformat as first');
                 return;
@@ -4853,8 +4991,9 @@ function buildSettingsPanel() {
     if (ttsAutoEl) {
         ttsAutoEl.checked = !!s.ttsAutoReadAi;
         ttsAutoEl.addEventListener('change', () => {
-            s.ttsAutoReadAi = !!ttsAutoEl.checked;
-            if (s.ttsAutoReadAi) unlockTtsAudio('settings-auto-read');
+            const fresh = settings();
+            fresh.ttsAutoReadAi = !!ttsAutoEl.checked;
+            if (fresh.ttsAutoReadAi) unlockTtsAudio('settings-auto-read');
             saveSettings();
             try { paintQuickLaunchAutoReadBtn(); } catch {}
         });
@@ -4862,16 +5001,17 @@ function buildSettingsPanel() {
     if (ttsAutoPersonaEl) {
         ttsAutoPersonaEl.checked = !!s.ttsAutoReadPersonaQuoted;
         ttsAutoPersonaEl.addEventListener('change', () => {
-            s.ttsAutoReadPersonaQuoted = !!ttsAutoPersonaEl.checked;
+            settings().ttsAutoReadPersonaQuoted = !!ttsAutoPersonaEl.checked;
             saveSettings();
         });
     }
     if (ttsStreamEl) {
         ttsStreamEl.checked = !!s.ttsReadStreamingPartials;
         ttsStreamEl.addEventListener('change', () => {
-            s.ttsReadStreamingPartials = !!ttsStreamEl.checked;
+            const fresh = settings();
+            fresh.ttsReadStreamingPartials = !!ttsStreamEl.checked;
             saveSettings();
-            if (!s.ttsReadStreamingPartials) cancelStreamingTts();
+            if (!fresh.ttsReadStreamingPartials) cancelStreamingTts();
         });
     }
 
@@ -4900,6 +5040,7 @@ function buildSettingsPanel() {
             // Replace options with server-provided list. Preserve current
             // selection if it's in the new list.
             const prev = ttsVoiceEl.value;
+            const fresh = settings();
             ttsVoiceEl.innerHTML = '';
             for (const v of voices) {
                 const opt = document.createElement('option');
@@ -4909,8 +5050,8 @@ function buildSettingsPanel() {
             }
             ttsVoiceEl.value = voices.some(v => (v.id || v.name) === prev) ? prev : (voices[0].id || voices[0].name || 'af_heart');
             // Persist global fallback only when no character profile is active.
-            if (!profileVoice && s.ttsVoice !== ttsVoiceEl.value) {
-                s.ttsVoice = ttsVoiceEl.value;
+            if (!profileVoice && fresh.ttsVoice !== ttsVoiceEl.value) {
+                fresh.ttsVoice = ttsVoiceEl.value;
                 saveSettings();
             }
             paintTtsProfileHint();
@@ -4920,8 +5061,9 @@ function buildSettingsPanel() {
             WARN('tts/voices fetch failed (using fallback)', e?.message || e);
         });
         ttsVoiceEl.addEventListener('change', () => {
-            s.ttsVoice = ttsVoiceEl.value || 'af_heart';
-            const profileName = rememberTtsVoiceForCurrentProfile(s.ttsVoice);
+            const fresh = settings();
+            fresh.ttsVoice = ttsVoiceEl.value || 'af_heart';
+            const profileName = rememberTtsVoiceForCurrentProfile(fresh.ttsVoice);
             saveSettings();
             paintTtsProfileHint();
             if (profileName) toast('success', `Saved TTS voice for ${escapeHtml(profileName)}`);
@@ -5145,7 +5287,7 @@ let initialized = false;
 export async function init() {
     if (initialized) return;
     initialized = true;
-    settings();
+    initializeSettings();
     window.addEventListener('message', onWindowMessage);
     window.addEventListener('pagehide', () => {
         desktopPttHeld = false;
