@@ -3858,6 +3858,247 @@ async function openDiagnosticsPanel() {
     modal.querySelector('.dictation-bridge-close')?.addEventListener('click', closeDiagnosticsPanel);
 }
 
+// ─── Slice C: in-memory session transcript ────────────────────────────────
+const TRANSCRIPT_PREVIEW_CHARS = 240;
+let sessionTranscriptEntries = [];
+let sessionTranscriptLoaded = false;
+let sessionTranscriptState = 'idle';
+let sessionTranscriptError = '';
+
+function transcriptListElement() {
+    return document.getElementById('dictation_bridge_transcript_list');
+}
+
+function invalidateSessionTranscript() {
+    sessionTranscriptEntries = [];
+    sessionTranscriptLoaded = false;
+    sessionTranscriptState = 'idle';
+    sessionTranscriptError = '';
+    renderSessionTranscript();
+}
+
+function formatTranscriptTimestamp(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return 'Time unavailable';
+    const parsed = new Date(raw);
+    return Number.isNaN(parsed.getTime()) ? raw : parsed.toLocaleString();
+}
+
+function appendTranscriptAction(parent, label, className, onClick) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `menu_button ${className}`;
+    button.textContent = label;
+    button.addEventListener('click', onClick);
+    parent.appendChild(button);
+    return button;
+}
+
+function renderSessionTranscript() {
+    const host = transcriptListElement();
+    if (!host) return;
+    host.replaceChildren();
+    host.setAttribute('aria-busy', sessionTranscriptState === 'loading' ? 'true' : 'false');
+
+    if (sessionTranscriptState === 'loading') {
+        const status = document.createElement('p');
+        status.className = 'dbb-transcript-status';
+        status.textContent = 'Loading session transcript…';
+        host.appendChild(status);
+        return;
+    }
+    if (sessionTranscriptState === 'error') {
+        const status = document.createElement('p');
+        status.className = 'dbb-transcript-status dbb-transcript-status--error';
+        status.setAttribute('role', 'alert');
+        status.textContent = sessionTranscriptError || 'Could not load the session transcript.';
+        host.appendChild(status);
+        return;
+    }
+    if (!sessionTranscriptLoaded) {
+        const status = document.createElement('p');
+        status.className = 'dbb-transcript-status';
+        status.textContent = 'Open this drawer or choose Refresh to load in-memory history.';
+        host.appendChild(status);
+        return;
+    }
+    if (!sessionTranscriptEntries.length) {
+        const status = document.createElement('p');
+        status.className = 'dbb-transcript-status';
+        status.textContent = 'No entries in this server session.';
+        host.appendChild(status);
+        return;
+    }
+
+    sessionTranscriptEntries.forEach((entry, index) => {
+        const entryId = String(entry?.id || '').trim();
+        const role = entry?.role === 'context' ? 'context' : 'user';
+        const fullText = String(entry?.text || '');
+        const isTruncated = fullText.length > TRANSCRIPT_PREVIEW_CHARS;
+
+        const article = document.createElement('article');
+        article.className = `dbb-transcript-entry dbb-transcript-entry--${role}`;
+
+        const meta = document.createElement('div');
+        meta.className = 'dbb-transcript-meta';
+        const roleLabel = document.createElement('strong');
+        roleLabel.textContent = role === 'context' ? 'Context' : 'You';
+        const timestamp = document.createElement('time');
+        timestamp.textContent = formatTranscriptTimestamp(entry?.timestamp);
+        if (entry?.timestamp) timestamp.dateTime = String(entry.timestamp);
+        meta.append(roleLabel, timestamp);
+        article.appendChild(meta);
+
+        const preview = document.createElement('p');
+        preview.className = 'dbb-transcript-preview';
+        preview.textContent = isTruncated
+            ? `${fullText.slice(0, TRANSCRIPT_PREVIEW_CHARS).trimEnd()}…`
+            : (fullText || 'Empty entry');
+        article.appendChild(preview);
+
+        if (isTruncated) {
+            const fullId = `dictation_bridge_transcript_full_${index}`;
+            const full = document.createElement('pre');
+            full.id = fullId;
+            full.className = 'dbb-transcript-full';
+            full.hidden = true;
+            full.textContent = fullText;
+            const review = appendTranscriptAction(article, 'Review full entry', 'dbb-transcript-review', () => {
+                const willExpand = full.hidden;
+                full.hidden = !willExpand;
+                review.setAttribute('aria-expanded', String(willExpand));
+                review.textContent = willExpand ? 'Collapse full entry' : 'Review full entry';
+                if (willExpand) full.focus({ preventScroll: true });
+            });
+            review.setAttribute('aria-controls', fullId);
+            review.setAttribute('aria-expanded', 'false');
+            full.tabIndex = -1;
+            article.appendChild(full);
+        }
+
+        const actions = document.createElement('div');
+        actions.className = 'dbb-transcript-actions';
+        const starLabel = entry?.starred ? 'Unstar' : 'Star';
+        const star = appendTranscriptAction(actions, starLabel, 'dbb-transcript-star', () => {
+            toggleTranscriptStar(entryId).catch(() => {});
+        });
+        star.setAttribute('aria-pressed', entry?.starred ? 'true' : 'false');
+        star.disabled = !entryId;
+        star.title = entry?.starred ? 'Remove star from this entry' : 'Star this entry';
+
+        const remove = appendTranscriptAction(actions, 'Delete', 'dbb-transcript-delete', () => {
+            deleteTranscriptEntry(entryId).catch(() => {});
+        });
+        remove.disabled = !entryId;
+        remove.title = 'Delete only this transcript entry';
+        article.appendChild(actions);
+        host.appendChild(article);
+    });
+}
+
+async function loadSessionTranscript() {
+    const base = settings().serverUrl.replace(/\/+$/, '');
+    sessionTranscriptState = 'loading';
+    sessionTranscriptError = '';
+    renderSessionTranscript();
+    try {
+        const res = await fetch(`${base}/transcript`, {
+            method: 'GET',
+            mode: 'cors',
+            headers: authHeaders(),
+        });
+        let data = {};
+        try { data = await res.json(); } catch {}
+        if (!res.ok) throw new Error(String(data?.error || `transcript_http_${res.status}`));
+        sessionTranscriptEntries = Array.isArray(data?.transcript) ? data.transcript : [];
+        sessionTranscriptLoaded = true;
+        sessionTranscriptState = 'ready';
+    } catch (error) {
+        sessionTranscriptEntries = [];
+        sessionTranscriptState = 'error';
+        sessionTranscriptError = `Could not load transcript: ${String(error?.message || 'unknown error')}`;
+    }
+    renderSessionTranscript();
+}
+
+async function toggleTranscriptStar(entryId) {
+    if (!entryId) return;
+    const base = settings().serverUrl.replace(/\/+$/, '');
+    try {
+        const res = await fetch(`${base}/transcript/${encodeURIComponent(entryId)}/star`, {
+            method: 'POST',
+            mode: 'cors',
+            headers: authHeaders(),
+        });
+        let data = {};
+        try { data = await res.json(); } catch {}
+        if (!res.ok) throw new Error(String(data?.error || `transcript_star_http_${res.status}`));
+        await loadSessionTranscript();
+    } catch (error) {
+        toast('error', `Could not update transcript star: ${escapeHtml(error?.message || 'unknown error')}`);
+        await loadSessionTranscript();
+    }
+}
+
+async function deleteTranscriptEntry(entryId) {
+    if (!entryId) return;
+    const confirmed = window.confirm('Delete only this transcript entry? This cannot be undone.');
+    if (!confirmed) return;
+    const base = settings().serverUrl.replace(/\/+$/, '');
+    try {
+        const res = await fetch(`${base}/transcript/${encodeURIComponent(entryId)}`, {
+            method: 'DELETE',
+            mode: 'cors',
+            headers: authHeaders(),
+        });
+        let data = {};
+        try { data = await res.json(); } catch {}
+        if (!res.ok) throw new Error(String(data?.error || `transcript_delete_http_${res.status}`));
+        toast('success', 'Transcript entry deleted');
+    } catch (error) {
+        toast('error', `Could not delete transcript entry: ${escapeHtml(error?.message || 'unknown error')}`);
+    }
+    await loadSessionTranscript();
+}
+
+function transcriptExportFilename(contentDisposition) {
+    const match = String(contentDisposition || '').match(/filename="?([^";]+)"?/i);
+    const candidate = String(match?.[1] || 'dictation-session.md').replace(/[^A-Za-z0-9._-]+/g, '-');
+    return candidate.toLowerCase().endsWith('.md') ? candidate : `${candidate}.md`;
+}
+
+async function exportSessionTranscript(button) {
+    const base = settings().serverUrl.replace(/\/+$/, '');
+    const previousLabel = button?.textContent || 'Export Markdown';
+    if (button) {
+        button.textContent = 'Exporting…';
+        button.disabled = true;
+    }
+    try {
+        const res = await fetch(`${base}/transcript/export.md`, {
+            method: 'GET',
+            mode: 'cors',
+            headers: authHeaders(),
+        });
+        if (!res.ok) {
+            let detail = '';
+            try { detail = (await res.json())?.error || ''; } catch {}
+            throw new Error(String(detail || `transcript_export_http_${res.status}`));
+        }
+        const blob = await res.blob();
+        const filename = transcriptExportFilename(res.headers.get('Content-Disposition'));
+        downloadBlob(blob, filename);
+        toast('success', 'Session transcript exported');
+    } catch (error) {
+        toast('error', `Could not export transcript: ${escapeHtml(error?.message || 'unknown error')}`);
+    } finally {
+        if (button) {
+            button.textContent = previousLabel;
+            button.disabled = false;
+        }
+    }
+}
+
 // ─── Quick-launch panel (above settings drawer) ────────────────────────────
 // Compact card: [🎤 Open Dictation] [🔊 Read All AI Msgs] · status dot · mode
 // label · "Last: <ago>s". Mounted at #extensions_settings2 INSERT-BEFORE the
@@ -4162,6 +4403,17 @@ function buildSettingsPanel() {
                         <small class="notes" style="margin-top:0">Reruns <code>/reformat</code> on the message box text; the original is undo-able.</small>
                     </div>
 
+                    <!-- Slice C: in-memory session transcript ───────────── -->
+                    <details id="dictation_bridge_transcript_drawer" class="dbb-transcript-drawer">
+                        <summary>Session transcript</summary>
+                        <div class="dbb-transcript-toolbar">
+                            <button id="dictation_bridge_transcript_refresh" type="button" class="menu_button">Refresh</button>
+                            <button id="dictation_bridge_transcript_export" type="button" class="menu_button">Export Markdown</button>
+                            <small>In-memory server session only.</small>
+                        </div>
+                        <div id="dictation_bridge_transcript_list" class="dbb-transcript-list" aria-live="polite" aria-busy="false"></div>
+                    </details>
+
                     <!-- TTS read-back (Kokoro backend) ─────────────────── -->
                     <div class="dbb-tts-settings" style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(201, 178, 139, 0.18)">
                         <div style="font-size:11px;letter-spacing:0.06em;text-transform:uppercase;color:#FFB648;margin-bottom:4px">TTS (read-back)</div>
@@ -4289,6 +4541,7 @@ function buildSettingsPanel() {
     urlEl.addEventListener('change', () => {
         s.serverUrl = urlEl.value.trim() || DEFAULTS.serverUrl;
         serverAuthStatus = { health: 'unknown', token: 'unknown', lastCheckedAt: 0, lastError: '' };
+        invalidateSessionTranscript();
         saveSettings();
         hidePairQrPanel(host);
         probeServer().then((ok) => { if (ok) return probeServerAuth(); }).catch(() => {});
@@ -4298,6 +4551,7 @@ function buildSettingsPanel() {
     tokenEl.addEventListener('change', () => {
         s.serverToken = tokenEl.value.trim();
         serverAuthStatus.token = 'unknown';
+        invalidateSessionTranscript();
         saveSettings();
         hidePairQrPanel(host);
         probeServerAuth().catch(() => {});
@@ -4461,6 +4715,29 @@ function buildSettingsPanel() {
                 reformatGoEl.textContent = prev;
                 reformatGoEl.removeAttribute('disabled');
             }
+        });
+    }
+
+    // ─── Slice C: transcript drawer wiring ─────────────────────────────────
+    const transcriptDrawerEl = host.querySelector('#dictation_bridge_transcript_drawer');
+    const transcriptRefreshEl = host.querySelector('#dictation_bridge_transcript_refresh');
+    const transcriptExportEl = host.querySelector('#dictation_bridge_transcript_export');
+    renderSessionTranscript();
+    if (transcriptDrawerEl) {
+        transcriptDrawerEl.addEventListener('toggle', () => {
+            if (transcriptDrawerEl.open && !sessionTranscriptLoaded) {
+                loadSessionTranscript().catch(() => {});
+            }
+        });
+    }
+    if (transcriptRefreshEl) {
+        transcriptRefreshEl.addEventListener('click', () => {
+            loadSessionTranscript().catch(() => {});
+        });
+    }
+    if (transcriptExportEl) {
+        transcriptExportEl.addEventListener('click', () => {
+            exportSessionTranscript(transcriptExportEl).catch(() => {});
         });
     }
 
