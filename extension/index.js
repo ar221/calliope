@@ -1091,8 +1091,8 @@ function handleDictationCommand(data) {
             if (!last) { toast('warning', 'No message to swipe'); break; }
             const sel = direction === 'left' ? '.mes_swipe_left' : '.mes_swipe_right';
             const ok = clickIfVisible(sel, last);
-            if (ok) toast('success', `Swiped ${direction}`);
-            else toast('warning', `Swipe ${direction} unavailable`);
+            if (ok) toast('success', `Swiped ${escapeHtml(direction)}`);
+            else toast('warning', `Swipe ${escapeHtml(direction)} unavailable`);
             break;
         }
         case 'regenerate': {
@@ -1469,7 +1469,7 @@ function connectSSE() {
         // Prepend the OOC tag back so the chat displays the convention ST
         // readers expect (OOC chunks are routed differently downstream).
         const modeOverride = String(data.mode_override || data.modeOverride || '').toLowerCase();
-        if (modeOverride === 'ooc' || modeOverride === 'grammar_clean'
+        if ((modeOverride === 'ooc' || modeOverride === 'grammar_clean')
                 && data.is_ooc === true) {
             if (!/^\s*ooc\b/i.test(text)) text = `OOC: ${text}`;
         }
@@ -1503,7 +1503,7 @@ function connectSSE() {
         renderRepairTraceFromPayload(data, text);
 
         if (data.formatting_skipped && window.toastr) {
-            const reason = data.formatting_reason ? `: ${data.formatting_reason}` : '';
+            const reason = data.formatting_reason ? `: ${escapeHtml(data.formatting_reason)}` : '';
             window.toastr.warning(`RP formatting skipped${reason}. Raw transcript used.`, 'Dictation Bridge');
         } else if (window.toastr) {
             const repair = data.has_repair_trace === true
@@ -1952,7 +1952,7 @@ function onWindowMessage(event) {
             if (cfg.autoSend) setTimeout(() => maybeReadDictatedPersonaText(text), 200);
             renderRepairTraceFromPayload(data, text);
             if (data.formatting_skipped && window.toastr) {
-                const reason = data.formatting_reason ? `: ${data.formatting_reason}` : '';
+                const reason = data.formatting_reason ? `: ${escapeHtml(data.formatting_reason)}` : '';
                 window.toastr.warning(`RP formatting skipped${reason}. Raw transcript used.`, 'Dictation Bridge');
             }
             // POL-3: low-confidence banner if the server tagged spans.
@@ -2862,7 +2862,7 @@ async function exportCurrentChatAudiobook(btn) {
             notifyTtsMissing(e?.message || `status_${status}`);
         } else {
             WARN('audiobook export failed', e?.message || e);
-            toast('error', `Audiobook export failed: ${e?.message || 'unknown'}`);
+            toast('error', `Audiobook export failed: ${escapeHtml(e?.message || 'unknown')}`);
         }
     } finally {
         if (btn) {
@@ -2937,7 +2937,7 @@ async function readMessageAloud(mesEl, btn) {
             notifyTtsMissing(e?.message || `status_${status}`);
         } else {
             WARN('tts fetch failed', e?.message || e);
-            toast('error', `TTS failed: ${e?.message || 'unknown'}`);
+            toast('error', `TTS failed: ${escapeHtml(e?.message || 'unknown')}`);
         }
         ttsSetButtonState(btn, 'idle');
         if (currentTtsBtn === btn) currentTtsBtn = null;
@@ -3130,7 +3130,7 @@ async function playNextTtsStreamChunk(session) {
             notifyTtsMissing(e?.message || `status_${status}`);
         } else {
             WARN('streaming TTS failed', e?.message || e);
-            toast('error', `Streaming TTS failed: ${e?.message || 'unknown'}`);
+            toast('error', `Streaming TTS failed: ${escapeHtml(e?.message || 'unknown')}`);
         }
         ttsSetButtonState(session.btn, 'idle');
         session.playing = false;
@@ -3263,7 +3263,7 @@ function maybeReadDictatedPersonaText(text) {
                 notifyTtsMissing(e?.message || `status_${status}`);
             } else {
                 WARN('dictated persona TTS failed', e?.message || e);
-                toast('error', `Persona TTS failed: ${e?.message || 'unknown'}`);
+                toast('error', `Persona TTS failed: ${escapeHtml(e?.message || 'unknown')}`);
             }
         });
 }
@@ -3928,7 +3928,7 @@ function buildSettingsPanel() {
                     stopTts();
                     await createAndPlayTtsAudio(blob, () => {});
                 } catch (e) {
-                    toast('error', `Sample failed: ${e?.message || 'unknown'}`);
+                    toast('error', `Sample failed: ${escapeHtml(e?.message || 'unknown')}`);
                 } finally {
                     btn.textContent = prevLabel;
                     btn.removeAttribute('disabled');
@@ -4048,7 +4048,7 @@ function buildSettingsPanel() {
                 if (status === 404 || status === 501 || status === 503 || status === 0) {
                     notifyTtsMissing(e?.message || `status_${status}`);
                 } else {
-                    toast('error', `Test voice failed: ${e?.message || 'unknown'}`);
+                    toast('error', `Test voice failed: ${escapeHtml(e?.message || 'unknown')}`);
                 }
             } finally {
                 ttsTestEl.textContent = prev;
@@ -4133,7 +4133,7 @@ function buildSettingsPanel() {
                             stopTts();
                             await createAndPlayTtsAudio(blob, () => {});
                         } catch (e) {
-                            toast('error', `Sample failed: ${e?.message || 'unknown'}`);
+                            toast('error', `Sample failed: ${escapeHtml(e?.message || 'unknown')}`);
                         } finally {
                             btn.textContent = prevLabel;
                             btn.removeAttribute('disabled');
@@ -4157,7 +4157,7 @@ function buildSettingsPanel() {
                     });
                 });
             } catch (e) {
-                toast('error', `Voice suggestion failed: ${e?.message || 'unknown'}`);
+                toast('error', `Voice suggestion failed: ${escapeHtml(e?.message || 'unknown')}`);
             } finally {
                 ttsSuggestEl.textContent = prev;
                 ttsSuggestEl.removeAttribute('disabled');
@@ -4208,7 +4208,7 @@ function buildSettingsPanel() {
                     toast('success', `Cast ${names.length} voice${names.length === 1 ? '' : 's'}${reused}`);
                 }
             } catch (e) {
-                toast('error', `Auto-cast failed: ${e?.message || 'unknown'}`);
+                toast('error', `Auto-cast failed: ${escapeHtml(e?.message || 'unknown')}`);
             } finally {
                 ttsAutocastEl.textContent = prev;
                 ttsAutocastEl.removeAttribute('disabled');
