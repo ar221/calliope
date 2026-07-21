@@ -19,30 +19,75 @@ from .config import _safe_child
 log = logging.getLogger("dictation-server")
 
 
+def _expand_persona_macros(text: str, display_name: str) -> str:
+    """Resolve the user-identity macros Calliope can safely know."""
+    if not text:
+        return ""
+    replacements = {
+        "{{user}}": display_name,
+        "{{persona}}": display_name,
+    }
+    out = text
+    for macro, value in replacements.items():
+        out = re.sub(re.escape(macro), value, out, flags=re.IGNORECASE)
+    return out
+
+
 # ─── Persona discovery & loading ─────────────────────────
-def discover_personas() -> list[dict]:
-    """Scan config.PERSONAS_DIR for .md files (excluding .voice.md sidecars)."""
-    personas = []
-    if not config.PERSONAS_DIR.is_dir():
-        return personas
-    for f in sorted(config.PERSONAS_DIR.glob("*.md")):
-        if f.name.endswith(".voice.md"):
+def _load_st_persona_catalog() -> dict[str, dict]:
+    """Read only persona names/descriptions from SillyTavern settings."""
+    try:
+        data = json.loads(config.ST_SETTINGS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    power_user = data.get("power_user", {})
+    if not isinstance(power_user, dict):
+        return {}
+    names = power_user.get("personas", {})
+    descriptions = power_user.get("persona_descriptions", {})
+    if not isinstance(names, dict):
+        return {}
+    if not isinstance(descriptions, dict):
+        descriptions = {}
+    out: dict[str, dict] = {}
+    for persona_id, display_name in names.items():
+        if not isinstance(persona_id, str) or not persona_id.strip():
             continue
-        # Extract display name from first heading
-        name = f.stem.replace("-", " ").replace("_", " ").title()
-        try:
-            for line in f.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line.startswith("# "):
-                    raw = line.lstrip("# ").strip()
-                    # Clean up common suffixes and version tags
-                    raw = re.sub(r"\s*[—\-]\s*PERSONA.*$", "", raw, flags=re.IGNORECASE).strip()
-                    name = raw
-                    break
-        except Exception:
-            pass
-        personas.append({"id": f.stem, "name": name})
-    return personas
+        descriptor = descriptions.get(persona_id, {})
+        description = descriptor.get("description", "") if isinstance(descriptor, dict) else ""
+        name = str(display_name or persona_id).strip()
+        out[persona_id] = {
+            "id": persona_id,
+            "name": name,
+            "description": _expand_persona_macros(str(description or "").strip(), name),
+            "source": "sillytavern",
+        }
+    return out
+
+
+def discover_personas() -> list[dict]:
+    """Return all SillyTavern personas plus optional local markdown personas."""
+    merged = {
+        persona_id: {"id": p["id"], "name": p["name"], "source": p["source"]}
+        for persona_id, p in _load_st_persona_catalog().items()
+    }
+    if config.PERSONAS_DIR.is_dir():
+        for f in sorted(config.PERSONAS_DIR.glob("*.md")):
+            if f.name.endswith(".voice.md"):
+                continue
+            name = f.stem.replace("-", " ").replace("_", " ").title()
+            try:
+                for line in f.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line.startswith("# "):
+                        raw = line.lstrip("# ").strip()
+                        raw = re.sub(r"\s*[—\-]\s*PERSONA.*$", "", raw, flags=re.IGNORECASE).strip()
+                        name = raw
+                        break
+            except Exception:
+                pass
+            merged[f.stem] = {"id": f.stem, "name": name, "source": "local"}
+    return sorted(merged.values(), key=lambda p: (p["name"].casefold(), p["id"].casefold()))
 
 
 def load_persona_voice(persona_id: str) -> str:
@@ -65,6 +110,12 @@ def load_persona_voice(persona_id: str) -> str:
     # Fallback: auto-extract from full persona file
     full_file = _safe_child(config.PERSONAS_DIR, persona_id, ".md")
     if full_file is None or not full_file.exists():
+        st_persona = _load_st_persona_catalog().get(persona_id)
+        if st_persona and st_persona.get("description"):
+            return (
+                "PERSONA VOICE GUIDE (you are writing AS this SillyTavern persona):\n"
+                + st_persona["description"][:4000].rstrip()
+            )
         return ""
 
     try:
@@ -131,6 +182,15 @@ def load_persona_full(persona_id: str, max_chars: int = 2000) -> dict:
                 description = description[:max_chars].rstrip() + "\n\n[...truncated]"
         except Exception:
             pass
+
+    if not description:
+        st_persona = _load_st_persona_catalog().get(persona_id)
+        if st_persona:
+            name = st_persona["name"]
+            full_description = st_persona["description"]
+            description = full_description[:max_chars].rstrip()
+            if len(full_description) > max_chars:
+                description += "\n\n[...truncated]"
 
     return {"id": persona_id, "name": name, "description": description}
 
