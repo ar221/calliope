@@ -16,12 +16,12 @@ def _write_settings(path):
     path.write_text(json.dumps({
         "power_user": {
             "personas": {
-                "ayaz.png": "Ayaz Rashid",
-                "alex.png": "Alex",
+                "user.png": "Test User",
+                "writer.png": "Test Writer",
             },
             "persona_descriptions": {
-                "ayaz.png": {"description": "Terse, controlled, first-person voice."},
-                "alex.png": {"description": "{{user}} is warm, playful, and highly physical in prose."},
+                "user.png": {"description": "Concise, controlled, first-person voice."},
+                "writer.png": {"description": "{{user}} is warm, playful, and vivid in prose."},
             },
         },
         "api_key": "must-not-leak",
@@ -33,12 +33,12 @@ def test_discover_personas_includes_full_st_list(monkeypatch, tmp_path):
     _write_settings(settings)
     local = tmp_path / "local"
     local.mkdir()
-    (local / "nightshade.md").write_text("# Nightshade\nPrivate local persona.", encoding="utf-8")
+    (local / "local-persona.md").write_text("# Local Persona\nPrivate local persona.", encoding="utf-8")
     monkeypatch.setattr(sillytavern.config, "ST_SETTINGS_FILE", settings)
     monkeypatch.setattr(sillytavern.config, "PERSONAS_DIR", local)
 
     personas = sillytavern.discover_personas()
-    assert {p["id"] for p in personas} == {"ayaz.png", "alex.png", "nightshade"}
+    assert {p["id"] for p in personas} == {"user.png", "writer.png", "local-persona"}
     assert all("description" not in p for p in personas)
     assert "must-not-leak" not in json.dumps(personas)
 
@@ -51,10 +51,10 @@ def test_st_persona_description_shapes_voice_and_full_card(monkeypatch, tmp_path
     monkeypatch.setattr(sillytavern.config, "ST_SETTINGS_FILE", settings)
     monkeypatch.setattr(sillytavern.config, "PERSONAS_DIR", local)
 
-    voice = sillytavern.load_persona_voice("alex.png")
+    voice = sillytavern.load_persona_voice("writer.png")
     assert "SillyTavern persona" in voice
-    assert "Alex is warm, playful" in voice
+    assert "Test Writer is warm, playful" in voice
     assert "{{user}}" not in voice
-    full = sillytavern.load_persona_full("alex.png")
-    assert full["name"] == "Alex"
-    assert "highly physical in prose" in full["description"]
+    full = sillytavern.load_persona_full("writer.png")
+    assert full["name"] == "Test Writer"
+    assert "vivid in prose" in full["description"]
