@@ -35,7 +35,7 @@ def test_check_renews_when_below_threshold(tmp_path, monkeypatch):
         mod, "cert_days_remaining", lambda: mod.CERT_RENEW_THRESHOLD_DAYS - 1
     )
     monkeypatch.setattr(
-        mod, "ensure_ssl_cert", lambda: calls.__setitem__("ensure", calls["ensure"] + 1)
+        mod, "ensure_ssl_cert", lambda: calls.__setitem__("ensure", calls["ensure"] + 1) or True
     )
     monkeypatch.setattr(
         mod,
@@ -72,6 +72,21 @@ def test_check_skips_when_expiry_unknown(tmp_path, monkeypatch):
 
     assert mod._check_and_renew_cert() is False
     assert calls["ensure"] == 0
+
+
+def test_check_does_not_reload_external_near_expiry_cert(tmp_path, monkeypatch):
+    mod = _load_server(tmp_path, monkeypatch)
+    calls = {"ensure": 0, "reload": 0}
+    monkeypatch.setattr(mod, "cert_days_remaining", lambda: 1)
+    monkeypatch.setattr(
+        mod, "ensure_ssl_cert", lambda: calls.__setitem__("ensure", calls["ensure"] + 1) or False
+    )
+    monkeypatch.setattr(
+        mod, "_reload_ssl_context_cert", lambda: calls.__setitem__("reload", calls["reload"] + 1)
+    )
+
+    assert mod._check_and_renew_cert() is False
+    assert calls == {"ensure": 1, "reload": 0}
 
 
 def test_reload_is_noop_without_registered_context(tmp_path, monkeypatch):
@@ -176,7 +191,7 @@ def test_ensure_never_clobbers_external_cert(tmp_path, monkeypatch):
     # Simulate a CA-issued cert by forcing the discriminator False and expiry
     # below threshold: ensure_ssl_cert must NOT regenerate.
     mod = _load_server(tmp_path, monkeypatch)
-    _mint(mod.CERT_FILE, mod.KEY_FILE, "/CN=beast.tail351822.ts.net")
+    _mint(mod.CERT_FILE, mod.KEY_FILE, "/CN=calliope.example.ts.net")
     monkeypatch.setattr(mod, "_cert_is_calliope_self_signed", lambda: False)
     monkeypatch.setattr(mod, "cert_days_remaining", lambda: 1)
     called = {"n": 0}
@@ -199,3 +214,54 @@ def test_ensure_generates_when_missing(tmp_path, monkeypatch):
     )
     mod.ensure_ssl_cert()
     assert called["n"] == 1  # first run, no cert on disk
+
+
+def test_tailscale_cert_validation_checks_hostname_and_key(tmp_path, monkeypatch):
+    mod = _load_server(tmp_path, monkeypatch)
+    cert = tmp_path / "issued.crt"
+    key = tmp_path / "issued.key"
+    _mint(cert, key, "/CN=calliope.example.ts.net")
+
+    assert mod._validate_cert_pair_for_hostname(cert, key, "calliope.example.ts.net") == (True, "")
+    ok, error = mod._validate_cert_pair_for_hostname(cert, key, "wrong.example.ts.net")
+    assert ok is False
+    assert error
+
+
+def test_tailscale_cert_validation_rejects_mismatched_key(tmp_path, monkeypatch):
+    mod = _load_server(tmp_path, monkeypatch)
+    cert = tmp_path / "issued.crt"
+    key = tmp_path / "issued.key"
+    other_cert = tmp_path / "other.crt"
+    other_key = tmp_path / "other.key"
+    _mint(cert, key, "/CN=calliope.example.ts.net")
+    _mint(other_cert, other_key, "/CN=calliope.example.ts.net")
+
+    ok, error = mod._validate_cert_pair_for_hostname(cert, other_key, "calliope.example.ts.net")
+    assert ok is False
+    assert "do not match" in error
+
+
+def test_install_pair_rolls_back_if_second_replace_fails(tmp_path, monkeypatch):
+    mod = _load_server(tmp_path, monkeypatch)
+    mod.CERT_FILE.write_text("old-cert", encoding="utf-8")
+    mod.KEY_FILE.write_text("old-key", encoding="utf-8")
+    tmp_crt = tmp_path / "new.crt"
+    tmp_key = tmp_path / "new.key"
+    tmp_crt.write_text("new-cert", encoding="utf-8")
+    tmp_key.write_text("new-key", encoding="utf-8")
+    real_replace = mod.os.replace
+    calls = {"n": 0}
+
+    def fail_second(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("simulated key replacement failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(mod.os, "replace", fail_second)
+    with pytest.raises(OSError, match="simulated key replacement failure"):
+        mod._install_cert_pair_with_rollback(tmp_crt, tmp_key)
+
+    assert mod.CERT_FILE.read_text(encoding="utf-8") == "old-cert"
+    assert mod.KEY_FILE.read_text(encoding="utf-8") == "old-key"

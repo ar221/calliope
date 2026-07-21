@@ -637,8 +637,8 @@ def _cert_is_calliope_self_signed() -> bool:
     return "CN=dictation-server" in subject or "CN = dictation-server" in subject
 
 
-def ensure_ssl_cert():
-    """Generate a self-signed cert if missing; auto-renew ONLY our own near-expiry cert.
+def ensure_ssl_cert() -> bool:
+    """Generate/renew our cert and return whether the live pair changed.
 
     An externally-managed cert (Tailscale/Let's Encrypt, or a user-installed
     custom cert) is never regenerated — clobbering it is exactly the bug that
@@ -656,12 +656,12 @@ def ensure_ssl_cert():
 
     if not (CERT_FILE.exists() and KEY_FILE.exists()):
         _generate_self_signed_cert(sans=sans)
-        return
+        return True
 
     days = cert_days_remaining()
     if days is None:
         log.warning("Could not determine cert expiry — leaving existing cert in place")
-        return
+        return False
 
     if not _cert_is_calliope_self_signed():
         # Externally-managed cert: warn near expiry but never overwrite it.
@@ -674,17 +674,18 @@ def ensure_ssl_cert():
             log.warning(f"Externally-managed SSL cert expires in {days} days — renew it soon.")
         else:
             log.info(f"Externally-managed SSL cert valid for {days} more days")
-        return
+        return False
 
     if days < CERT_RENEW_THRESHOLD_DAYS:
         log.warning(f"SSL cert expires in {days} days — auto-regenerating")
         _generate_self_signed_cert(sans=sans)
-        return
+        return True
 
     if days < CERT_WARN_THRESHOLD_DAYS:
         log.warning(f"SSL cert expires in {days} days — consider regenerating soon")
     else:
         log.info(f"SSL cert valid for {days} more days")
+    return False
 
 
 def _reload_ssl_context_cert() -> bool:
@@ -723,7 +724,10 @@ def _check_and_renew_cert() -> bool:
             log.info(f"In-run cert check: {days} days remaining")
         return False
     log.warning(f"In-run cert check: cert expires in {days} days — regenerating")
-    ensure_ssl_cert()
+    renewed = ensure_ssl_cert()
+    if not renewed:
+        log.warning("In-run cert check: near-expiry cert is externally managed — renewal skipped")
+        return False
     if not _reload_ssl_context_cert():
         log.warning("Regenerated cert on disk but could not hot-reload it — "
                     "restart the dictation-server to serve the new cert")
@@ -2704,6 +2708,62 @@ def _tailscale_self_dns() -> str | None:
     return dns.rstrip(".")
 
 
+def _validate_cert_pair_for_hostname(cert: Path, key: Path, hostname: str) -> tuple[bool, str]:
+    """Validate certificate syntax, hostname identity, and cert/key pairing."""
+    try:
+        host_check = subprocess.run(
+            ["openssl", "x509", "-checkhost", hostname, "-noout", "-in", str(cert)],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if host_check.returncode != 0:
+            detail = (host_check.stderr or host_check.stdout or "hostname mismatch").strip()
+            return False, detail
+
+        cert_pub = subprocess.run(
+            ["openssl", "x509", "-pubkey", "-noout", "-in", str(cert)],
+            capture_output=True, timeout=5, check=True,
+        ).stdout
+        key_pub = subprocess.run(
+            ["openssl", "pkey", "-pubout", "-in", str(key)],
+            capture_output=True, timeout=5, check=True,
+        ).stdout
+        if cert_pub.strip() != key_pub.strip():
+            return False, "certificate and private key do not match"
+    except Exception as exc:
+        return False, str(exc)
+    return True, ""
+
+
+def _install_cert_pair_with_rollback(tmp_crt: Path, tmp_key: Path) -> None:
+    """Replace the live cert pair, restoring the prior pair on partial failure."""
+    destinations = ((tmp_crt, CERT_FILE), (tmp_key, KEY_FILE))
+    backups: dict[Path, Path | None] = {}
+    for _src, dst in destinations:
+        if dst.exists():
+            bak = dst.with_suffix(dst.suffix + ".pre-tailscale.bak")
+            shutil.copy2(dst, bak)
+            backups[dst] = bak
+        else:
+            backups[dst] = None
+
+    installed: list[Path] = []
+    try:
+        for src, dst in destinations:
+            os.replace(str(src), str(dst))
+            installed.append(dst)
+    except Exception:
+        for dst in reversed(installed):
+            bak = backups[dst]
+            try:
+                if bak is None:
+                    dst.unlink(missing_ok=True)
+                else:
+                    shutil.copy2(bak, dst)
+            except Exception as rollback_error:
+                log.error(f"failed to roll back {dst}: {rollback_error}")
+        raise
+
+
 def run_tailscale_cert(args) -> int:
     """Issue a Tailscale-managed Let's Encrypt cert for this node.
 
@@ -2799,32 +2859,21 @@ def run_tailscale_cert(args) -> int:
             _cleanup_tmp()
             return 2
 
-        # Validate the new cert parses and matches the requested hostname before
-        # we replace the live one — never install a broken cert.
-        try:
-            check = subprocess.run(
-                ["openssl", "x509", "-noout", "-subject", "-in", str(tmp_crt)],
-                capture_output=True, text=True, timeout=5, check=True,
-            )
-            if hostname not in check.stdout:
-                log.warning(f"new cert subject unexpected: {check.stdout.strip()}")
-        except Exception as e:
-            print(f"! new cert failed validation: {e}")
+        # Validate syntax, SAN/CN hostname identity, and the key pairing before
+        # replacing either live file.
+        valid, validation_error = _validate_cert_pair_for_hostname(tmp_crt, tmp_key, hostname)
+        if not valid:
+            print(f"! new cert failed validation: {validation_error}")
             _cleanup_tmp()
             return 2
 
-        # Backup existing cert+key together before replacing.
-        for dst in (CERT_FILE, KEY_FILE):
-            if dst.exists():
-                bak = dst.with_suffix(dst.suffix + ".pre-tailscale.bak")
-                try:
-                    shutil.copy2(dst, bak)
-                except Exception as e:
-                    log.warning(f"backup of {dst} failed: {e}")
-
-        # os.replace is atomic within the same filesystem (DATA_DIR).
-        os.replace(str(tmp_crt), str(CERT_FILE))
-        os.replace(str(tmp_key), str(KEY_FILE))
+        # Each replace is atomic; the helper restores the old pair if the second
+        # replace fails so the live certificate and key cannot become mismatched.
+        try:
+            _install_cert_pair_with_rollback(tmp_crt, tmp_key)
+        except Exception as e:
+            print(f"! could not install new certificate pair; prior pair restored: {e}")
+            return 2
         try:
             os.chmod(CERT_FILE, 0o644)
             os.chmod(KEY_FILE, 0o600)
