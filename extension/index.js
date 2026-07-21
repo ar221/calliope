@@ -20,6 +20,7 @@
 import { eventSource, event_types, name1, this_chid, characters, user_avatar, chat } from '../../../../script.js';
 import { extension_settings, getContext } from '../../../extensions.js';
 import { selected_group, groups } from '../../../group-chats.js';
+import { power_user } from '../../../power-user.js';
 import { qrcodegen } from './qrcodegen.min.js';
 
 const MODULE = 'dictation-bridge';
@@ -65,6 +66,8 @@ const DEFAULTS = {
     voiceCommandsEnabled: true,  // POL-1: server-emitted dictation-command SSE dispatcher
     language: 'auto',            // QW2: ?language= for transcription ('auto' = Whisper detect)
     reformatMode: '',            // QW3: last-chosen "Reformat as…" mode id
+    formatterModel: '',          // empty = OmniRoute auto chain; otherwise allow-listed model
+    reformatPersona: '',         // empty = active ST persona; otherwise selected persona avatar id
     // ─── TTS read-back (Calliope Kokoro backend) ───────────────────────────
     ttsAutoReadAi: false,        // auto-fire TTS on every new AI message
     ttsAutoReadPersonaQuoted: true, // auto-fire TTS on new user messages, quoted dialogue only
@@ -930,8 +933,10 @@ async function reformatCurrentText(modeId) {
         body: JSON.stringify({
             text: source,
             mode: String(modeId || '').trim(),
+            provider: 'omniroute',
+            formatter_model: cfg.formatterModel || '',
             context: ctx.lastAi || '',
-            persona: ctx.personaId || '',
+            persona: cfg.reformatPersona || ctx.personaId || '',
             character: currentReformatCharacterKey(),
             persist_transcript: false,
         }),
@@ -1953,8 +1958,10 @@ async function buildPairedPhoneUrl({ embed = true } = {}) {
     const qp = new URLSearchParams();
     if (embed) qp.set('embed', '1');
     if (ctx.chatId) qp.set('chat', String(ctx.chatId));
-    if (ctx.personaId) qp.set('persona', String(ctx.personaId));
+    const selectedPersona = cfg.reformatPersona || ctx.personaId;
+    if (selectedPersona) qp.set('persona', String(selectedPersona));
     if (ctx.characterId) qp.set('character', String(ctx.characterId));
+    if (cfg.formatterModel) qp.set('formatter_model', String(cfg.formatterModel));
     // QW2: always carry transcription language; 'auto' prevents a silent en fallback.
     const lang = String(cfg.language || 'auto').trim().toLowerCase() || 'auto';
     qp.set('language', lang);
@@ -2377,7 +2384,9 @@ async function submitDesktopRecording(capture) {
         const params = new URLSearchParams();
         params.set('mode', modeId);
         params.set('context', cfg.pushContext ? (ctx.lastAi || '') : '');
-        params.set('persona', ctx.personaId || '');
+        params.set('persona', cfg.reformatPersona || ctx.personaId || '');
+        params.set('provider', 'omniroute');
+        if (cfg.formatterModel) params.set('formatter_model', cfg.formatterModel);
         params.set('character', character);
         params.set('language', language);
         const url = `${cfg.serverUrl.replace(/\/+$/, '')}/transcribe?${params.toString()}`;
@@ -2684,7 +2693,7 @@ function renderRepairTraceFromPayload(data, finalText) {
 }
 
 // ─── MVP-23: privacy badge + audit log peek ───────────────────────────────
-// Click the "🔒 LOCAL" chip in the settings panel to open a peek panel
+// Click the "🔒 LOCAL CAPTURE" chip in the settings panel to open a peek panel
 // listing what the dictation server talks to. Calls GET /audit/network on
 // the configured server and renders the last 5-10 entries (timestamp,
 // method/path, host:port, latency). Loopback destinations colour green;
@@ -2793,7 +2802,7 @@ function buildPrivacyPeekHtml(audit, opts = {}) {
             <div class="dictation-bridge-backdrop"></div>
             <div class="dictation-bridge-frame-wrap" style="background:#1C150C;border:1px solid #FFB648;border-radius:2px;width:min(90vw, 560px);max-width:560px;max-height:80vh;overflow:auto;padding:16px;color:#C9B28B;font-family:inherit">
                 <div class="dictation-bridge-close" style="color:#FFB648">&times;</div>
-                <h3 style="margin:0 0 10px 0;color:#A8C97B;font-size:16px;letter-spacing:0.04em">🔒 LOCAL</h3>
+                <h3 style="margin:0 0 10px 0;color:#A8C97B;font-size:16px;letter-spacing:0.04em">🔒 LOCAL CAPTURE</h3>
                 ${warningBanner}
                 ${errorBanner}
                 <div style="display:grid;grid-template-columns:auto 1fr;gap:6px 12px;font-size:12px;margin-bottom:12px">
@@ -4494,8 +4503,8 @@ function buildSettingsPanel() {
                 </div>
                 <div class="inline-drawer-content">
                     <div class="dictation-bridge-chip-row" style="display:flex;gap:6px;align-items:center;margin:2px 0 8px 0;flex-wrap:wrap">
-                        <button id="dictation_bridge_privacy_badge" type="button" class="menu_button" title="Click to see what the dictation server is talking to" style="display:inline-flex;align-items:center;gap:6px;padding:2px 10px;font-size:12px;border:1px solid #A8C97B;background:#1C150C;color:#A8C97B;border-radius:2px;cursor:pointer">
-                            <span aria-hidden="true">🔒</span><span>LOCAL</span>
+                        <button id="dictation_bridge_privacy_badge" type="button" class="menu_button" title="Audio capture stays local; selected formatter prompts may continue through OmniRoute to cloud models" style="display:inline-flex;align-items:center;gap:6px;padding:2px 10px;font-size:12px;border:1px solid #A8C97B;background:#1C150C;color:#A8C97B;border-radius:2px;cursor:pointer">
+                            <span aria-hidden="true">🔒</span><span>LOCAL CAPTURE</span>
                         </button>
                         <button id="dictation_bridge_cheatsheet_chip" type="button" class="menu_button" title="Voice-command cheatsheet" style="display:inline-flex;align-items:center;gap:6px;padding:2px 10px;font-size:12px;border:1px solid #FFB648;background:#1C150C;color:#FFB648;border-radius:2px;cursor:pointer;font-weight:600">
                             <span aria-hidden="true">?</span>
@@ -4586,6 +4595,16 @@ function buildSettingsPanel() {
                     <!-- QW1/QW2/QW3: formatter mode + language + reformat ── -->
                     <div class="dbb-formatter-settings" style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(201, 178, 139, 0.18)">
                         <div style="font-size:11px;letter-spacing:0.06em;text-transform:uppercase;color:#FFB648;margin-bottom:4px">Formatter</div>
+
+                        <label for="dictation_bridge_formatter_model">Formatter model (OmniRoute)</label>
+                        <select id="dictation_bridge_formatter_model" class="text_pole" title="Route reformatting and desktop dictation through a selected OmniRoute model.">
+                            <option value="">Auto fallback chain</option>
+                        </select>
+
+                        <label for="dictation_bridge_reformat_persona">Reformat persona</label>
+                        <select id="dictation_bridge_reformat_persona" class="text_pole" title="Use the active SillyTavern persona, or deliberately write as any persona in your ST list.">
+                            <option value="">Active ST persona</option>
+                        </select>
 
                         <label for="dictation_bridge_mode">Formatter mode (per character)</label>
                         <select id="dictation_bridge_mode" class="text_pole" title="Formatter pipeline mode for the active character. Fetched from the server's /modes; saved per-character so the phone UI stays in sync.">
@@ -4826,11 +4845,59 @@ function buildSettingsPanel() {
     }
 
     // ─── QW1/QW2/QW3: formatter mode + language + reformat wiring ───────────
+    const modelEl = host.querySelector('#dictation_bridge_formatter_model');
+    const personaEl = host.querySelector('#dictation_bridge_reformat_persona');
     const modeEl = formatterModeEl = host.querySelector('#dictation_bridge_mode');
     const modeHintEl = formatterModeHintEl = host.querySelector('#dictation_bridge_mode_hint');
     const languageEl = host.querySelector('#dictation_bridge_language');
     const reformatModeEl = host.querySelector('#dictation_bridge_reformat_mode');
     const reformatGoEl = host.querySelector('#dictation_bridge_reformat_go');
+
+    const modelLabels = {
+        'no-think/antigravity/claude-sonnet-5': 'Sonnet 5',
+        'no-think/cc/claude-opus-4-8': 'Opus 4.8',
+        'no-think/cc/claude-opus-4-6': 'Opus 4.6',
+        'codex/gpt-5.6-sol-high': 'GPT 5.6 High',
+    };
+    if (modelEl) {
+        fetch(`${s.serverUrl.replace(/\/+$/, '')}/formatter-models`, {
+            headers: { ...authHeaders() }, cache: 'no-store', mode: 'cors',
+        }).then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
+            .then(data => {
+                const models = Array.isArray(data.models) ? data.models : [];
+                for (const model of models) {
+                    const opt = document.createElement('option');
+                    opt.value = model;
+                    opt.textContent = modelLabels[model] || model;
+                    modelEl.appendChild(opt);
+                }
+                if (s.formatterModel && !models.includes(s.formatterModel)) {
+                    settings().formatterModel = '';
+                    saveSettings();
+                }
+                modelEl.value = models.includes(settings().formatterModel) ? settings().formatterModel : '';
+            }).catch(e => WARN('formatter models failed', e?.message || e));
+        modelEl.addEventListener('change', () => {
+            settings().formatterModel = modelEl.value || '';
+            saveSettings();
+        });
+    }
+
+    if (personaEl) {
+        const personas = Object.entries(power_user?.personas || {});
+        for (const [avatar, displayName] of personas) {
+            const opt = document.createElement('option');
+            opt.value = avatar;
+            opt.textContent = `${displayName || avatar}${avatar === user_avatar ? ' (active)' : ''}`;
+            personaEl.appendChild(opt);
+        }
+        personaEl.value = personas.some(([avatar]) => avatar === s.reformatPersona)
+            ? s.reformatPersona : '';
+        personaEl.addEventListener('change', () => {
+            settings().reformatPersona = personaEl.value || '';
+            saveSettings();
+        });
+    }
 
     // QW2: language selector — persisted in extension settings, applied to
     // the paired-phone URL as ?language= (omitted for 'auto').

@@ -1388,9 +1388,8 @@ WEB_UI = r"""<!DOCTYPE html>
 </div>
 
 <div class="controls">
-  <select class="chip" id="providerSelect" onchange="setProvider(this.value)">
-    <option value="claude">Claude</option>
-    <option value="openai">OpenAI</option>
+  <select class="chip" id="formatterModelSelect" onchange="setFormatterModel(this.value)">
+    <option value="">OmniRoute Auto</option>
   </select>
   <select class="chip" id="modelSelect">
     <option value="large-v3-turbo">Large Turbo</option>
@@ -1676,7 +1675,8 @@ let audioChunks = [];
 let recording = false;
 let rpMode = 0;                // derived legacy numeric mode (kept for any lingering callers)
 let currentMode = '';          // active mode id (e.g. 'rp_enhance')
-let currentProvider = 'claude';
+let currentProvider = 'omniroute';
+let currentFormatterModel = '';
 let lastUsedMode = '';         // mode id used for last transcription
 let availableModes = [];       // [{id, label, icon, whisper_model, preset, use_persona, use_character, use_chat_context, pipeline}, ...]
 let durationInterval = null;
@@ -1684,6 +1684,7 @@ let recordStart = 0;
 let lastRawText = '';          // raw whisper output (before RP formatting)
 let sessionLog = [];           // local mirror of server transcript
 let selectedPersona = 'none';
+let personaPinned = false;       // explicit URL/UI persona survives ST state refreshes
 let selectedCharacter = 'none';
 let useRules = false;
 let proseFormat = false;
@@ -1760,7 +1761,7 @@ const MODE_TO_RP = {
 const btn = document.getElementById('recordBtn');
 const label = document.getElementById('recordLabel');
 const recordSub = document.getElementById('recordSub');
-const providerSelect = document.getElementById('providerSelect');
+const formatterModelSelect = document.getElementById('formatterModelSelect');
 const resultArea = document.getElementById('resultArea');
 const resultText = document.getElementById('resultText');
 const durationEl = document.getElementById('duration');
@@ -1785,16 +1786,49 @@ function iconSvg(name) {
 }
 
 function normalizeProvider(provider) {
-  provider = String(provider || '').toLowerCase();
-  return provider === 'openai' ? 'openai' : 'claude';
+  return 'omniroute';
 }
 
 function setProvider(provider, opts) {
+  currentProvider = 'omniroute';
+}
+
+function formatterModelLabel(model) {
+  const labels = {
+    'no-think/antigravity/claude-sonnet-5': 'Sonnet 5',
+    'no-think/cc/claude-opus-4-8': 'Opus 4.8',
+    'no-think/cc/claude-opus-4-6': 'Opus 4.6',
+    'codex/gpt-5.6-sol-high': 'GPT 5.6 High',
+  };
+  return labels[model] || model;
+}
+
+function setFormatterModel(model, opts) {
   opts = opts || {};
-  currentProvider = normalizeProvider(provider);
-  if (providerSelect) providerSelect.value = currentProvider;
+  currentProvider = 'omniroute';
+  currentFormatterModel = String(model || '');
+  if (formatterModelSelect) formatterModelSelect.value = currentFormatterModel;
   if (opts.persist !== false) {
-    try { localStorage.setItem('dictation.provider', currentProvider); } catch {}
+    try { localStorage.setItem('dictation.formatterModel', currentFormatterModel); } catch {}
+  }
+}
+
+async function loadFormatterModels() {
+  try {
+    const resp = await fetch('/formatter-models');
+    const data = await resp.json();
+    const models = Array.isArray(data.models) ? data.models : [];
+    formatterModelSelect.innerHTML = '<option value="">OmniRoute Auto</option>';
+    models.forEach(model => {
+      const opt = document.createElement('option');
+      opt.value = model;
+      opt.textContent = formatterModelLabel(model);
+      formatterModelSelect.appendChild(opt);
+    });
+    const requested = embedConfig.formatter_model || localStorage.getItem('dictation.formatterModel') || '';
+    setFormatterModel(models.includes(requested) ? requested : '', { persist: false });
+  } catch {
+    setFormatterModel('', { persist: false });
   }
 }
 
@@ -1819,8 +1853,7 @@ async function loadModes() {
 
   renderModeChips();
 
-  const storedProvider = localStorage.getItem('dictation.provider') || '';
-  setProvider(embedConfig.provider || storedProvider || 'claude', { persist: false });
+  setProvider('omniroute', { persist: false });
 
   // Resolve initial mode: embed config → localStorage → rp_enhance → first.
   const stored = localStorage.getItem('dictation.mode') || '';
@@ -1935,13 +1968,15 @@ async function loadPersonas() {
       opt.textContent = p.name;
       select.appendChild(opt);
     });
-    // Embed config persona wins; else first persona if available.
+    // Active ST persona wins. Otherwise keep an explicit no-persona state;
+    // never silently choose the alphabetically first persona.
     if (embedConfig.persona && data.personas.some(p => p.id === embedConfig.persona)) {
       select.value = embedConfig.persona;
       selectedPersona = embedConfig.persona;
-    } else if (data.personas.length > 0) {
-      select.value = data.personas[0].id;
-      selectedPersona = data.personas[0].id;
+      personaPinned = true;
+    } else {
+      select.value = 'none';
+      selectedPersona = 'none';
     }
   } catch { /* ignore */ }
 }
@@ -1997,6 +2032,7 @@ function onPersonaChange(val) {
     markOverride('persona');
   }
   selectedPersona = val;
+  personaPinned = true;
 }
 
 function selectCharacter(id, name) {
@@ -2550,6 +2586,7 @@ async function sendAudio() {
   const mode = getMode(currentMode);
   const params = new URLSearchParams({ model });
   params.set('provider', currentProvider);
+  if (currentFormatterModel) params.set('formatter_model', currentFormatterModel);
   params.set('language', transcriptionLanguage);
   if (currentMode) params.set('mode', currentMode);
   if (context) params.set('context', context);
@@ -2634,6 +2671,7 @@ async function regenerate() {
       body: JSON.stringify({
         text: lastRawText,
         provider: currentProvider,
+        formatter_model: currentFormatterModel,
         mode: regenMode,
         context: context,
         chat_source: chatSource !== 'manual' ? chatSource : '',
@@ -3042,6 +3080,8 @@ async function regenLogEntry(id, btn) {
       body: JSON.stringify({
         text: entry.text,
         entry_id: id,
+        provider: currentProvider,
+        formatter_model: currentFormatterModel,
         mode: regenMode,
         context: context,
         chat_source: chatSource !== 'manual' ? chatSource : '',
@@ -3482,7 +3522,7 @@ async function applyStateIfFresh(snap, { force = false } = {}) {
     }
   }
   // Persona
-  if (snap.personaId) {
+  if (snap.personaId && !personaPinned) {
     const pEl = document.getElementById('personaSelect');
     if (pEl && pEl.value !== snap.personaId) {
       // Only set if option exists; otherwise ignore (persona file may not be loaded)
@@ -3528,6 +3568,7 @@ function markOverride(reason) {
 
 async function resyncWithST() {
   stFollow = true;
+  personaPinned = false;
   await loadStateAndApply({ force: true });
   showToast('Re-synced with ST');
 }
@@ -3743,6 +3784,7 @@ function init() {
   loadModes();          // fetches /modes, renders chips, then posts 'dictation-ready'
   loadTranscript();
   loadPersonas();
+  loadFormatterModels();
   loadCharacters();
   loadRecentChats();
   setupEmbedMessaging();
