@@ -40,15 +40,35 @@ Current server flags:
   RP/enhance modes (creative-quality first).
 - `DICTATION_OMNIROUTE_CLEAN_CHAIN` — comma-separated model fallback chain for
   cleanup/grammar modes (cheaper/faster first).
-- `DICTATION_CLAUDE_PROXY_URL` / `DICTATION_PROXY_URL` — Claude-shape proxy base URL.
+- `DICTATION_OMNIROUTE_SELECTABLE_MODELS` — comma-separated allow-list shown in
+  the phone and SillyTavern formatter-model pickers. A picked Claude or GPT model
+  still routes through OmniRoute; empty selection uses the RP fallback chain.
+- `DICTATION_CLAUDE_PROXY_URL` / `DICTATION_PROXY_URL` — legacy direct Claude-shape proxy base URL.
 - `DICTATION_CLAUDE_RP_MODEL` / `DICTATION_RP_MODEL` — Claude RP model override.
 - `DICTATION_OPENAI_PROXY_URL` — OpenAI-compatible proxy base URL.
 - `DICTATION_OPENAI_RP_MODEL` — OpenAI-compatible RP model.
 - `DICTATION_OPENAI_CLEAN_MODEL` — OpenAI-compatible cleanup/disfluency model.
+- `DICTATION_FORMATTER_TIMEOUT` — per-model formatter request timeout in seconds;
+  default `10`. This leaves enough room for full RP persona/scene prompts while
+  keeping failures bounded.
 
 Every formatter response carries model attribution — which model in the
 active chain produced the text, and whether it was a fallback tier — surfaced
 in both the ST extension and the phone PWA.
+
+Current built-in OmniRoute defaults (catalog/live-completion verified
+2026-07-14):
+
+- RP/enhance: `codex/gpt-5.6-sol-high` →
+  `no-think/antigravity/claude-sonnet-5` → `no-think/cc/claude-opus-4-8`.
+- Cleanup: `codex/gpt-5.6-sol-low` →
+  `no-think/cc/claude-sonnet-4-6`.
+
+The RP prompt treats profanity, insults, slurs, punchlines, commands, and other
+charged diction as verbatim voice anchors. Enhancement may add rhythm and
+physical/sensory detail around those anchors, but must not euphemize, sanitize,
+or replace them. Override either chain through the environment variables above
+when the OmniRoute catalog changes; no source edit is required.
 
 ### Request limits
 
@@ -63,7 +83,11 @@ malformed/negative values get a 400.
 - `DICTATION_ST_DATA_ROOT` — SillyTavern `data/default-user` directory;
   relocates the whole ST data tree in one shot. Default is a local path from
   the operator's own deployment — override this for any other install.
-- `DICTATION_PERSONAS_DIR` — persona-card source directory.
+- `DICTATION_ST_SETTINGS_FILE` — optional direct path to SillyTavern's
+  `settings.json`; Calliope reads only `power_user.personas` and
+  `power_user.persona_descriptions` to populate and shape the full persona list.
+- `DICTATION_PERSONAS_DIR` — optional local markdown persona-card source merged
+  with SillyTavern's persona list.
 - `DICTATION_RULES_DIR` — rules/formatting source directory.
 - `DICTATION_CHARACTERS_DIR` — character-card source directory; overrides
   `DICTATION_ST_DATA_ROOT/characters` when set.

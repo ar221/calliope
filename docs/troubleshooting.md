@@ -327,9 +327,9 @@ asterisks, no enhanced phrasing — even when you've selected
 
 **Cause:** the LLM proxy at `localhost:42069` (`claude-code-proxy`) is
 not running, or is returning errors / empty responses, and the pipeline
-is falling back to the previous stage's output. The 5-second timeout
-(MVP-7) gives up faster than the old 60-second one, so this fails
-loudly now.
+is falling back to the previous stage's output. The bounded formatter timeout
+(default 10 seconds via `DICTATION_FORMATTER_TIMEOUT`) gives up far faster than
+the old 60-second one, so this fails loudly now.
 
 **Fix:**
 

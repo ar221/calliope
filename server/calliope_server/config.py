@@ -164,15 +164,37 @@ def _parse_model_chain(raw: str, default: list[str]) -> list[str]:
     return items or list(default)
 
 
-# RP/enhance chain (creative-quality first). Live-verified 2026-07-01.
+# RP/enhance chain (creative-quality first). Live-verified against the
+# OmniRoute catalog and completion endpoint 2026-07-14. Prefer the newest
+# Default RP lane: current GPT-5.6 Sol, then Sonnet 5, then Opus 4.8.
+# Sonnet 4.6 remains an explicit picker option but never wins regeneration
+# implicitly — the operator asked to retire it from the automatic RP chain.
 OMNIROUTE_RP_CHAIN = _parse_model_chain(
     os.environ.get("DICTATION_OMNIROUTE_RP_CHAIN", ""),
-    ["claude/claude-opus-4-8", "codex/gpt-5.5", "claude/claude-sonnet-4-6", "nous/x-ai/grok-4.3"],
+    [
+        "codex/gpt-5.6-sol-high",
+        "no-think/antigravity/claude-sonnet-5",
+        "no-think/cc/claude-opus-4-8",
+    ],
 )
 # Cleanup/grammar chain (cheaper + faster first).
 OMNIROUTE_CLEAN_CHAIN = _parse_model_chain(
     os.environ.get("DICTATION_OMNIROUTE_CLEAN_CHAIN", ""),
-    ["codex/gpt-5.4", "claude/claude-sonnet-4-6"],
+    ["codex/gpt-5.6-sol-low", "no-think/cc/claude-sonnet-4-6"],
+)
+
+# User-selectable RP formatter models. The phone UI and SillyTavern extension
+# expose these as explicit quality lanes; an empty selection keeps the normal
+# fallback chain above. Selected models are allow-listed here so a request
+# cannot turn Calliope into an arbitrary OmniRoute model relay.
+OMNIROUTE_SELECTABLE_MODELS = _parse_model_chain(
+    os.environ.get("DICTATION_OMNIROUTE_SELECTABLE_MODELS", ""),
+    [
+        "no-think/antigravity/claude-sonnet-5",
+        "no-think/cc/claude-opus-4-8",
+        "no-think/cc/claude-opus-4-6",
+        "codex/gpt-5.6-sol-high",
+    ],
 )
 
 _VALID_PROVIDERS = {"claude", "openai", "omniroute"}
@@ -189,6 +211,10 @@ RULES_DIR = Path(os.environ.get("DICTATION_RULES_DIR", Path.home() / "STWork/rul
 ST_DATA_ROOT = Path(os.environ.get(
     "DICTATION_ST_DATA_ROOT",
     "/mnt/hdd/AI/SillyTavern/data/default-user",
+))
+ST_SETTINGS_FILE = Path(os.environ.get(
+    "DICTATION_ST_SETTINGS_FILE",
+    str(ST_DATA_ROOT / "settings.json"),
 ))
 CHARACTERS_DIR = Path(os.environ.get(
     "DICTATION_CHARACTERS_DIR",
@@ -233,10 +259,10 @@ DISFLUENCY_CLEAN_MIN_WORDS = 12  # skip cleanup below this — LLM round-trip
                                   # is more disruptive than the disfluencies
                                   # it removes for quick-fire RP responses.
                                   # See ADR-9 / Agent 3 §10 recommendation 5.
-FORMATTER_TIMEOUT_SECONDS = 5.0  # was 60s — see ADR-9 / Agent 3 §1
-                                  # 5s is the real upper bound; a hung
-                                  # formatter must not freeze the
-                                  # conversation for a full minute.
+FORMATTER_TIMEOUT_SECONDS = float(os.environ.get("DICTATION_FORMATTER_TIMEOUT", "10"))
+# Modern OmniRoute models need room for Calliope's full persona/character/scene
+# prompt. Ten seconds remains a hard conversational bound without turning a
+# transiently slow formatter into the old 60-second freeze.
 
 # Phase 2 — persistent whisper-server (ADR-1).
 # A user systemd unit `whisper-server.service` runs the long-lived

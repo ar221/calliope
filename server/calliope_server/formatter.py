@@ -168,6 +168,19 @@ RP_SYSTEM_ENHANCE = (
     "- Elevate vocabulary and sentence structure — richer, more immersive prose\n"
     "- Add sensory details and emotional texture where natural\n\n"
 
+    "LEXICAL FIDELITY — CHARGED WORDS ARE LOCKED:\n"
+    "- Preserve verbatim every vulgar, obscene, aggressive, insulting, degrading, taboo, "
+    "racially charged, or comically crude word and phrase from the dictated input.\n"
+    "- Treat profanity, slurs, nicknames, insults, punchlines, threats, commands, and the "
+    "speaker's deliberately ugly or funny wording as immutable voice anchors.\n"
+    "- Do not replace a concrete charged term with a tasteful synonym, euphemism, implication, "
+    "clinical wording, or abstract literary description.\n"
+    "- Do not make the speaker kinder, safer, more tasteful, more respectful, or more generic.\n"
+    "- Embellishment must happen AROUND those anchors through rhythm, physicality, sensory detail, "
+    "and cadence — never by deleting or laundering them.\n"
+    "- Before answering, silently compare input and output: every charged voice anchor must still "
+    "appear verbatim. If elegance conflicts with lexical fidelity, lexical fidelity wins.\n\n"
+
     "CRITICAL RULES:\n"
     "- You are REWRITING the user's input, NOT responding to it. Do NOT write any other "
     "character's response, reaction, or dialogue. Only rewrite what the user dictated.\n"
@@ -314,13 +327,17 @@ def formatter_model(provider: str, *, cleanup: bool = False) -> str:
     return config.DISFLUENCY_CLEAN_MODEL if cleanup else config.CLAUDE_RP_MODEL
 
 
-def formatter_model_chain(provider: str, *, cleanup: bool = False) -> list[str]:
-    """Ordered model fallback chain for a provider. Non-omniroute providers
-    have a single-element chain (their one configured model)."""
+def formatter_model_chain(provider: str, *, cleanup: bool = False,
+                          model_override: str = "") -> list[str]:
+    """Ordered model fallback chain, or one allow-listed OmniRoute override."""
     provider = normalize_formatter_provider(provider)
+    if model_override:
+        if provider != "omniroute" or model_override not in config.OMNIROUTE_SELECTABLE_MODELS:
+            return []
+        return [model_override]
     if provider == "omniroute":
         chain = config.OMNIROUTE_CLEAN_CHAIN if cleanup else config.OMNIROUTE_RP_CHAIN
-        return list(chain) if chain else [config.CLAUDE_RP_MODEL]
+        return list(chain)
     return [formatter_model(provider, cleanup=cleanup)]
 
 
@@ -528,7 +545,7 @@ def disfluency_clean(text: str, provider: str = config.DEFAULT_FORMATTER_PROVIDE
 
 # ─── Phase 3: Per-character mode memory ──────────────────
 _char_modes_cache: dict = {"data": {}, "mtime": 0.0}
-char_modes_lock = threading.Lock()
+char_modes_lock = threading.RLock()
 
 
 def _ensure_char_modes_file() -> None:
@@ -1052,7 +1069,8 @@ def format_rp(text: str, mode: int = 1, context: str = "",
                user_content_override: str = "",
                temperature: float | None = None,
                provider: str = config.DEFAULT_FORMATTER_PROVIDER,
-               request_id: str = "") -> tuple[str, bool, str]:
+               request_id: str = "",
+               model_override: str = "") -> tuple[str, bool, str]:
     """Format text via the selected formatter proxy. Backwards-compatible legacy interface.
 
     mode=1 format, mode=2 enhance.
@@ -1157,7 +1175,9 @@ def format_rp(text: str, mode: int = 1, context: str = "",
     request_url = formatter_request_url(provider, endpoint)
     # Ordered model chain. Single-element for claude/openai; multi-tier for
     # omniroute so a transiently un-credentialed model skips to the next.
-    chain = formatter_model_chain(provider)
+    chain = formatter_model_chain(provider, model_override=model_override)
+    if not chain:
+        return text, True, "RP formatter model is not selectable through OmniRoute"
     last_reason = "RP formatting failed"
 
     for idx, model in enumerate(chain):
@@ -2231,6 +2251,7 @@ def run_pipeline(text: str, mode: dict,
                  use_rules: bool = False,
                  prose_format: bool = False,
                  provider: str = config.DEFAULT_FORMATTER_PROVIDER,
+                 formatter_model: str = "",
                  request_id: str = "",
                  timing: dict | None = None) -> tuple[str, bool, str, str]:
     """Run the pipeline steps of `mode` over `text`.
@@ -2373,6 +2394,7 @@ def run_pipeline(text: str, mode: dict,
                 user_content_override=user_content,
                 temperature=mode.get("temperature"),
                 provider=provider,
+                model_override=formatter_model,
             )
             if skipped:
                 formatting_skipped = True
@@ -2396,6 +2418,7 @@ def run_pipeline(text: str, mode: dict,
                 endpoint_override="/v1/messages",
                 temperature=mode.get("temperature"),
                 provider=provider,
+                model_override=formatter_model,
             )
             if skipped:
                 formatting_skipped = True
@@ -2421,6 +2444,7 @@ def run_pipeline(text: str, mode: dict,
                 temperature=mode.get("temperature"),
                 provider=provider,
                 request_id=request_id,  # MVP-13 — stream deltas via SSE
+                model_override=formatter_model,
             )
             if skipped:
                 formatting_skipped = True
@@ -2448,6 +2472,7 @@ def run_pipeline(text: str, mode: dict,
                     temperature=mode.get("temperature"),
                     provider=provider,
                     request_id=request_id,  # MVP-13
+                    model_override=formatter_model,
                 )
                 fb_reason = "persona_pov requires both persona and character; fell back to rp_enhance"
                 if skipped:
@@ -2475,6 +2500,7 @@ def run_pipeline(text: str, mode: dict,
                 temperature=mode.get("temperature"),
                 provider=provider,
                 request_id=request_id,  # MVP-13
+                model_override=formatter_model,
             )
             if skipped:
                 formatting_skipped = True

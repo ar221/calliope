@@ -26,11 +26,11 @@ def _load_server(tmp_path, monkeypatch):
     monkeypatch.setenv("DICTATION_FORMATTER_PROVIDER", "omniroute")
     monkeypatch.setenv(
         "DICTATION_OMNIROUTE_RP_CHAIN",
-        "claude/claude-opus-4-8, codex/gpt-5.5, claude/claude-sonnet-4-6",
+        "codex/gpt-5.6-sol-high, no-think/antigravity/claude-sonnet-5, no-think/cc/claude-opus-4-8",
     )
     monkeypatch.setenv(
         "DICTATION_OMNIROUTE_CLEAN_CHAIN",
-        "codex/gpt-5.4, claude/claude-sonnet-4-6",
+        "codex/gpt-5.6-sol-low, no-think/cc/claude-sonnet-4-6",
     )
     name = f"calliope_server_omni_{uuid.uuid4().hex}"
     loader = SourceFileLoader(name, str(SRC))
@@ -96,16 +96,37 @@ def test_omniroute_is_default_and_openai_shape(tmp_path, monkeypatch):
 def test_omniroute_model_chain(tmp_path, monkeypatch):
     mod = _load_server(tmp_path, monkeypatch)
     chain = mod.formatter_model_chain("omniroute")
-    assert chain[0] == "claude/claude-opus-4-8"
+    assert chain[0] == "codex/gpt-5.6-sol-high"
     assert chain == [
-        "claude/claude-opus-4-8",
-        "codex/gpt-5.5",
-        "claude/claude-sonnet-4-6",
+        "codex/gpt-5.6-sol-high",
+        "no-think/antigravity/claude-sonnet-5",
+        "no-think/cc/claude-opus-4-8",
     ]
     clean = mod.formatter_model_chain("omniroute", cleanup=True)
-    assert clean == ["codex/gpt-5.4", "claude/claude-sonnet-4-6"]
+    assert clean == ["codex/gpt-5.6-sol-low", "no-think/cc/claude-sonnet-4-6"]
     # Non-omniroute providers collapse to a single-element chain.
     assert len(mod.formatter_model_chain("claude")) == 1
+
+
+def test_selectable_model_override_is_single_omniroute_lane(tmp_path, monkeypatch):
+    mod = _load_server(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        mod.config,
+        "OMNIROUTE_SELECTABLE_MODELS",
+        ["no-think/cc/claude-opus-4-8", "codex/gpt-5.6-sol-high"],
+    )
+    assert mod.formatter_model_chain(
+        "omniroute", model_override="no-think/cc/claude-opus-4-8"
+    ) == ["no-think/cc/claude-opus-4-8"]
+    assert mod.formatter_model_chain(
+        "omniroute", model_override="codex/gpt-5.6-sol-high"
+    ) == ["codex/gpt-5.6-sol-high"]
+    assert mod.formatter_model_chain(
+        "omniroute", model_override="untrusted/arbitrary-model"
+    ) == []
+    assert mod.formatter_model_chain(
+        "claude", model_override="no-think/cc/claude-opus-4-8"
+    ) == []
 
 
 def test_omniroute_payload_is_openai_messages(tmp_path, monkeypatch):
@@ -114,11 +135,11 @@ def test_omniroute_payload_is_openai_messages(tmp_path, monkeypatch):
         "omniroute",
         system_prompt="SYS",
         user_content="hello",
-        model="codex/gpt-5.5",
+        model="codex/gpt-5.6-sol-high",
         max_tokens=128,
         temperature=0.3,
     )
-    assert payload["model"] == "codex/gpt-5.5"
+    assert payload["model"] == "codex/gpt-5.6-sol-high"
     assert payload["messages"][0] == {"role": "system", "content": "SYS"}
     assert payload["messages"][1] == {"role": "user", "content": "hello"}
     assert payload["temperature"] == 0.3
@@ -133,15 +154,15 @@ def test_chain_skips_credential_error_to_next_tier(tmp_path, monkeypatch):
         monkeypatch,
         mod,
         {
-            "claude/claude-opus-4-8": _err_body("no credentials for provider"),
-            "codex/gpt-5.5": _ok_body("polished prose"),
+            "codex/gpt-5.6-sol-high": _err_body("no credentials for provider"),
+            "no-think/antigravity/claude-sonnet-5": _ok_body("polished prose"),
         },
         calls,
     )
     out, skipped, reason = mod.format_rp("raw text here", provider="omniroute")
     assert out == "polished prose"
     assert skipped is False
-    assert calls == ["claude/claude-opus-4-8", "codex/gpt-5.5"]
+    assert calls == ["codex/gpt-5.6-sol-high", "no-think/antigravity/claude-sonnet-5"]
 
 
 def test_chain_falls_through_to_last_tier(tmp_path, monkeypatch):
@@ -151,19 +172,19 @@ def test_chain_falls_through_to_last_tier(tmp_path, monkeypatch):
         monkeypatch,
         mod,
         {
-            "claude/claude-opus-4-8": _err_body("model not found"),
-            "codex/gpt-5.5": _err_body("rate limit exceeded"),
-            "claude/claude-sonnet-4-6": _ok_body("sonnet output"),
+            "codex/gpt-5.6-sol-high": _err_body("model not found"),
+            "no-think/antigravity/claude-sonnet-5": _err_body("rate limit exceeded"),
+            "no-think/cc/claude-opus-4-8": _ok_body("opus output"),
         },
         calls,
     )
     out, skipped, _ = mod.format_rp("raw text here", provider="omniroute")
-    assert out == "sonnet output"
+    assert out == "opus output"
     assert skipped is False
     assert calls == [
-        "claude/claude-opus-4-8",
-        "codex/gpt-5.5",
-        "claude/claude-sonnet-4-6",
+        "codex/gpt-5.6-sol-high",
+        "no-think/antigravity/claude-sonnet-5",
+        "no-think/cc/claude-opus-4-8",
     ]
 
 
@@ -176,15 +197,15 @@ def test_hard_error_stops_chain(tmp_path, monkeypatch):
         {
             # A non-skippable error (e.g. a 500-style bad-request) should abort
             # rather than burn the rest of the chain.
-            "claude/claude-opus-4-8": _err_body("internal formatting explosion"),
-            "codex/gpt-5.5": _ok_body("should not reach here"),
+            "codex/gpt-5.6-sol-high": _err_body("internal formatting explosion"),
+            "no-think/antigravity/claude-sonnet-5": _ok_body("should not reach here"),
         },
         calls,
     )
     out, skipped, reason = mod.format_rp("raw text here", provider="omniroute")
     assert skipped is True
     assert out == "raw text here"
-    assert calls == ["claude/claude-opus-4-8"]
+    assert calls == ["codex/gpt-5.6-sol-high"]
 
 
 def test_disfluency_clean_uses_cleanup_chain(tmp_path, monkeypatch):
@@ -194,8 +215,8 @@ def test_disfluency_clean_uses_cleanup_chain(tmp_path, monkeypatch):
         monkeypatch,
         mod,
         {
-            "codex/gpt-5.4": _err_body("no credentials"),
-            "claude/claude-sonnet-4-6": _ok_body(
+            "codex/gpt-5.6-sol-low": _err_body("no credentials"),
+            "no-think/cc/claude-sonnet-4-6": _ok_body(
                 "This is the cleaned up sentence with plenty of words to pass the length guard."
             ),
         },
@@ -205,4 +226,13 @@ def test_disfluency_clean_uses_cleanup_chain(tmp_path, monkeypatch):
     out, cleaned, _ = mod.disfluency_clean(text, provider="omniroute")
     assert cleaned is True
     assert "cleaned up sentence" in out
-    assert calls == ["codex/gpt-5.4", "claude/claude-sonnet-4-6"]
+    assert calls == ["codex/gpt-5.6-sol-low", "no-think/cc/claude-sonnet-4-6"]
+
+
+def test_rp_enhance_prompt_locks_charged_and_comic_wording(tmp_path, monkeypatch):
+    mod = _load_server(tmp_path, monkeypatch)
+    prompt = mod.RP_SYSTEM_ENHANCE
+    assert "CHARGED WORDS ARE LOCKED" in prompt
+    assert "appear verbatim" in prompt
+    assert "profanity, slurs, nicknames, insults, punchlines" in prompt
+    assert "lexical fidelity wins" in prompt
