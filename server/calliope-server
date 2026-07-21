@@ -138,6 +138,7 @@ from calliope_server.config import (  # noqa: E402
     _safe_child,  # noqa: F401 — moved to config (neutral home); re-export for tests/back-compat
     OMNIROUTE_RP_CHAIN,
     OMNIROUTE_CLEAN_CHAIN,  # noqa: F401 — re-export for tests/back-compat
+    OMNIROUTE_SELECTABLE_MODELS,
     _VALID_PROVIDERS,
     DEFAULT_FORMATTER_PROVIDER,
     DEFAULT_MODEL,
@@ -601,8 +602,49 @@ def cert_days_remaining() -> int | None:
         return None
 
 
+def _cert_is_calliope_self_signed() -> bool:
+    """True only when CERT_FILE is a cert *we* minted and may safely regenerate.
+
+    We positively identify our own self-signed cert rather than broadly
+    treating every CA-issued cert as external, so a user-installed custom
+    cert (self-signed or CA-signed) is never clobbered. Our cert is uniquely:
+      - self-signed (subject == issuer), AND
+      - subject CN == 'dictation-server' (see _generate_self_signed_cert).
+
+    Returns False on any parse failure or missing cert — fail safe: unknown
+    means do-not-clobber.
+    """
+    if not CERT_FILE.exists():
+        return False
+    try:
+        result = subprocess.run(
+            ["openssl", "x509", "-noout", "-subject", "-issuer", "-in", str(CERT_FILE)],
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+    except Exception as e:
+        log.warning(f"Could not read cert subject/issuer: {e}")
+        return False
+    subject = issuer = ""
+    for line in result.stdout.splitlines():
+        low = line.lower()
+        if low.startswith("subject="):
+            subject = line.split("=", 1)[1].strip()
+        elif low.startswith("issuer="):
+            issuer = line.split("=", 1)[1].strip()
+    if not subject or subject != issuer:
+        return False  # CA-issued (e.g. Let's Encrypt/Tailscale) — never regenerate
+    # Self-signed: only ours carries CN=dictation-server.
+    return "CN=dictation-server" in subject or "CN = dictation-server" in subject
+
+
 def ensure_ssl_cert():
-    """Generate a self-signed cert if missing; auto-renew if near expiry."""
+    """Generate a self-signed cert if missing; auto-renew ONLY our own near-expiry cert.
+
+    An externally-managed cert (Tailscale/Let's Encrypt, or a user-installed
+    custom cert) is never regenerated — clobbering it is exactly the bug that
+    broke phone pairing. For those we warn and leave renewal to the operator
+    (`dictation-server --tailscale-cert` or their own tooling).
+    """
     sans = _discover_local_ips()
     try:
         import socket as _sock
@@ -619,6 +661,19 @@ def ensure_ssl_cert():
     days = cert_days_remaining()
     if days is None:
         log.warning("Could not determine cert expiry — leaving existing cert in place")
+        return
+
+    if not _cert_is_calliope_self_signed():
+        # Externally-managed cert: warn near expiry but never overwrite it.
+        if days < CERT_RENEW_THRESHOLD_DAYS:
+            log.warning(
+                f"Externally-managed SSL cert expires in {days} days — NOT auto-regenerating. "
+                f"Renew it (e.g. `dictation-server --tailscale-cert`) to avoid an outage."
+            )
+        elif days < CERT_WARN_THRESHOLD_DAYS:
+            log.warning(f"Externally-managed SSL cert expires in {days} days — renew it soon.")
+        else:
+            log.info(f"Externally-managed SSL cert valid for {days} more days")
         return
 
     if days < CERT_RENEW_THRESHOLD_DAYS:
@@ -977,7 +1032,6 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         token = get_token()
         return token if _token_matches(presented, token) else ""
 
-
     def require_auth(self) -> bool:
         """Gate every request unless loopback or exempt endpoint.
 
@@ -1317,10 +1371,11 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         persona = query.get("persona", [""])[0]
         character = query.get("character", [""])[0]
         mode = query.get("mode", [""])[0]
+        formatter_model = query.get("formatter_model", [""])[0]
         language = query.get("language", ["auto"])[0] or "auto"
 
 
-        if not embed and not (chat or persona or character or mode or language != "auto"):
+        if not embed and not (chat or persona or character or mode or formatter_model or language != "auto"):
             return WEB_UI
 
         cfg = {
@@ -1329,6 +1384,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             "persona": persona or None,
             "character": character or None,
             "mode": mode or None,
+            "formatter_model": formatter_model or None,
             "language": language,
         }
         # Values are user-supplied query params: escape "<" so a crafted
@@ -1364,6 +1420,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             "status": "ok",
             "providers": sorted(_VALID_PROVIDERS),
             "default_provider": DEFAULT_FORMATTER_PROVIDER,
+            "formatter_models": list(OMNIROUTE_SELECTABLE_MODELS),
             "mode_count": len(load_modes()),
         }
         if days is not None:
@@ -1408,6 +1465,11 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             self._handle_transcript_export()
         elif path == "/personas":
             self.send_json({"personas": discover_personas()})
+        elif path == "/formatter-models":
+            self.send_json({
+                "provider": "omniroute",
+                "models": list(OMNIROUTE_SELECTABLE_MODELS),
+            })
         elif path == "/characters":
             # POL-6 — `?group=<groupId>` filters to that group's members.
             group_id = query.get("group", [""])[0].strip()
@@ -2097,6 +2159,12 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         provider = normalize_formatter_provider(
             data.get("provider") or params.get("provider", [""])[0] or DEFAULT_FORMATTER_PROVIDER
         )
+        formatter_model = str(data.get("formatter_model") or "").strip()
+        if formatter_model and (
+            provider != "omniroute" or formatter_model not in OMNIROUTE_SELECTABLE_MODELS
+        ):
+            self.send_error_json("Unknown formatter model", code="bad_formatter_model", status=400)
+            return
 
         context = data.get("context", "")
         chat_source = data.get("chat_source", "")
@@ -2168,6 +2236,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             use_rules=use_rules,
             prose_format=prose_format,
             provider=provider,
+            formatter_model=formatter_model,
         )
 
         # Only append / replace in transcript for enhancement-style modes that succeeded.
@@ -2246,6 +2315,12 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         provider = normalize_formatter_provider(
             params.get("provider", [DEFAULT_FORMATTER_PROVIDER])[0]
         )
+        formatter_model = params.get("formatter_model", [""])[0].strip()
+        if formatter_model and (
+            provider != "omniroute" or formatter_model not in OMNIROUTE_SELECTABLE_MODELS
+        ):
+            self.send_error_json("Unknown formatter model", code="bad_formatter_model", status=400)
+            return
 
         # Model: explicit query param overrides mode default.
         model = params.get("model", [mode.get("whisper_model", DEFAULT_MODEL)])[0]
@@ -2436,6 +2511,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 use_rules=use_rules,
                 prose_format=prose_format,
                 provider=provider,
+                formatter_model=formatter_model,
                 request_id=request_id,
                 timing=timing,
             )
@@ -2634,8 +2710,10 @@ def run_tailscale_cert(args) -> int:
     Steps:
       1. Verify `tailscale` on PATH + node logged in.
       2. Resolve MagicDNS name from `tailscale status --json`.
-      3. `sudo tailscale cert <hostname>` — produces <host>.crt + <host>.key in CWD.
-      4. Atomically move into DATA_DIR with the right modes.
+      3. `tailscale cert --cert-file/--key-file` straight into DATA_DIR (no
+         /tmp cross-device move; no root-owned temp files). sudo only as a
+         fallback if the daemon demands elevation, with ownership reclaimed.
+      4. Validate, back up the old pair, then os.replace atomically.
       5. Restart dictation-server so it picks up the new cert.
     """
     print("=" * 64)
@@ -2655,46 +2733,98 @@ def run_tailscale_cert(args) -> int:
         return 2
 
     print(f"  Tailnet hostname:  {hostname}")
-    print(f"  Will run:          sudo tailscale cert {hostname}")
+    print("  Will run:          tailscale cert (into the Calliope data dir)")
     if not _wizard_confirm("  Proceed?", default_yes=True):
         print("  Aborted.")
         return 0
 
-    workdir = Path(tempfile.mkdtemp(prefix="calliope-tscert-"))
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # Write directly into DATA_DIR (same filesystem as the final cert/key) via
+    # --cert-file/--key-file. This avoids the old /tmp -> ~/.local cross-device
+    # rename crash, and files are owned by the invoking user (no root-owned temp
+    # files from a `sudo tailscale cert` we then cannot read). Unique suffix so
+    # a concurrent/aborted run never collides.
+    suffix = f".tsnew.{os.getpid()}.{int(time.time())}"
+    tmp_crt = CERT_FILE.with_suffix(CERT_FILE.suffix + suffix)
+    tmp_key = KEY_FILE.with_suffix(KEY_FILE.suffix + suffix)
+
+    def _cleanup_tmp() -> None:
+        for p in (tmp_crt, tmp_key):
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+
     try:
+        cmd = ["tailscale", "cert",
+               "--cert-file", str(tmp_crt), "--key-file", str(tmp_key), hostname]
         try:
-            res = subprocess.run(
-                ["sudo", "tailscale", "cert", hostname],
-                cwd=str(workdir), check=False, text=True,
-                capture_output=False,
-            )
+            res = subprocess.run(cmd, check=False, text=True, capture_output=True)
         except FileNotFoundError:
-            print("! sudo not on PATH.")
+            print("! tailscale not on PATH.")
             return 2
         if res.returncode != 0:
-            print("! tailscale cert failed.")
-            print("  Common causes:")
-            print("    - HTTPS certs disabled in tailnet ACL/admin console")
-            print("    - sudo not pre-authorized; re-run interactively")
-            print("    - DNS not propagated (give it 60s + retry)")
+            # tailscale cert usually does NOT need root; only fall back to sudo
+            # if the daemon rejected us for privileges, and chown the results
+            # back so we can read the key.
+            stderr = (res.stderr or "").strip()
+            needs_priv = "access denied" in stderr.lower() or "permission" in stderr.lower()
+            if needs_priv and shutil.which("sudo"):
+                print("  tailscale cert needs elevation — retrying with sudo…")
+                sudo_cmd = ["sudo", "tailscale", "cert",
+                            "--cert-file", str(tmp_crt), "--key-file", str(tmp_key), hostname]
+                res = subprocess.run(sudo_cmd, check=False, text=True, capture_output=True)
+                if res.returncode == 0:
+                    # Reclaim ownership so the non-root service can read the key.
+                    try:
+                        subprocess.run(
+                            ["sudo", "chown", f"{os.getuid()}:{os.getgid()}",
+                             str(tmp_crt), str(tmp_key)],
+                            check=False, capture_output=True, text=True,
+                        )
+                    except Exception as e:
+                        log.warning(f"chown of tailscale cert failed: {e}")
+            if res.returncode != 0:
+                print("! tailscale cert failed.")
+                if stderr:
+                    print(f"    {stderr}")
+                print("  Common causes:")
+                print("    - HTTPS certs disabled in tailnet ACL/admin console")
+                print("    - DNS not propagated (give it 60s + retry)")
+                _cleanup_tmp()
+                return 2
+
+        if not (tmp_crt.exists() and tmp_key.exists()):
+            print(f"! Expected {tmp_crt.name} + {tmp_key.name} — not found.")
+            _cleanup_tmp()
             return 2
 
-        crt = workdir / f"{hostname}.crt"
-        key = workdir / f"{hostname}.key"
-        if not (crt.exists() and key.exists()):
-            print(f"! Expected {crt.name} + {key.name} in {workdir} — not found.")
+        # Validate the new cert parses and matches the requested hostname before
+        # we replace the live one — never install a broken cert.
+        try:
+            check = subprocess.run(
+                ["openssl", "x509", "-noout", "-subject", "-in", str(tmp_crt)],
+                capture_output=True, text=True, timeout=5, check=True,
+            )
+            if hostname not in check.stdout:
+                log.warning(f"new cert subject unexpected: {check.stdout.strip()}")
+        except Exception as e:
+            print(f"! new cert failed validation: {e}")
+            _cleanup_tmp()
             return 2
 
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        # Backup any existing self-signed cert before clobbering.
-        for src, dst in ((crt, CERT_FILE), (key, KEY_FILE)):
+        # Backup existing cert+key together before replacing.
+        for dst in (CERT_FILE, KEY_FILE):
             if dst.exists():
                 bak = dst.with_suffix(dst.suffix + ".pre-tailscale.bak")
                 try:
                     shutil.copy2(dst, bak)
                 except Exception as e:
                     log.warning(f"backup of {dst} failed: {e}")
-            shutil.move(str(src), str(dst))
+
+        # os.replace is atomic within the same filesystem (DATA_DIR).
+        os.replace(str(tmp_crt), str(CERT_FILE))
+        os.replace(str(tmp_key), str(KEY_FILE))
         try:
             os.chmod(CERT_FILE, 0o644)
             os.chmod(KEY_FILE, 0o600)
@@ -2734,10 +2864,7 @@ def run_tailscale_cert(args) -> int:
         else:
             print("  systemctl not present — restart dictation-server manually.")
     finally:
-        try:
-            shutil.rmtree(workdir, ignore_errors=True)
-        except Exception:
-            pass
+        _cleanup_tmp()
 
     return 0
 
