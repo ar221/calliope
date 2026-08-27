@@ -1391,6 +1391,9 @@ WEB_UI = r"""<!DOCTYPE html>
   <select class="chip" id="formatterModelSelect" onchange="setFormatterModel(this.value)">
     <option value="">OmniRoute Auto</option>
   </select>
+  <select class="chip" id="microphoneSelect" onchange="setMicrophone(this.value)" aria-label="Microphone input">
+    <option value="">Automatic microphone</option>
+  </select>
   <select class="chip" id="modelSelect">
     <option value="large-v3-turbo">Large Turbo</option>
     <option value="medium">Medium</option>
@@ -1742,6 +1745,8 @@ let micSourceNode = null;
 let vadRafId = null;
 let vadCheckInterval = null;
 let silenceStartTs = 0;
+let peakInputDb = -Infinity;
+let selectedMicrophoneId = '';
 let vadEnabled = true;
 let vadThreshold = -40;        // dB
 let vadSilenceDuration = 2.0;  // seconds
@@ -1762,6 +1767,7 @@ const btn = document.getElementById('recordBtn');
 const label = document.getElementById('recordLabel');
 const recordSub = document.getElementById('recordSub');
 const formatterModelSelect = document.getElementById('formatterModelSelect');
+const microphoneSelect = document.getElementById('microphoneSelect');
 const resultArea = document.getElementById('resultArea');
 const resultText = document.getElementById('resultText');
 const durationEl = document.getElementById('duration');
@@ -1830,6 +1836,44 @@ async function loadFormatterModels() {
   } catch {
     setFormatterModel('', { persist: false });
   }
+}
+
+function setMicrophone(deviceId, opts) {
+  opts = opts || {};
+  selectedMicrophoneId = String(deviceId || '');
+  if (microphoneSelect) microphoneSelect.value = selectedMicrophoneId;
+  if (opts.persist !== false) {
+    try { localStorage.setItem('dictation.microphoneId', selectedMicrophoneId); } catch {}
+  }
+}
+
+async function loadMicrophones() {
+  if (!microphoneSelect || !navigator.mediaDevices?.enumerateDevices) return;
+  try {
+    const devices = (await navigator.mediaDevices.enumerateDevices())
+      .filter(device => device.kind === 'audioinput');
+    const requested = selectedMicrophoneId || localStorage.getItem('dictation.microphoneId') || '';
+    microphoneSelect.innerHTML = '<option value="">Automatic microphone</option>';
+    devices.forEach((device, index) => {
+      const opt = document.createElement('option');
+      opt.value = device.deviceId;
+      opt.textContent = device.label || `Microphone ${index + 1}`;
+      microphoneSelect.appendChild(opt);
+    });
+    setMicrophone(devices.some(device => device.deviceId === requested) ? requested : '', {
+      persist: false,
+    });
+  } catch (err) {
+    console.warn('Failed to enumerate microphones:', err);
+  }
+}
+
+function recordingAudioConstraints() {
+  // Do not force a 16 kHz mono format. Android Bluetooth headset profiles
+  // expose their own native format and can otherwise open as a silent stream.
+  const audio = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+  if (selectedMicrophoneId) audio.deviceId = { exact: selectedMicrophoneId };
+  return audio;
 }
 
 // ─── Mode chips ─────────────────────────────────────────
@@ -2374,9 +2418,9 @@ async function startRecording() {
     // Mobile tab switching can leave the phone UI with a stale snapshot. Pull
     // once at the moment of capture so context is current without manual refresh.
     if (FOLLOW_ST_FROM_URL) await loadStateAndApply({ force: true });
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true }
-    });
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: recordingAudioConstraints() });
+    const audioTrack = stream.getAudioTracks()[0];
+    await loadMicrophones();
 
     const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
       ? 'audio/webm;codecs=opus' : 'audio/webm';
@@ -2398,6 +2442,7 @@ async function startRecording() {
     mediaRecorder.start(100);
     recording = true;
     recordStart = Date.now();
+    peakInputDb = -Infinity;
 
     // Hook up VAD + VU meter on the same stream.
     setupAudioAnalysis(stream);
@@ -2406,8 +2451,9 @@ async function startRecording() {
     btn.classList.remove('processing');
     setIcon('stop');
     label.textContent = 'Tap to stop';
-    recordSub.textContent = '';
-    recordSub.classList.remove('visible');
+    const activeMicLabel = audioTrack?.label || microphoneSelect?.selectedOptions?.[0]?.textContent || '';
+    recordSub.textContent = activeMicLabel ? `Using ${activeMicLabel}` : '';
+    recordSub.classList.toggle('visible', !!activeMicLabel);
     durationEl.classList.add('recording-dur');
 
     durationInterval = setInterval(() => {
@@ -2456,9 +2502,9 @@ function setupAudioAnalysis(stream) {
 
     // Start VAD silence polling.
     silenceStartTs = 0;
-    if (vadEnabled) {
-      vadCheckInterval = setInterval(checkSilence, 100);
-    }
+    // Always sample input level so silent Bluetooth routing is detectable,
+    // even when the user disables automatic silence stopping.
+    vadCheckInterval = setInterval(checkSilence, 100);
   } catch (err) {
     console.warn('Audio analysis setup failed:', err);
   }
@@ -2502,6 +2548,8 @@ function computeDb() {
 function checkSilence() {
   if (!recording || !analyserNode) return;
   const db = computeDb();
+  if (Number.isFinite(db)) peakInputDb = Math.max(peakInputDb, db);
+  if (!vadEnabled) return;
   const now = Date.now();
 
   if (db < vadThreshold) {
@@ -2581,6 +2629,18 @@ async function sendAudio() {
   if (FOLLOW_ST_FROM_URL) await loadStateAndApply({ force: true });
   const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType });
 
+  // MediaRecorder can create a non-empty container around total silence.
+  // Catch Bluetooth routing failure before sending it to Whisper.
+  const recordedForMs = Date.now() - recordStart;
+  if (recordedForMs >= 700 && peakInputDb < -56) {
+    btn.classList.remove('processing');
+    setIcon('mic');
+    durationEl.classList.remove('recording-dur');
+    showError('No microphone signal — choose another mic or reconnect Bluetooth');
+    showToast('⚠ Silent input detected. Pick the Fold microphone in the microphone menu.', 6000);
+    return;
+  }
+
   const model = document.getElementById('modelSelect').value;
   const context = getContext();
   const mode = getMode(currentMode);
@@ -2652,6 +2712,20 @@ async function sendAudio() {
 }
 
 // ─── Regenerate ───────────────────────────────────────
+function isFormatterMode(modeId) {
+  const mode = availableModes.find(item => item.id === modeId);
+  const pipeline = Array.isArray(mode?.pipeline) ? mode.pipeline : [];
+  return pipeline.some(step => ['grammar_clean', 'rp_format', 'rp_enhance', 'persona_pov'].includes(step));
+}
+
+function resolveRegenMode() {
+  // Plain has no formatter step, so choosing Sonnet/Opus/GPT while Plain is
+  // active otherwise produces a perfect no-op.
+  if (isFormatterMode(lastUsedMode)) return lastUsedMode;
+  if (isFormatterMode(currentMode)) return currentMode;
+  return 'rp_enhance';
+}
+
 async function regenerate() {
   if (!lastRawText) return;
 
@@ -2661,8 +2735,8 @@ async function regenerate() {
   setIcon('spinner');
 
   const context = getContext();
-  // Prefer the mode used for the last transcription; fall back to current.
-  const regenMode = lastUsedMode || currentMode || 'rp_enhance';
+  // Preserve a formatter-capable prior mode; Plain cannot regenerate prose.
+  const regenMode = resolveRegenMode();
 
   try {
     const resp = await fetch('/reformat', {
@@ -2682,10 +2756,10 @@ async function regenerate() {
       }),
     });
 
-    const data = await resp.json();
+    const data = await resp.json().catch(() => ({}));
 
-    if (data.error) {
-      showError(data.error);
+    if (!resp.ok || data.error) {
+      showError(data.error || `Regen failed (HTTP ${resp.status})`);
     } else {
       const resolvedMode = data.mode || regenMode;
       lastUsedMode = resolvedMode;
@@ -2704,7 +2778,7 @@ async function regenerate() {
       }
     }
   } catch (err) {
-    showError('Regen failed');
+    showError('Regen failed: ' + (err?.message || 'connection error'));
   }
 
   regenBtn.disabled = false;
@@ -3069,7 +3143,7 @@ async function copyLogEntry(id) {
 async function regenLogEntry(id, btn) {
   const entry = _findEntry(id);
   if (!entry || entry.role !== 'user') return;
-  const regenMode = lastUsedMode || currentMode || 'rp_enhance';
+  const regenMode = resolveRegenMode();
   const context = (typeof getContext === 'function') ? getContext() : '';
   btn.classList.add('spinning');
   btn.disabled = true;
@@ -3091,9 +3165,9 @@ async function regenLogEntry(id, btn) {
         prose: proseFormat,
       }),
     });
-    const data = await resp.json();
-    if (data.error) {
-      showToast('⚠ ' + data.error, 4000);
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || data.error) {
+      showToast('⚠ ' + (data.error || `Regen failed (HTTP ${resp.status})`), 5000);
     } else {
       if (data.formatting_skipped) {
         showToast('⚠ ' + (data.formatting_reason || 'Formatting skipped'), 4000);
@@ -3102,8 +3176,8 @@ async function regenLogEntry(id, btn) {
       }
       await loadTranscript();
     }
-  } catch {
-    showToast('Regen failed');
+  } catch (err) {
+    showToast('Regen failed: ' + (err?.message || 'connection error'), 5000);
   } finally {
     btn.classList.remove('spinning');
     btn.disabled = false;
@@ -3785,6 +3859,8 @@ function init() {
   loadTranscript();
   loadPersonas();
   loadFormatterModels();
+  try { setMicrophone(localStorage.getItem('dictation.microphoneId') || '', { persist: false }); } catch {}
+  loadMicrophones();
   loadCharacters();
   loadRecentChats();
   setupEmbedMessaging();
