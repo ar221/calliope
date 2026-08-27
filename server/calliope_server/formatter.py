@@ -70,7 +70,9 @@ state_lock = threading.Lock()
 # Caches for hot-reloadable config (mtime-based)
 _modes_cache: dict = {"data": [], "mtime": 0.0}
 _vocab_cache: dict = {"data": [], "mtime": 0.0}
-modes_lock = threading.Lock()
+# Reentrant: save_mode_formatter() holds this while calling load_modes(), which
+# takes it again — the same save+load pattern char_modes_lock already uses.
+modes_lock = threading.RLock()
 vocab_lock = threading.Lock()
 
 
@@ -317,28 +319,50 @@ def formatter_request_url(provider: str, endpoint_override: str = "") -> str:
     return f"{base}{endpoint}"
 
 
-def formatter_model(provider: str, *, cleanup: bool = False) -> str:
+def provider_chain(provider: str, *, cleanup: bool = False) -> list[str]:
+    """The configured fallback chain for `provider`."""
     provider = normalize_formatter_provider(provider)
     if provider == "omniroute":
         chain = config.OMNIROUTE_CLEAN_CHAIN if cleanup else config.OMNIROUTE_RP_CHAIN
-        return chain[0] if chain else config.CLAUDE_RP_MODEL
+    elif provider == "openai":
+        chain = config.OPENAI_CLEAN_CHAIN if cleanup else config.OPENAI_RP_CHAIN
+    else:
+        # The Claude-shape proxy fronts a single model.
+        chain = [config.DISFLUENCY_CLEAN_MODEL if cleanup else config.CLAUDE_RP_MODEL]
+    return [m for m in chain if m]
+
+
+def selectable_models(provider: str) -> list[str]:
+    """Models a client may pin explicitly for `provider`.
+
+    Allow-listed so a request cannot turn Calliope into an arbitrary relay.
+    """
+    provider = normalize_formatter_provider(provider)
+    if provider == "omniroute":
+        return list(config.OMNIROUTE_SELECTABLE_MODELS)
     if provider == "openai":
-        return config.OPENAI_CLEAN_MODEL if cleanup else config.OPENAI_RP_MODEL
-    return config.DISFLUENCY_CLEAN_MODEL if cleanup else config.CLAUDE_RP_MODEL
+        return list(config.OPENAI_SELECTABLE_MODELS)
+    return [config.CLAUDE_RP_MODEL]
+
+
+def formatter_model(provider: str, *, cleanup: bool = False) -> str:
+    chain = provider_chain(provider, cleanup=cleanup)
+    return chain[0] if chain else config.CLAUDE_RP_MODEL
 
 
 def formatter_model_chain(provider: str, *, cleanup: bool = False,
                           model_override: str = "") -> list[str]:
-    """Ordered model fallback chain, or one allow-listed OmniRoute override."""
+    """Ordered fallback chain, or one allow-listed explicitly-pinned model.
+
+    An empty list means the caller asked for a model this provider will not
+    serve; callers surface that rather than silently substituting another.
+    """
     provider = normalize_formatter_provider(provider)
     if model_override:
-        if provider != "omniroute" or model_override not in config.OMNIROUTE_SELECTABLE_MODELS:
+        if model_override not in selectable_models(provider):
             return []
         return [model_override]
-    if provider == "omniroute":
-        chain = config.OMNIROUTE_CLEAN_CHAIN if cleanup else config.OMNIROUTE_RP_CHAIN
-        return list(chain)
-    return [formatter_model(provider, cleanup=cleanup)]
+    return provider_chain(provider, cleanup=cleanup)
 
 
 def formatter_payload(
@@ -1249,7 +1273,9 @@ def format_rp(text: str, mode: int = 1, context: str = "",
     # omniroute so a transiently un-credentialed model skips to the next.
     chain = formatter_model_chain(provider, model_override=model_override)
     if not chain:
-        return text, True, "RP formatter model is not selectable through OmniRoute"
+        return text, True, (
+            f"pinned formatter model is not selectable for provider '{provider}'"
+        )
     last_reason = "RP formatting failed"
     # Retry bound across tiers. A per-tier timeout now skips to the next model,
     # so without this a 3-tier chain could stack three full timeouts onto one
@@ -1560,6 +1586,13 @@ def _normalize_mode(entry: dict) -> dict:
         "use_character": False,
         "use_chat_context": False,
         "use_rules": False,
+        # Optional per-mode LLM pin. Empty = use the provider's fallback chain.
+        # A request-level formatter_model still wins over this.
+        "formatter_model": "",
+        # Optional per-mode provider pin. Needed because both clients hardcode
+        # provider=omniroute, so without it a mode could only ever pin an
+        # OmniRoute model.
+        "formatter_provider": "",
     }
     for k, v in defaults.items():
         entry.setdefault(k, v)
@@ -1654,6 +1687,32 @@ def mode_has_formatter_step(mode: dict) -> bool:
     return any(step in FORMATTER_PIPELINE_STEPS for step in mode.get("pipeline", []))
 
 
+def resolve_formatter_target(mode: dict, provider: str,
+                             formatter_model: str) -> tuple[str, str]:
+    """Decide which provider and pinned model a pipeline run should use.
+
+    Precedence:
+      1. A request-level `formatter_model` is a direct user choice (the model
+         picker) and wins, evaluated against the request's provider.
+      2. Otherwise the mode may pin its own model, and optionally its own
+         provider. The mode's provider overrides the request's because both
+         clients send a hardcoded `provider=omniroute` rather than a user
+         choice — without this, per-mode assignment could only name OmniRoute
+         models.
+      3. Otherwise the request provider's normal fallback chain.
+    """
+    provider = normalize_formatter_provider(provider)
+    if formatter_model:
+        return provider, formatter_model
+    mode_model = str(mode.get("formatter_model") or "").strip()
+    if not mode_model:
+        return provider, ""
+    mode_provider = str(mode.get("formatter_provider") or "").strip()
+    if mode_provider:
+        provider = normalize_formatter_provider(mode_provider)
+    return provider, mode_model
+
+
 def mode_public_view(mode: dict) -> dict:
     """Strip prompt internals for the GET /modes response."""
     return {
@@ -1666,6 +1725,8 @@ def mode_public_view(mode: dict) -> dict:
         "use_character": bool(mode.get("use_character", False)),
         "use_chat_context": bool(mode.get("use_chat_context", False)),
         "pipeline": list(mode.get("pipeline", [])),
+        "formatter_model": mode.get("formatter_model", ""),
+        "formatter_provider": mode.get("formatter_provider", ""),
     }
 
 
@@ -1730,6 +1791,54 @@ def _invalidate_modes_cache() -> None:
     with modes_lock:
         _modes_cache["data"] = []
         _modes_cache["mtime"] = 0.0
+
+
+def save_mode_formatter(mode_id: str, model: str, provider: str = "") -> dict:
+    """Persist (or clear) a mode's pinned formatter model/provider.
+
+    Empty `model` clears the pin and the mode reverts to its provider's
+    fallback chain. Raises ValueError for an unknown mode or a model the
+    target provider will not serve, so a typo cannot silently route a mode to
+    the wrong LLM — the failure mode this whole feature exists to remove.
+
+    Returns the updated public view of the mode.
+    """
+    mode_id = (mode_id or "").strip()
+    model = (model or "").strip()
+    provider = (provider or "").strip()
+    if not mode_id:
+        raise ValueError("mode id is required")
+
+    target_provider = normalize_formatter_provider(provider) if provider else ""
+    if model:
+        check_provider = target_provider or config.DEFAULT_FORMATTER_PROVIDER
+        if model not in selectable_models(check_provider):
+            raise ValueError(
+                f"model '{model}' is not selectable for provider '{check_provider}'"
+            )
+
+    with modes_lock:
+        modes = [dict(m) for m in load_modes()]
+        found = next((m for m in modes if m.get("id") == mode_id), None)
+        if found is None:
+            raise ValueError(f"unknown mode '{mode_id}'")
+        if not mode_has_formatter_step(found):
+            raise ValueError(
+                f"mode '{mode_id}' has no formatter step, so a model pin would never apply"
+            )
+        found["formatter_model"] = model
+        found["formatter_provider"] = target_provider if model else ""
+        try:
+            _atomic_write(config.MODES_FILE, _serialize_config(modes))
+        except Exception as e:
+            log.warning(f"Failed to write {config.MODES_FILE}: {e}")
+            raise ValueError(f"could not persist mode formatter: {e}") from e
+        _modes_cache["data"] = modes
+        try:
+            _modes_cache["mtime"] = config.MODES_FILE.stat().st_mtime
+        except Exception:
+            _modes_cache["mtime"] = 0.0
+        return mode_public_view(found)
 
 
 # ─── Whisper hallucination filter ────────────────────────
@@ -2415,7 +2524,9 @@ def run_pipeline(text: str, mode: dict,
         return text, False, "", ""
 
     out = text
-    provider = normalize_formatter_provider(provider)
+    # Per-mode LLM pin (if any) resolves here, before any step runs, so every
+    # formatter step in this pipeline targets the same provider and model.
+    provider, formatter_model = resolve_formatter_target(mode, provider, formatter_model)
     # Fresh attribution slot for this pipeline run. A formatter/cleanup step
     # records the winning model into it; steps that never call the LLM leave
     # it empty (plain mode, or a pure vocab/hallucination pass).

@@ -46,8 +46,18 @@ Current server flags:
 - `DICTATION_CLAUDE_PROXY_URL` / `DICTATION_PROXY_URL` — legacy direct Claude-shape proxy base URL.
 - `DICTATION_CLAUDE_RP_MODEL` / `DICTATION_RP_MODEL` — Claude RP model override.
 - `DICTATION_OPENAI_PROXY_URL` — OpenAI-compatible proxy base URL.
-- `DICTATION_OPENAI_RP_MODEL` — OpenAI-compatible RP model.
-- `DICTATION_OPENAI_CLEAN_MODEL` — OpenAI-compatible cleanup/disfluency model.
+- `DICTATION_OPENAI_RP_MODEL` — primary OpenAI-shape RP model, default `gpt-5.5`.
+- `DICTATION_OPENAI_CLEAN_MODEL` — primary cleanup/disfluency model, default
+  `gpt-5.4-mini`.
+- `DICTATION_OPENAI_RP_CHAIN` / `DICTATION_OPENAI_CLEAN_CHAIN` — comma-separated
+  fallback chains for the OpenAI-shape lane. This lane used to be a single
+  pinned model, so one 500 or expired credential meant raw unformatted text with
+  nowhere to fall back to. When unset, the chain starts with the
+  `*_RP_MODEL` / `*_CLEAN_MODEL` above (so an operator's pin stays primary) and
+  appends the remaining known-good models, de-duplicated.
+- `DICTATION_OPENAI_SELECTABLE_MODELS` — allow-list for explicitly pinning a
+  model on the OpenAI lane. Model pins are validated against the provider they
+  are used with, so a `gpt-*` id cannot be smuggled onto the OmniRoute lane.
 - `DICTATION_FORMATTER_TIMEOUT` — per-model formatter request timeout in seconds;
   default `18`. Measured RP round-trips with a full persona/character/scene
   prompt land at 3.5–5.6s, so the previous `10` clipped the slow tail. This is
@@ -73,18 +83,52 @@ active chain produced the text, and whether it was a fallback tier — surfaced
 in both the ST extension and the phone PWA.
 
 Current built-in OmniRoute defaults (catalog/live-completion verified
-2026-07-14):
+2026-08-27):
 
 - RP/enhance: `codex/gpt-5.6-sol-high` →
-  `no-think/antigravity/claude-sonnet-5` → `no-think/cc/claude-opus-4-8`.
+  `no-think/cc/claude-sonnet-5` → `no-think/cc/claude-opus-4-8`.
 - Cleanup: `codex/gpt-5.6-sol-low` →
   `no-think/cc/claude-sonnet-4-6`.
+
+`no-think/cc/claude-sonnet-5` replaced `no-think/antigravity/claude-sonnet-5`:
+the antigravity lane only carries sonnet-4-6, so the old id was absent from the
+live catalog and worked only because the proxy resolved it loosely.
 
 The RP prompt treats profanity, insults, slurs, punchlines, commands, and other
 charged diction as verbatim voice anchors. Enhancement may add rhythm and
 physical/sensory detail around those anchors, but must not euphemize, sanitize,
 or replace them. Override either chain through the environment variables above
 when the OmniRoute catalog changes; no source edit is required.
+
+### Per-mode LLM assignment
+
+A mode can pin the model that formats it, instead of every mode sharing one
+global picker value. Two optional fields per mode in `modes.yaml`:
+
+```yaml
+- id: rp_enhance
+  formatter_model: gpt-5.5        # empty = use the provider's fallback chain
+  formatter_provider: openai      # optional; empty = the request's provider
+```
+
+Precedence, highest first:
+
+1. A request-level `formatter_model` (the phone/extension model picker). This is
+   a direct user choice for one request.
+2. The mode's `formatter_model`, on the mode's `formatter_provider` when set.
+   The mode's provider overrides the request's, because both clients send a
+   hardcoded `provider=omniroute` rather than a user choice — without that
+   override, a mode could only ever pin an OmniRoute model.
+3. The request provider's fallback chain.
+
+Set it from the SillyTavern extension ("Model assigned to a mode"), or via
+`POST /modes/formatter` with `{"mode": "...", "model": "...", "provider": "..."}`.
+An empty `model` clears the pin. The server rejects an unknown mode, a model the
+target provider will not serve, and a mode with no formatter step — a typo must
+not silently route a mode to the wrong LLM. `GET /modes` reports both fields.
+
+A pinned model is a one-element chain, so it deliberately has no fallback: an
+explicit choice is honoured or reported, never silently substituted.
 
 ### Request limits
 

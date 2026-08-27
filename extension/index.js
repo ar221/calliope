@@ -4596,10 +4596,16 @@ function buildSettingsPanel() {
                     <div class="dbb-formatter-settings" style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(201, 178, 139, 0.18)">
                         <div style="font-size:11px;letter-spacing:0.06em;text-transform:uppercase;color:#FFB648;margin-bottom:4px">Formatter</div>
 
-                        <label for="dictation_bridge_formatter_model">Formatter model (OmniRoute)</label>
-                        <select id="dictation_bridge_formatter_model" class="text_pole" title="Route reformatting and desktop dictation through a selected OmniRoute model.">
+                        <label for="dictation_bridge_formatter_model">Formatter model (this request)</label>
+                        <select id="dictation_bridge_formatter_model" class="text_pole" title="Pin the model used for reformatting and desktop dictation. Overrides any per-mode assignment.">
                             <option value="">Auto fallback chain</option>
                         </select>
+
+                        <label for="dictation_bridge_mode_model">Model assigned to a mode</label>
+                        <select id="dictation_bridge_mode_model" class="text_pole" title="Pin an LLM to the formatter mode selected below. Saved server-side in modes.yaml, so the phone UI and dictation use it too. The picker above still wins for a single request.">
+                            <option value="">Auto fallback chain</option>
+                        </select>
+                        <small id="dictation_bridge_mode_model_hint" class="notes" style="margin-top:0">Applies to the mode chosen in “Formatter mode” below.</small>
 
                         <label for="dictation_bridge_reformat_persona">Reformat persona</label>
                         <select id="dictation_bridge_reformat_persona" class="text_pole" title="Use the active SillyTavern persona, or deliberately write as any persona in your ST list.">
@@ -4846,6 +4852,8 @@ function buildSettingsPanel() {
 
     // ─── QW1/QW2/QW3: formatter mode + language + reformat wiring ───────────
     const modelEl = host.querySelector('#dictation_bridge_formatter_model');
+    const modeModelEl = host.querySelector('#dictation_bridge_mode_model');
+    const modeModelHintEl = host.querySelector('#dictation_bridge_mode_model_hint');
     const personaEl = host.querySelector('#dictation_bridge_reformat_persona');
     const modeEl = formatterModeEl = host.querySelector('#dictation_bridge_mode');
     const modeHintEl = formatterModeHintEl = host.querySelector('#dictation_bridge_mode_hint');
@@ -4854,21 +4862,37 @@ function buildSettingsPanel() {
     const reformatGoEl = host.querySelector('#dictation_bridge_reformat_go');
 
     const modelLabels = {
-        'no-think/antigravity/claude-sonnet-5': 'Sonnet 5',
+        'no-think/cc/claude-sonnet-5': 'Sonnet 5',
         'no-think/cc/claude-opus-4-8': 'Opus 4.8',
         'no-think/cc/claude-opus-4-6': 'Opus 4.6',
         'codex/gpt-5.6-sol-high': 'GPT 5.6 High',
+        'gpt-5.5': 'GPT 5.5',
+        'gpt-5.4': 'GPT 5.4',
+        'gpt-5.4-mini': 'GPT 5.4 mini',
     };
+    const modelLabel = (model) => modelLabels[model] || model;
+    // provider -> [model]; populated from /formatter-models so the per-mode
+    // picker can offer non-OmniRoute lanes too.
+    let modelsByProvider = {};
+
+    const loadFormatterModels = () => fetch(
+        `${s.serverUrl.replace(/\/+$/, '')}/formatter-models`,
+        { headers: { ...authHeaders() }, cache: 'no-store', mode: 'cors' },
+    ).then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
+        .then(data => {
+            modelsByProvider = (data && typeof data.by_provider === 'object' && data.by_provider)
+                ? data.by_provider
+                : { omniroute: Array.isArray(data?.models) ? data.models : [] };
+            return Array.isArray(data?.models) ? data.models : [];
+        });
+
     if (modelEl) {
-        fetch(`${s.serverUrl.replace(/\/+$/, '')}/formatter-models`, {
-            headers: { ...authHeaders() }, cache: 'no-store', mode: 'cors',
-        }).then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
-            .then(data => {
-                const models = Array.isArray(data.models) ? data.models : [];
+        loadFormatterModels()
+            .then(models => {
                 for (const model of models) {
                     const opt = document.createElement('option');
                     opt.value = model;
-                    opt.textContent = modelLabels[model] || model;
+                    opt.textContent = modelLabel(model);
                     modelEl.appendChild(opt);
                 }
                 if (s.formatterModel && !models.includes(s.formatterModel)) {
@@ -4876,10 +4900,90 @@ function buildSettingsPanel() {
                     saveSettings();
                 }
                 modelEl.value = models.includes(settings().formatterModel) ? settings().formatterModel : '';
+                populateModeModelOptions();
             }).catch(e => WARN('formatter models failed', e?.message || e));
         modelEl.addEventListener('change', () => {
             settings().formatterModel = modelEl.value || '';
             saveSettings();
+        });
+    }
+
+    // ─── Per-mode LLM assignment (POST /modes/formatter) ────────────────────
+    // Option values are "provider|model" because a model only means something
+    // paired with its provider lane.
+    function populateModeModelOptions() {
+        if (!modeModelEl) return;
+        modeModelEl.innerHTML = '<option value="">Auto fallback chain</option>';
+        for (const [provider, models] of Object.entries(modelsByProvider)) {
+            if (!Array.isArray(models) || !models.length) continue;
+            const group = document.createElement('optgroup');
+            group.label = provider;
+            for (const model of models) {
+                const opt = document.createElement('option');
+                opt.value = `${provider}|${model}`;
+                opt.textContent = modelLabel(model);
+                group.appendChild(opt);
+            }
+            modeModelEl.appendChild(group);
+        }
+        reflectModeModel();
+    }
+
+    function reflectModeModel() {
+        if (!modeModelEl) return;
+        const modeId = modeEl?.value || '';
+        const mode = cachedModes?.find(m => m.id === modeId);
+        const disabled = !modeId || !mode;
+        modeModelEl.disabled = disabled;
+        if (modeModelHintEl) {
+            modeModelHintEl.textContent = disabled
+                ? 'Pick a formatter mode below to assign a model to it.'
+                : `Assigned to “${mode.label || modeId}”. The picker above still wins per request.`;
+        }
+        const model = String(mode?.formatter_model || '');
+        const provider = String(mode?.formatter_provider || '') || 'omniroute';
+        modeModelEl.value = model ? `${provider}|${model}` : '';
+    }
+
+    if (modeModelEl) {
+        modeModelEl.addEventListener('change', async () => {
+            const modeId = modeEl?.value || '';
+            if (!modeId) {
+                toast('warning', 'Pick a formatter mode first');
+                reflectModeModel();
+                return;
+            }
+            const [provider, model] = String(modeModelEl.value || '').split('|');
+            modeModelEl.disabled = true;
+            try {
+                const res = await fetch(`${s.serverUrl.replace(/\/+$/, '')}/modes/formatter`, {
+                    method: 'POST',
+                    mode: 'cors',
+                    cache: 'no-store',
+                    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+                    body: JSON.stringify({
+                        mode: modeId,
+                        model: model || '',
+                        provider: model ? (provider || '') : '',
+                    }),
+                });
+                let data = null;
+                try { data = await res.json(); } catch {}
+                if (!res.ok) throw new Error(data?.error || `HTTP ${res.status}`);
+                const updated = data?.mode;
+                if (updated?.id) {
+                    const idx = (cachedModes || []).findIndex(m => m.id === updated.id);
+                    if (idx >= 0) cachedModes[idx] = updated;
+                }
+                toast('success', model
+                    ? `${escapeHtml(modeId)} → ${escapeHtml(modelLabel(model))}`
+                    : `${escapeHtml(modeId)} → auto fallback chain`);
+            } catch (e) {
+                toast('error', `Could not assign model: ${escapeHtml(e?.message || 'unknown')}`);
+            } finally {
+                modeModelEl.disabled = false;
+                reflectModeModel();
+            }
         });
     }
 
@@ -4938,6 +5042,7 @@ function buildSettingsPanel() {
                 modeEl.appendChild(opt);
             }
             await refreshFormatterModeForContext();
+            reflectModeModel();
         }
         // Reformat dropdown: leading "Reformat as…" placeholder is kept.
         if (reformatModeEl) {
@@ -4957,6 +5062,9 @@ function buildSettingsPanel() {
 
     if (modeEl) {
         modeEl.addEventListener('change', async () => {
+            // Keep the per-mode model picker pointed at the newly chosen mode
+            // even if saving the mode itself fails below.
+            reflectModeModel();
             const char = currentModeMemoryKey();
             const modeId = modeEl.value || '';
             if (!char) {

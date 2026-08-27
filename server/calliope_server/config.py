@@ -143,7 +143,9 @@ CLAUDE_RP_MODEL = os.environ.get(
     os.environ.get("DICTATION_RP_MODEL", "claude-sonnet-4-6"),
 )
 OPENAI_PROXY_URL = os.environ.get("DICTATION_OPENAI_PROXY_URL", "http://127.0.0.1:10531/v1")
-OPENAI_RP_MODEL = os.environ.get("DICTATION_OPENAI_RP_MODEL", "gpt-5.4")
+# Catalog-verified against the live proxy 2026-08-27: gpt-5.5 is current,
+# gpt-5.4 and gpt-5.4-mini still serve, gpt-5.2 returns HTTP 500.
+OPENAI_RP_MODEL = os.environ.get("DICTATION_OPENAI_RP_MODEL", "gpt-5.5")
 OPENAI_CLEAN_MODEL = os.environ.get("DICTATION_OPENAI_CLEAN_MODEL", "gpt-5.4-mini")
 
 # ─── OmniRoute provider (OpenAI-compatible aggregator) ─────
@@ -164,16 +166,34 @@ def _parse_model_chain(raw: str, default: list[str]) -> list[str]:
     return items or list(default)
 
 
+def _chain_from(primary: str, *fallbacks: str) -> list[str]:
+    """Primary model first, then fallbacks, de-duplicated in order.
+
+    Keeps an operator's pinned single-model env var authoritative while still
+    giving that lane somewhere to go when the pinned model fails.
+    """
+    ordered: list[str] = []
+    for model in (primary, *fallbacks):
+        if model and model not in ordered:
+            ordered.append(model)
+    return ordered
+
+
 # RP/enhance chain (creative-quality first). Live-verified against the
-# OmniRoute catalog and completion endpoint 2026-07-14. Prefer the newest
+# OmniRoute catalog and completion endpoint 2026-08-27. Prefer the newest
 # Default RP lane: current GPT-5.6 Sol, then Sonnet 5, then Opus 4.8.
 # Sonnet 4.6 remains an explicit picker option but never wins regeneration
 # implicitly — the operator asked to retire it from the automatic RP chain.
+#
+# `no-think/cc/claude-sonnet-5` replaces the former
+# `no-think/antigravity/claude-sonnet-5`: the antigravity lane only carries
+# sonnet-4-6, so that id was absent from the live catalog and only worked
+# because the proxy resolved it loosely.
 OMNIROUTE_RP_CHAIN = _parse_model_chain(
     os.environ.get("DICTATION_OMNIROUTE_RP_CHAIN", ""),
     [
         "codex/gpt-5.6-sol-high",
-        "no-think/antigravity/claude-sonnet-5",
+        "no-think/cc/claude-sonnet-5",
         "no-think/cc/claude-opus-4-8",
     ],
 )
@@ -183,18 +203,34 @@ OMNIROUTE_CLEAN_CHAIN = _parse_model_chain(
     ["codex/gpt-5.6-sol-low", "no-think/cc/claude-sonnet-4-6"],
 )
 
-# User-selectable RP formatter models. The phone UI and SillyTavern extension
-# expose these as explicit quality lanes; an empty selection keeps the normal
-# fallback chain above. Selected models are allow-listed here so a request
-# cannot turn Calliope into an arbitrary OmniRoute model relay.
+# The OpenAI-shape proxy lane gets a chain too. It used to be a single pinned
+# model, so one 500 or an expired credential meant raw unformatted text with
+# nowhere to fall back to.
+OPENAI_RP_CHAIN = _parse_model_chain(
+    os.environ.get("DICTATION_OPENAI_RP_CHAIN", ""),
+    _chain_from(OPENAI_RP_MODEL, "gpt-5.5", "gpt-5.4"),
+)
+OPENAI_CLEAN_CHAIN = _parse_model_chain(
+    os.environ.get("DICTATION_OPENAI_CLEAN_CHAIN", ""),
+    _chain_from(OPENAI_CLEAN_MODEL, "gpt-5.4-mini", "gpt-5.4"),
+)
+
+# User-selectable RP formatter models, per provider. The phone UI and
+# SillyTavern extension expose these as explicit quality lanes; an empty
+# selection keeps the normal fallback chain above. Selected models are
+# allow-listed so a request cannot turn Calliope into an arbitrary model relay.
 OMNIROUTE_SELECTABLE_MODELS = _parse_model_chain(
     os.environ.get("DICTATION_OMNIROUTE_SELECTABLE_MODELS", ""),
     [
-        "no-think/antigravity/claude-sonnet-5",
+        "no-think/cc/claude-sonnet-5",
         "no-think/cc/claude-opus-4-8",
         "no-think/cc/claude-opus-4-6",
         "codex/gpt-5.6-sol-high",
     ],
+)
+OPENAI_SELECTABLE_MODELS = _parse_model_chain(
+    os.environ.get("DICTATION_OPENAI_SELECTABLE_MODELS", ""),
+    _chain_from("gpt-5.5", "gpt-5.4", "gpt-5.4-mini"),
 )
 
 _VALID_PROVIDERS = {"claude", "openai", "omniroute"}

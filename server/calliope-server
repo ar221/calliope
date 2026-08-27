@@ -345,6 +345,9 @@ from calliope_server.formatter import (  # noqa: E402
     resolve_mode,
     mode_public_view,
     mode_has_formatter_step,
+    save_mode_formatter,
+    selectable_models,
+    resolve_formatter_target,  # noqa: F401 — re-export for tests
     _normalize_vocab_entry,
     load_vocab,
     _invalidate_vocab_cache,
@@ -1425,7 +1428,10 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             "status": "ok",
             "providers": sorted(_VALID_PROVIDERS),
             "default_provider": DEFAULT_FORMATTER_PROVIDER,
-            "formatter_models": list(OMNIROUTE_SELECTABLE_MODELS),
+            "formatter_models": selectable_models(DEFAULT_FORMATTER_PROVIDER),
+            "formatter_models_by_provider": {
+                p: selectable_models(p) for p in sorted(_VALID_PROVIDERS)
+            },
             "mode_count": len(load_modes()),
         }
         if days is not None:
@@ -1471,9 +1477,17 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/personas":
             self.send_json({"personas": discover_personas()})
         elif path == "/formatter-models":
+            # `?provider=` picks a lane; default keeps the historical omniroute
+            # response shape so existing clients are unaffected.
+            fm_provider = normalize_formatter_provider(
+                query.get("provider", [""])[0] or "omniroute"
+            )
             self.send_json({
-                "provider": "omniroute",
-                "models": list(OMNIROUTE_SELECTABLE_MODELS),
+                "provider": fm_provider,
+                "models": selectable_models(fm_provider),
+                "by_provider": {
+                    p: selectable_models(p) for p in sorted(_VALID_PROVIDERS)
+                },
             })
         elif path == "/characters":
             # POL-6 — `?group=<groupId>` filters to that group's members.
@@ -1827,6 +1841,27 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 "mode": persisted_mode,
                 "modes": updated,
             })
+        elif path == "/modes/formatter":
+            # Per-mode LLM assignment. Body:
+            #   {mode: <mode_id>, model: <model|"">, provider: <provider|"">}
+            # Empty model clears the pin and the mode reverts to its
+            # provider's fallback chain.
+            try:
+                body = self.read_json_body()
+            except Exception:
+                self.send_error_json("Invalid JSON", code="bad_json", status=400)
+                return
+            body = body or {}
+            try:
+                updated = save_mode_formatter(
+                    str(body.get("mode", "")).strip(),
+                    str(body.get("model", "")).strip(),
+                    str(body.get("provider", "")).strip(),
+                )
+            except ValueError as e:
+                self.send_error_json(str(e), code="bad_mode_formatter", status=400)
+                return
+            self.send_json({"mode": updated})
         elif path == "/pair":
             # MVP-19 Stage 6 — phone pairing handshake. Phone scans the QR
             # rendered by the wizard, posts back token+fingerprint to confirm
@@ -2165,10 +2200,11 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             data.get("provider") or params.get("provider", [""])[0] or DEFAULT_FORMATTER_PROVIDER
         )
         formatter_model = str(data.get("formatter_model") or "").strip()
-        if formatter_model and (
-            provider != "omniroute" or formatter_model not in OMNIROUTE_SELECTABLE_MODELS
-        ):
-            self.send_error_json("Unknown formatter model", code="bad_formatter_model", status=400)
+        if formatter_model and formatter_model not in selectable_models(provider):
+            self.send_error_json(
+                f"Model '{formatter_model}' is not selectable for provider '{provider}'",
+                code="bad_formatter_model", status=400,
+            )
             return
 
         context = data.get("context", "")
@@ -2305,7 +2341,9 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             "cleaned": cleaned_text,
             "repair_trace": repair_trace,
             "mode": mode.get("id"),
-            "provider": provider,
+            # A per-mode pin can route to a different provider than the client
+            # asked for, so report the one that actually produced the text.
+            "provider": attribution["provider"] or provider,
             "transcript_count": transcript_count,
             "formatting_skipped": formatting_skipped,
             "formatting_reason": formatting_reason,
@@ -2343,10 +2381,11 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             params.get("provider", [DEFAULT_FORMATTER_PROVIDER])[0]
         )
         formatter_model = params.get("formatter_model", [""])[0].strip()
-        if formatter_model and (
-            provider != "omniroute" or formatter_model not in OMNIROUTE_SELECTABLE_MODELS
-        ):
-            self.send_error_json("Unknown formatter model", code="bad_formatter_model", status=400)
+        if formatter_model and formatter_model not in selectable_models(provider):
+            self.send_error_json(
+                f"Model '{formatter_model}' is not selectable for provider '{provider}'",
+                code="bad_formatter_model", status=400,
+            )
             return
 
         # Model: explicit query param overrides mode default.
@@ -2572,7 +2611,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                     "text": output_text,
                     "has_repair_trace": repair_trace.get("has_changes", False),
                     "mode": mode.get("id", ""),
-                    "provider": provider,
+                    "provider": attribution["provider"] or provider,
                     "formatting_skipped": formatting_skipped,
                     "formatting_reason": formatting_reason,
                     "model": attribution["model"],
@@ -2627,7 +2666,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 "cleaned": cleaned_text,
                 "repair_trace": repair_trace,
                 "mode": mode.get("id"),
-                "provider": provider,
+                "provider": attribution["provider"] or provider,
                 "transcript_count": transcript_count,
                 "formatting_skipped": formatting_skipped,
                 "formatting_reason": formatting_reason,
