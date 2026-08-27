@@ -2518,6 +2518,12 @@ def run_pipeline(text: str, mode: dict,
         except Exception as _e:  # pragma: no cover — best-effort SSE
             log.debug("dictation-state emit failed: %s", _e)
 
+    # Fresh attribution slot for this pipeline run. A formatter/cleanup step
+    # records the winning model into it; steps that never call the LLM leave it
+    # empty. This must happen BEFORE the plain-mode early return, or a plain run
+    # reports whatever model a previous run on this thread recorded.
+    reset_model_attribution()
+
     pipeline = [step for step in mode.get("pipeline", []) if step != "whisper"]
     if not pipeline:
         # Plain mode — no pipeline transitions to broadcast.
@@ -2527,10 +2533,6 @@ def run_pipeline(text: str, mode: dict,
     # Per-mode LLM pin (if any) resolves here, before any step runs, so every
     # formatter step in this pipeline targets the same provider and model.
     provider, formatter_model = resolve_formatter_target(mode, provider, formatter_model)
-    # Fresh attribution slot for this pipeline run. A formatter/cleanup step
-    # records the winning model into it; steps that never call the LLM leave
-    # it empty (plain mode, or a pure vocab/hallucination pass).
-    reset_model_attribution()
     if scene_contract is None:
         scene_contract = build_scene_contract(
             snapshot_state(),

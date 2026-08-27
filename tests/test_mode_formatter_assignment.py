@@ -210,6 +210,33 @@ def test_save_mode_formatter_persists_and_survives_reload(tmp_path, monkeypatch)
     assert reloaded["formatter_provider"] == "omniroute"
 
 
+
+def test_plain_mode_does_not_report_a_previous_runs_model(tmp_path, monkeypatch):
+    """Attribution is reset before the plain-mode early return.
+
+    Regression: reset_model_attribution() ran *after* the `if not pipeline`
+    return, so a plain run on a reused thread reported whatever model the
+    previous run had recorded.
+    """
+    mod = _load_server(tmp_path, monkeypatch)
+    calls: list[str] = []
+    _script(monkeypatch, mod, {
+        "codex/gpt-5.6-sol-high": _ok("formatted by the first run"),
+    }, calls)
+
+    enhance = mod._normalize_mode({"id": "rp_enhance", "pipeline": ["whisper", "rp_enhance"]})
+    mod.run_pipeline("she walks in and i say hello", enhance, provider="omniroute")
+    assert mod.get_model_attribution()["model"] == "codex/gpt-5.6-sol-high"
+
+    # Same thread, now a mode with no formatter step.
+    plain = mod._normalize_mode({"id": "plain", "pipeline": ["whisper"]})
+    out, skipped, _reason, _cleaned = mod.run_pipeline("untouched", plain, provider="omniroute")
+    assert out == "untouched"
+    assert skipped is False
+    assert mod.get_model_attribution()["model"] == "", "stale model leaked into a plain run"
+    assert mod.get_model_attribution()["provider"] == ""
+
+
 def test_save_mode_formatter_clears_the_pin(tmp_path, monkeypatch):
     mod = _load_server(tmp_path, monkeypatch)
     mod.save_mode_formatter("rp_format", "no-think/cc/claude-opus-4-8", "omniroute")
@@ -267,6 +294,24 @@ def test_extension_exposes_a_per_mode_model_control():
     assert "`${provider}|${model}`" in source
     # The stale antigravity label must not linger in the picker.
     assert "no-think/antigravity/claude-sonnet-5" not in source
+    assert "'no-think/cc/claude-sonnet-5': 'Sonnet 5'" in source
+
+
+def test_extension_discloses_that_the_global_override_beats_mode_pins():
+    """The global picker is persisted and sent every request, so a stale
+    selection silently disables every per-mode assignment. That has to be
+    visible in the UI, not just true in the server."""
+    source = EXT_SRC.read_text()
+
+    # Label must not imply the override is per-request.
+    assert "Global model override (every mode)" in source
+    assert "Formatter model (this request)" not in source
+    assert "dictation_bridge_formatter_model_hint" in source
+    assert "overrideHintEl" in source
+    # The mode hint calls the pin inactive while an override is set.
+    assert "Inactive: the global override" in source
+    # Changing the override refreshes the hints instead of going stale.
+    assert source.count("reflectModeModel();") >= 4
     assert "'no-think/cc/claude-sonnet-5': 'Sonnet 5'" in source
 
 

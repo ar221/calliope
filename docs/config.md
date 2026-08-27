@@ -113,8 +113,13 @@ global picker value. Two optional fields per mode in `modes.yaml`:
 
 Precedence, highest first:
 
-1. A request-level `formatter_model` (the phone/extension model picker). This is
-   a direct user choice for one request.
+1. A request-level `formatter_model` (the phone/extension model picker). Note
+   that both clients **persist** this selection and send it on every request, so
+   it behaves as a sticky global override, not a one-shot choice: while it is
+   set, every per-mode assignment below is ignored. Set the picker back to
+   "Auto fallback chain" to let per-mode assignments apply. The extension labels
+   it "Global model override (every mode)" and marks a shadowed mode pin as
+   inactive.
 2. The mode's `formatter_model`, on the mode's `formatter_provider` when set.
    The mode's provider overrides the request's, because both clients send a
    hardcoded `provider=omniroute` rather than a user choice — without that

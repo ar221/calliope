@@ -4596,13 +4596,14 @@ function buildSettingsPanel() {
                     <div class="dbb-formatter-settings" style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(201, 178, 139, 0.18)">
                         <div style="font-size:11px;letter-spacing:0.06em;text-transform:uppercase;color:#FFB648;margin-bottom:4px">Formatter</div>
 
-                        <label for="dictation_bridge_formatter_model">Formatter model (this request)</label>
-                        <select id="dictation_bridge_formatter_model" class="text_pole" title="Pin the model used for reformatting and desktop dictation. Overrides any per-mode assignment.">
+                        <label for="dictation_bridge_formatter_model">Global model override (every mode)</label>
+                        <select id="dictation_bridge_formatter_model" class="text_pole" title="Sticky override sent with every request. While this is set it wins over any per-mode assignment below. Choose 'Auto fallback chain' to let per-mode assignments apply.">
                             <option value="">Auto fallback chain</option>
                         </select>
+                        <small id="dictation_bridge_formatter_model_hint" class="notes" style="margin-top:0">Sticky, not per-request. While set, it overrides every per-mode assignment.</small>
 
                         <label for="dictation_bridge_mode_model">Model assigned to a mode</label>
-                        <select id="dictation_bridge_mode_model" class="text_pole" title="Pin an LLM to the formatter mode selected below. Saved server-side in modes.yaml, so the phone UI and dictation use it too. The picker above still wins for a single request.">
+                        <select id="dictation_bridge_mode_model" class="text_pole" title="Pin an LLM to the formatter mode selected below. Saved server-side in modes.yaml, so the phone UI and dictation use it too.">
                             <option value="">Auto fallback chain</option>
                         </select>
                         <small id="dictation_bridge_mode_model_hint" class="notes" style="margin-top:0">Applies to the mode chosen in “Formatter mode” below.</small>
@@ -4852,6 +4853,7 @@ function buildSettingsPanel() {
 
     // ─── QW1/QW2/QW3: formatter mode + language + reformat wiring ───────────
     const modelEl = host.querySelector('#dictation_bridge_formatter_model');
+    const overrideHintEl = host.querySelector('#dictation_bridge_formatter_model_hint');
     const modeModelEl = host.querySelector('#dictation_bridge_mode_model');
     const modeModelHintEl = host.querySelector('#dictation_bridge_mode_model_hint');
     const personaEl = host.querySelector('#dictation_bridge_reformat_persona');
@@ -4905,6 +4907,9 @@ function buildSettingsPanel() {
         modelEl.addEventListener('change', () => {
             settings().formatterModel = modelEl.value || '';
             saveSettings();
+            // Setting or clearing the sticky override flips whether per-mode
+            // assignments apply at all, so refresh both hints immediately.
+            reflectModeModel();
         });
     }
 
@@ -4935,14 +4940,34 @@ function buildSettingsPanel() {
         const mode = cachedModes?.find(m => m.id === modeId);
         const disabled = !modeId || !mode;
         modeModelEl.disabled = disabled;
-        if (modeModelHintEl) {
-            modeModelHintEl.textContent = disabled
-                ? 'Pick a formatter mode below to assign a model to it.'
-                : `Assigned to “${mode.label || modeId}”. The picker above still wins per request.`;
-        }
         const model = String(mode?.formatter_model || '');
         const provider = String(mode?.formatter_provider || '') || 'omniroute';
         modeModelEl.value = model ? `${provider}|${model}` : '';
+
+        // The global override is sticky and sent on every request, so while it
+        // is set every per-mode assignment is dead. Say so instead of letting
+        // the pin look active.
+        const override = String(settings().formatterModel || '');
+        if (modeModelHintEl) {
+            if (disabled) {
+                modeModelHintEl.textContent = 'Pick a formatter mode below to assign a model to it.';
+            } else if (override) {
+                modeModelHintEl.textContent =
+                    `Inactive: the global override (${modelLabel(override)}) wins. `
+                    + 'Set it to “Auto fallback chain” to use per-mode assignments.';
+            } else if (model) {
+                modeModelHintEl.textContent =
+                    `“${mode.label || modeId}” formats with ${modelLabel(model)} (${provider}).`;
+            } else {
+                modeModelHintEl.textContent =
+                    `“${mode.label || modeId}” uses the provider's fallback chain.`;
+            }
+        }
+        if (overrideHintEl) {
+            overrideHintEl.textContent = override
+                ? `Sticky override active (${modelLabel(override)}) — per-mode assignments are ignored.`
+                : 'Sticky, not per-request. While set, it overrides every per-mode assignment.';
+        }
     }
 
     if (modeModelEl) {
