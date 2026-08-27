@@ -244,7 +244,7 @@ fans out.
 | whisper-server `/inference` | 300–800 ms (5s clip) | GPU warm; cold first call ~2s extra |
 | `vocab_correct` | <10 ms | regex + difflib, in-process |
 | `disfluency_clean` | 800–2000 ms | LLM HTTP, 3s timeout, skipped <12 words (MVP-15) |
-| `rp_enhance` | 2000–10000 ms | LLM HTTP, 10s timeout (env-overridable), OmniRoute model chain |
+| `rp_enhance` | 2000–6000 ms | LLM HTTP, 18s per-attempt timeout (env-overridable), OmniRoute model chain; timeouts skip to the next tier, with a 40s retry bound on how many tiers are attempted |
 | SSE fan-out | <5 ms | `Queue.put_nowait` |
 | **Total** | **3–7 s** for `rp_enhance` | LLM dominates |
 

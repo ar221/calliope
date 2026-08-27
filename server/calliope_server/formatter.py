@@ -431,6 +431,11 @@ def formatter_error_text(data: dict) -> str:
 # Substrings that mark a model as un-usable *right now* but worth skipping to
 # the next chain tier (transient/credential/routing issues), rather than a
 # hard failure of the whole request.
+#
+# Timeouts belong here: a reasoning-tier first model that blows its per-attempt
+# budget is exactly the case the fallback chain exists for. Treating a timeout
+# as fatal aborted the whole chain on tier 0, so "OmniRoute Auto" silently
+# returned raw unformatted text instead of falling through to the next model.
 _CHAIN_SKIP_MARKERS = (
     "no credentials",
     "not found",
@@ -444,6 +449,9 @@ _CHAIN_SKIP_MARKERS = (
     "rate limit",
     "overloaded",
     "capacity",
+    "timed out",
+    "timeout",
+    "bad gateway",
 )
 
 
@@ -453,13 +461,64 @@ def _is_chain_skippable_error(message: str) -> bool:
     return any(marker in m for marker in _CHAIN_SKIP_MARKERS)
 
 
-def probe_formatter(provider: str, timeout: float = 2.0) -> tuple[bool, str]:
+def _attempt_timeout(deadline: float, per_attempt: float) -> float:
+    """Per-tier socket timeout, clamped to the chain's remaining retry budget.
+
+    Enabling timeout fallback would otherwise multiply worst-case latency by the
+    chain length. This bounds how many tiers get attempted; it is not a
+    wall-clock cap, since the value returned is a per-socket-operation timeout.
+    """
+    return min(per_attempt, max(0.0, deadline - time.monotonic()))
+
+
+# provider -> (expires_at_monotonic, healthy, reason)
+_probe_cache: dict[str, tuple[float, bool, str]] = {}
+_probe_lock = threading.Lock()
+
+
+def reset_probe_cache() -> None:
+    """Drop cached liveness verdicts (config reload / tests)."""
+    with _probe_lock:
+        _probe_cache.clear()
+
+
+def probe_formatter(provider: str, timeout: float | None = None) -> tuple[bool, str]:
+    """Liveness check for the formatter proxy, cached for a few seconds.
+
+    The health URL for OpenAI-shape providers is /v1/models, which on OmniRoute
+    rebuilds a ~2300-entry catalog. That answers in milliseconds warm but has
+    been measured over 3s cold, so the previous hard-coded 2s timeout reported a
+    perfectly healthy proxy as offline on the first call after an idle period —
+    and format_rp then returned raw, unformatted text without trying a single
+    model. Caching also stops one dictation from paying for several probes.
+    """
+    provider = normalize_formatter_provider(provider)
+    if timeout is None:
+        timeout = config.FORMATTER_PROBE_TIMEOUT_SECONDS
+    now = time.monotonic()
+    with _probe_lock:
+        cached = _probe_cache.get(provider)
+        if cached is not None and now < cached[0]:
+            return cached[1], cached[2]
     try:
         req = urllib.request.Request(formatter_health_url(provider), method="GET")
-        urllib.request.urlopen(req, timeout=timeout)
-        return True, ""
+        # Close the response: the old call leaked the socket every probe.
+        with urllib.request.urlopen(req, timeout=timeout):
+            pass
+        healthy, reason = True, ""
     except Exception as e:
-        return False, str(e)
+        healthy, reason = False, str(e)
+    ttl = (
+        config.FORMATTER_PROBE_TTL_SECONDS if healthy
+        else config.FORMATTER_PROBE_FAIL_TTL_SECONDS
+    )
+    with _probe_lock:
+        # Expiry is measured from when the probe FINISHED, not when it started.
+        # A failing probe burns its whole timeout, so `now + ttl` was already in
+        # the past whenever timeout > ttl — the failure verdict expired on
+        # arrival and every request re-paid the full probe with the proxy down.
+        _probe_cache[provider] = (time.monotonic() + ttl, healthy, reason)
+    return healthy, reason
 
 
 def disfluency_clean(text: str, provider: str = config.DEFAULT_FORMATTER_PROVIDER) -> tuple[str, bool, str]:
@@ -479,7 +538,9 @@ def disfluency_clean(text: str, provider: str = config.DEFAULT_FORMATTER_PROVIDE
         return text, False, f"input {word_count} words exceeds cap {config.DISFLUENCY_CLEAN_MAX_WORDS}"
 
     provider = normalize_formatter_provider(provider)
-    healthy, _reason = probe_formatter(provider, timeout=1.5)
+    # No hard-coded timeout: a cold /v1/models catalog build exceeds 2s and the
+    # config default governs, otherwise this silently skips a healthy proxy.
+    healthy, _reason = probe_formatter(provider)
     if not healthy:
         log.info("disfluency_clean: %s formatter unreachable — passing through raw", provider)
         return text, False, f"cleanup proxy unreachable ({provider})"
@@ -999,13 +1060,19 @@ def _parse_sse_delta(provider: str, line_data: str) -> tuple[str, bool]:
 
 
 def _stream_formatter(url: str, payload: bytes, provider: str,
-                       on_delta, timeout: float) -> tuple[str, str]:
+                       on_delta, timeout: float,
+                       deadline: float | None = None) -> tuple[str, str]:
     """POST `payload` with stream=True; parse SSE deltas; call `on_delta(text)`
     for each visible (post-thinking-filter) chunk.
 
     Returns (full_visible_text, error_reason). On mid-stream failure, the
     partial buffer is returned so the caller can surface what we got rather
     than lose data.
+
+    `timeout` is a socket-operation timeout, so it cannot bound a stream that
+    trickles steadily. `deadline` (a time.monotonic() value) is checked between
+    SSE events, which stops a slow-but-alive stream from being consumed forever.
+    One already-started read can still overrun it.
     """
     req = urllib.request.Request(
         url,
@@ -1023,6 +1090,11 @@ def _stream_formatter(url: str, payload: bytes, provider: str,
             # Each event is "data: <json>\n\n" (sometimes "event: ...\n" first).
             # We work line-oriented; line could be bytes.
             for raw_line in resp:
+                if deadline is not None and time.monotonic() >= deadline:
+                    return (
+                        "".join(visible_buf),
+                        "stream exceeded the formatter time budget",
+                    )
                 line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
                 if not line:
                     continue
@@ -1093,7 +1165,7 @@ def format_rp(text: str, mode: int = 1, context: str = "",
     On skip/failure, formatted_text is the raw input and reason explains why.
     """
     provider = normalize_formatter_provider(provider)
-    healthy, _reason = probe_formatter(provider, timeout=2)
+    healthy, _reason = probe_formatter(provider)
     if not healthy:
         log.warning("%s formatter proxy not reachable — returning raw text", provider)
         return text, True, f"RP proxy offline ({provider} formatter not reachable)"
@@ -1179,8 +1251,18 @@ def format_rp(text: str, mode: int = 1, context: str = "",
     if not chain:
         return text, True, "RP formatter model is not selectable through OmniRoute"
     last_reason = "RP formatting failed"
+    # Retry bound across tiers. A per-tier timeout now skips to the next model,
+    # so without this a 3-tier chain could stack three full timeouts onto one
+    # interactive regenerate. This gates which tiers are attempted; it does not
+    # cap a single in-flight request.
+    deadline = time.monotonic() + config.FORMATTER_CHAIN_BUDGET_SECONDS
 
     for idx, model in enumerate(chain):
+        attempt_timeout = _attempt_timeout(deadline, config.FORMATTER_TIMEOUT_SECONDS)
+        if attempt_timeout <= 0:
+            log.warning("RP formatting chain budget exhausted before model '%s'", model)
+            last_reason = "RP formatting exhausted its time budget"
+            break
         payload_obj = formatter_payload(
             provider,
             system_prompt=system_prompt,
@@ -1210,23 +1292,40 @@ def format_rp(text: str, mode: int = 1, context: str = "",
 
             full_text, stream_err = _stream_formatter(
                 request_url, payload, provider, _emit,
-                timeout=config.FORMATTER_TIMEOUT_SECONDS,
+                timeout=attempt_timeout,
+                deadline=deadline,
             )
             full_text = strip_formatter_preamble(full_text)
+            if stream_err:
+                # Check the error BEFORE accepting text. A stream that timed out
+                # mid-answer leaves truncated prose in full_text; the old order
+                # recorded that as a clean success and blocked any fallback.
+                if not full_text:
+                    # Nothing visible reached the UI, so another tier is safe.
+                    if has_next and _is_chain_skippable_error(stream_err):
+                        log.warning("RP model '%s' skipped (%s) — trying next tier", model, stream_err)
+                        last_reason = f"RP streaming failed: {stream_err}"
+                        continue
+                    events.broadcast_event("dictation-token", {"requestId": request_id, "delta": "", "done": True})
+                    log.warning("RP streaming failed: %s", stream_err)
+                    return text, True, f"RP streaming failed: {stream_err}"
+                # Partial tokens already painted the client. Retrying another
+                # model would paint a second answer over the first, so keep the
+                # raw text canonical and report the truncation instead of
+                # passing a half-formatted line off as success.
+                events.broadcast_event("dictation-token", {"requestId": request_id, "delta": "", "done": True})
+                log.warning("RP streaming truncated on '%s': %s", model, stream_err)
+                return text, True, f"RP streaming truncated: {stream_err}"
             if full_text:
                 events.broadcast_event("dictation-token", {"requestId": request_id, "delta": "", "done": True})
                 record_model_attribution(provider, model, tier=idx)
                 return full_text, False, ""
-            # Skip to the next chain tier on a credential/routing error, but
-            # only if we have not already streamed visible tokens to the UI.
-            if stream_err and has_next and _is_chain_skippable_error(stream_err):
-                log.warning("RP model '%s' skipped (%s) — trying next tier", model, stream_err)
-                last_reason = f"RP streaming failed: {stream_err}"
+            # Clean stream that produced no visible text (thinking-only output).
+            # Advance like the non-streaming path does on an empty response.
+            if has_next:
+                last_reason = "RP proxy returned empty stream"
                 continue
             events.broadcast_event("dictation-token", {"requestId": request_id, "delta": "", "done": True})
-            if stream_err:
-                log.warning("RP streaming failed: %s", stream_err)
-                return text, True, f"RP streaming failed: {stream_err}"
             return text, True, "RP proxy returned empty stream"
 
         # Non-streaming path.
@@ -1237,7 +1336,7 @@ def format_rp(text: str, mode: int = 1, context: str = "",
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=config.FORMATTER_TIMEOUT_SECONDS) as resp:
+            with urllib.request.urlopen(req, timeout=attempt_timeout) as resp:
                 data = json.loads(resp.read())
             err_msg = formatter_error_text(data)
             if err_msg:
@@ -1540,6 +1639,19 @@ def resolve_mode(rp: int | None = None, mode_id: str | None = None) -> dict:
     if m is not None:
         return m
     return _normalize_mode({"id": target_id, "label": target_id, "pipeline": ["whisper"]})
+
+
+# Pipeline steps that actually call an LLM to rewrite the text. A mode without
+# one of these cannot reformat anything, so /reformat must say so instead of
+# returning the input unchanged as a success.
+FORMATTER_PIPELINE_STEPS = frozenset(
+    {"grammar_clean", "rp_format", "rp_enhance", "persona_pov"}
+)
+
+
+def mode_has_formatter_step(mode: dict) -> bool:
+    """True if `mode`'s pipeline contains a step that rewrites text via an LLM."""
+    return any(step in FORMATTER_PIPELINE_STEPS for step in mode.get("pipeline", []))
 
 
 def mode_public_view(mode: dict) -> dict:

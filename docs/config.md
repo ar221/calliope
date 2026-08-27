@@ -49,8 +49,24 @@ Current server flags:
 - `DICTATION_OPENAI_RP_MODEL` — OpenAI-compatible RP model.
 - `DICTATION_OPENAI_CLEAN_MODEL` — OpenAI-compatible cleanup/disfluency model.
 - `DICTATION_FORMATTER_TIMEOUT` — per-model formatter request timeout in seconds;
-  default `10`. This leaves enough room for full RP persona/scene prompts while
-  keeping failures bounded.
+  default `18`. Measured RP round-trips with a full persona/character/scene
+  prompt land at 3.5–5.6s, so the previous `10` clipped the slow tail. This is
+  a per-attempt budget, not the total: a timeout now advances the model chain.
+- `DICTATION_FORMATTER_CHAIN_BUDGET` — retry bound for the fallback chain, in
+  seconds; default `40`. Checked before each tier starts, and between SSE events
+  while streaming, so a timeout-skippable chain cannot stack a full per-attempt
+  timeout per tier. It is **not** a total wall-clock cap: `urlopen` timeouts are
+  per socket operation, so a response already in flight can outlive the
+  deadline, and a non-streaming body that keeps trickling has no total bound.
+- `DICTATION_FORMATTER_PROBE_TIMEOUT` — formatter liveness-probe timeout in
+  seconds; default `6`. The OpenAI-shape health endpoint is `/v1/models`, which
+  on OmniRoute rebuilds a ~2300-entry catalog: ~5ms warm but over 3s cold. The
+  old hard-coded 2s probe reported a healthy proxy as offline on the first
+  request after an idle period, and formatting was skipped entirely.
+- `DICTATION_FORMATTER_PROBE_TTL` / `DICTATION_FORMATTER_PROBE_FAIL_TTL` —
+  how long a successful / failed liveness verdict is cached, in seconds;
+  defaults `30` and `3`. Failures expire fast so recovery is not gated by the
+  success TTL.
 
 Every formatter response carries model attribution — which model in the
 active chain produced the text, and whether it was a fallback tier — surfaced

@@ -259,10 +259,40 @@ DISFLUENCY_CLEAN_MIN_WORDS = 12  # skip cleanup below this — LLM round-trip
                                   # is more disruptive than the disfluencies
                                   # it removes for quick-fire RP responses.
                                   # See ADR-9 / Agent 3 §10 recommendation 5.
-FORMATTER_TIMEOUT_SECONDS = float(os.environ.get("DICTATION_FORMATTER_TIMEOUT", "10"))
-# Modern OmniRoute models need room for Calliope's full persona/character/scene
-# prompt. Ten seconds remains a hard conversational bound without turning a
-# transiently slow formatter into the old 60-second freeze.
+# Per-attempt budget for one model in the chain. Modern OmniRoute reasoning
+# tiers need room for Calliope's full persona/character/scene prompt; measured
+# RP round-trips land at 3.5-5.6s, and a 10s cap was clipping the slow tail.
+# This is a per-attempt socket timeout, not a total.
+FORMATTER_TIMEOUT_SECONDS = float(os.environ.get("DICTATION_FORMATTER_TIMEOUT", "18"))
+
+# Retry bound for the fallback chain. Checked before starting each tier, and
+# between SSE events while streaming, so a timeout-skippable chain cannot stack
+# one full per-attempt timeout per tier.
+#
+# NOT a wall-clock cap. `urlopen` timeouts are per socket operation, so a
+# response already in flight can outlive the deadline, and a non-streaming body
+# that keeps trickling within the per-operation timeout has no total bound at
+# all. Bounding that would require deadline-aware incremental reads.
+FORMATTER_CHAIN_BUDGET_SECONDS = float(
+    os.environ.get("DICTATION_FORMATTER_CHAIN_BUDGET", "40")
+)
+
+# Formatter liveness probe. OmniRoute's only OpenAI-shape health endpoint is
+# /v1/models, which rebuilds a ~2300-entry catalog: measured >3s cold, ~5ms
+# warm. The old hard-coded 2s probe therefore declared a healthy proxy
+# "offline" on the first request after an idle period, and the formatter
+# returned raw unformatted text without trying a single model. Cache the
+# verdict so one cold catalog build cannot poison a dictation session.
+FORMATTER_PROBE_TIMEOUT_SECONDS = float(
+    os.environ.get("DICTATION_FORMATTER_PROBE_TIMEOUT", "6")
+)
+FORMATTER_PROBE_TTL_SECONDS = float(
+    os.environ.get("DICTATION_FORMATTER_PROBE_TTL", "30")
+)
+# Re-probe quickly after a failure so recovery is not gated by the success TTL.
+FORMATTER_PROBE_FAIL_TTL_SECONDS = float(
+    os.environ.get("DICTATION_FORMATTER_PROBE_FAIL_TTL", "3")
+)
 
 # Phase 2 — persistent whisper-server (ADR-1).
 # A user systemd unit `whisper-server.service` runs the long-lived

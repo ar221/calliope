@@ -138,3 +138,99 @@ def test_extension_slice_a_guards_context_and_text_safety():
     assert "event_types.CHAT_LOADED" in source
     assert "String(data?.mode || '') === String(modeId || '').trim()" in source
     assert "persistAddresseeChoice" not in source
+
+
+def test_phone_regen_uses_a_formatter_mode_and_reports_http_errors():
+    source = WEB_UI_SRC.read_text()
+
+    assert "function resolveRegenMode()" in source
+    assert source.count("const regenMode = resolveRegenMode();") == 2
+    assert "if (!resp.ok || data.error)" in source
+    assert "Regen failed (HTTP ${resp.status})" in source
+
+
+def test_phone_microphone_selector_uses_permissive_bluetooth_constraints():
+    source = WEB_UI_SRC.read_text()
+
+    assert 'id="microphoneSelect"' in source
+    assert "function recordingAudioConstraints()" in source
+    assert "sampleRate: 16000" not in source
+    assert "audio.deviceId = { exact: selectedMicrophoneId }" in source
+    assert "Silent input detected" in source
+    assert "if (!vadEnabled) return;" in source
+
+
+def test_failed_legacy_regen_does_not_delete_transcript_entry(tmp_path, monkeypatch):
+    mod = _load_server(tmp_path, monkeypatch)
+    original = [{"id": "keep", "role": "user", "text": "existing", "starred": True}]
+    sent = {}
+
+    class DummyHandler:
+        def read_json_body(self):
+            return {"text": "existing", "mode": "rp_enhance"}
+
+        def send_json(self, data, status=200):
+            sent.update(status=status, data=data)
+
+        def send_error_json(self, message, **kwargs):
+            raise AssertionError((message, kwargs))
+
+        def _build_chat_context(self, chat_source):
+            return ""
+
+    monkeypatch.setattr(
+        mod,
+        "run_pipeline",
+        lambda *args, **kwargs: ("existing", True, "formatter offline", "existing"),
+    )
+    mod.session_transcript[:] = list(original)
+    mod.DictationHandler._handle_reformat(DummyHandler(), {})
+
+    assert sent["data"]["formatting_skipped"] is True
+    assert mod.session_transcript == original
+
+
+def test_reformat_into_a_mode_without_a_formatter_step_reports_skipped(tmp_path, monkeypatch):
+    """'plain' has no LLM rewrite step, so a reformat into it must not claim success.
+
+    Previously the handler ran the pipeline, got the text back unchanged, and
+    replied formatting_skipped=False — so the client toasted a successful
+    reformat that never reached a model. An unknown mode id resolves to 'plain',
+    which made a typo look like a working regenerate.
+    """
+    mod = _load_server(tmp_path, monkeypatch)
+    sent = {}
+    ran = []
+
+    class DummyHandler:
+        def read_json_body(self):
+            return {"text": "some dictated line", "mode": "plain"}
+
+        def send_json(self, data, status=200):
+            sent.update(status=status, data=data)
+
+        def send_error_json(self, message, **kwargs):
+            raise AssertionError((message, kwargs))
+
+        def _build_chat_context(self, chat_source):
+            return ""
+
+    monkeypatch.setattr(
+        mod, "run_pipeline",
+        lambda *args, **kwargs: ran.append(1) or ("x", False, "", "x"),
+    )
+    mod.DictationHandler._handle_reformat(DummyHandler(), {})
+
+    assert ran == [], "no formatter step means the pipeline should not run"
+    assert sent["data"]["formatting_skipped"] is True
+    assert "no formatter step" in sent["data"]["formatting_reason"]
+    assert sent["data"]["text"] == "some dictated line"
+    assert sent["data"]["model"] == ""
+
+
+def test_mode_has_formatter_step_classifies_builtin_modes(tmp_path, monkeypatch):
+    mod = _load_server(tmp_path, monkeypatch)
+    for mode_id in ("grammar_clean", "rp_format", "rp_enhance", "persona_pov"):
+        assert mod.mode_has_formatter_step(mod.resolve_mode(mode_id=mode_id)) is True, mode_id
+    for mode_id in ("plain", "command"):
+        assert mod.mode_has_formatter_step(mod.resolve_mode(mode_id=mode_id)) is False, mode_id

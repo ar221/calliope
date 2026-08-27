@@ -325,11 +325,25 @@ Update phone bookmarks + ST extension settings to the new port.
 asterisks, no enhanced phrasing — even when you've selected
 `rp_enhance` mode.
 
-**Cause:** the LLM proxy at `localhost:42069` (`claude-code-proxy`) is
-not running, or is returning errors / empty responses, and the pipeline
-is falling back to the previous stage's output. The bounded formatter timeout
-(default 10 seconds via `DICTATION_FORMATTER_TIMEOUT`) gives up far faster than
-the old 60-second one, so this fails loudly now.
+**Cause:** the configured formatter proxy is not running, is returning errors /
+empty responses, or every model in the chain failed — so the pipeline falls back
+to the previous stage's output and reports `formatting_skipped` with a reason.
+Check `formatting_reason` first; it names the actual failure:
+
+- `RP proxy offline (... not reachable)` — the liveness probe failed. Probe
+  timeout is `DICTATION_FORMATTER_PROBE_TIMEOUT` (default 6s) and the verdict is
+  cached for `DICTATION_FORMATTER_PROBE_TTL` (default 30s). A cold OmniRoute
+  `/v1/models` catalog build can take over 3s, which is why the probe budget is
+  no longer 2s.
+- `RP formatting failed: timed out` — a model blew
+  `DICTATION_FORMATTER_TIMEOUT` (default 18s per attempt). Timeouts are
+  chain-skippable, so the next tier is tried automatically.
+- `RP formatting exhausted its time budget` — the chain's retry bound
+  (`DICTATION_FORMATTER_CHAIN_BUDGET`, default 40s) elapsed, so remaining tiers
+  were not attempted. This bounds retries, not a single in-flight request.
+- `mode '<id>' has no formatter step — nothing to reformat` — the mode has no
+  LLM rewrite step (`plain`, `command`), or an unknown mode id resolved to
+  `plain`. Pick a formatter mode such as `rp_format` or `rp_enhance`.
 
 **Fix:**
 
@@ -351,8 +365,10 @@ journalctl --user -u dictation-server -f
 # Trigger a transcribe; look for `formatter_request` log lines.
 # `formatter_request → 200` = good; `connection refused` / `timeout` = proxy down.
 
-# 5. Fallback: switch mode to `rp_format` (no LLM) or `plain` (no formatter at all)
-#    via the phone UI mode selector.
+# 5. Fallback while the proxy is down: switch mode to `plain` or `command` via
+#    the phone UI mode selector — those are the only modes with no LLM step.
+#    `rp_format` is a lighter formatter, but it still calls the LLM, so it
+#    fails the same way while the proxy is unreachable.
 ```
 
 Same drill for the OpenAI-shape proxy at `127.0.0.1:10531`, used for
