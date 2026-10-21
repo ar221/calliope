@@ -241,6 +241,18 @@ MAX_JSON_BODY_BYTES = int(os.environ.get(
     "DICTATION_MAX_JSON_BODY_BYTES", str(1 * 1024 * 1024)))     # 1 MB
 MAX_AUDIO_BODY_BYTES = int(os.environ.get(
     "DICTATION_MAX_AUDIO_BODY_BYTES", str(25 * 1024 * 1024)))   # 25 MB
+# Per-connection socket timeout for the HTTP server: bounds the TLS
+# handshake, request parsing and each body/response chunk so one stalled
+# client cannot pin a thread (or, before per-connection TLS, the accept loop).
+CONNECTION_TIMEOUT_SECONDS = float(os.environ.get("DICTATION_CONNECTION_TIMEOUT", "60"))
+
+
+def _env_flag(name: str) -> bool:
+    """True for 1/true/yes/on (case-insensitive); unset, empty, 0, false, no, off → False.
+
+    `bool(os.environ.get(...))` treated `=0` and `=false` as enabled."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
 
 # Phase 2 — Modes + Vocab persistence. YAML preferred, JSON fallback if PyYAML missing.
 _CONFIG_EXT = "yaml" if _HAVE_YAML else "json"
@@ -309,7 +321,7 @@ WHISPER_SERVER_URL = os.environ.get("WHISPER_SERVER_URL", "http://127.0.0.1:9001
 WHISPER_SERVER_HEALTH_TIMEOUT = 10.0  # seconds to wait for boot after `systemctl start`
 WHISPER_SERVER_REQUEST_TIMEOUT = 120.0  # match old whisper-cli timeout
 IDLE_SHUTDOWN_SECONDS = int(os.environ.get("WHISPER_IDLE_SHUTDOWN_SECONDS", "300"))
-IDLE_SHUTDOWN_DISABLED = bool(os.environ.get("WHISPER_IDLE_SHUTDOWN_DISABLED"))
+IDLE_SHUTDOWN_DISABLED = _env_flag("WHISPER_IDLE_SHUTDOWN_DISABLED")
 IDLE_SHUTDOWN_CHECK_INTERVAL = 60.0  # seconds between idle checks
 
 # ─── TTS — Kokoro-82M proxy (read-back UX) ───────────────
@@ -320,7 +332,7 @@ IDLE_SHUTDOWN_CHECK_INTERVAL = 60.0  # seconds between idle checks
 KOKORO_SERVER_URL = os.environ.get("KOKORO_SERVER_URL", "http://127.0.0.1:9002")
 KOKORO_DEFAULT_VOICE = os.environ.get("KOKORO_DEFAULT_VOICE", "af_heart")
 KOKORO_IDLE_SHUTDOWN_SECONDS = int(os.environ.get("KOKORO_IDLE_SHUTDOWN_SECONDS", "600"))
-KOKORO_IDLE_SHUTDOWN_DISABLED = bool(os.environ.get("KOKORO_IDLE_SHUTDOWN_DISABLED"))
+KOKORO_IDLE_SHUTDOWN_DISABLED = _env_flag("KOKORO_IDLE_SHUTDOWN_DISABLED")
 KOKORO_PROBE_TIMEOUT = 1.0
 KOKORO_BOOT_TIMEOUT = 10.0
 KOKORO_REQUEST_TIMEOUT = float(os.environ.get("KOKORO_REQUEST_TIMEOUT", "240"))

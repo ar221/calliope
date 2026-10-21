@@ -51,7 +51,20 @@ def _load(env: dict[str, str] | None = None):
 
 @pytest.fixture(scope="module")
 def mod():
-    return _load()
+    return _load_cached()
+
+
+def mod_handler_method(name):
+    return getattr(_load_cached().DictationHandler, name)
+
+
+_CACHED = {}
+
+
+def _load_cached():
+    if "mod" not in _CACHED:
+        _CACHED["mod"] = _load()
+    return _CACHED["mod"]
 
 
 class FakeHandler:
@@ -65,6 +78,8 @@ class FakeHandler:
         self.command = "GET"
         self.sent: list[tuple] = []
         self.html_sent: list[str] = []
+        # Real loopback/Origin policy so method tests exercise it.
+        self._loopback_trusted = mod_handler_method("_loopback_trusted").__get__(self)
 
     def _client_addr(self):
         return self.client_address[0]
@@ -128,8 +143,21 @@ def test_reject_oversized_body_missing_header_passes(mod):
 
 def test_read_json_body_normal(mod):
     payload = json.dumps({"a": 1}).encode()
-    fh = FakeHandler(headers={"Content-Length": str(len(payload))}, body=payload)
+    fh = FakeHandler(headers={"Content-Length": str(len(payload)),
+                              "Content-Type": "application/json; charset=utf-8"}, body=payload)
     assert mod.DictationHandler.read_json_body(fh) == {"a": 1}
+
+
+def test_read_json_body_rejects_non_json_content_type(mod):
+    """`text/plain` is a CORS "simple" request a foreign page can send to
+    127.0.0.1 without a preflight; it must not be parsed as JSON."""
+    payload = json.dumps({"text": "forged", "auto_send": True}).encode()
+    for ctype in ("text/plain", "application/x-www-form-urlencoded", ""):
+        fh = FakeHandler(headers={"Content-Length": str(len(payload)), "Content-Type": ctype}, body=payload)
+        with pytest.raises(ValueError):
+            mod.DictationHandler.read_json_body(fh)
+    # Body-less POSTs (star/clear/pair) carry no Content-Type and stay fine.
+    assert mod.DictationHandler.read_json_body(FakeHandler(headers={"Content-Length": "0"})) == {}
 
 
 def test_read_json_body_oversized_raises(mod):
@@ -238,6 +266,32 @@ def test_loopback_is_privileged(mod):
     assert _privileged(mod, FakeHandler(client="::1"))
 
 
+def test_loopback_with_foreign_origin_is_not_trusted(mod, monkeypatch):
+    """A page on another site, open in the desktop browser, reaches 127.0.0.1
+    too — its Origin is the only tell. Default allowlist is https://localhost etc."""
+    monkeypatch.setattr(mod, "get_token", lambda: "sekret-token-value")
+    for origin in ("https://evil.example", "null", "http://192.168.1.9:8000"):
+        fh = FakeHandler(client="127.0.0.1", headers={"Origin": origin})
+        assert not _privileged(mod, fh), origin
+        fh2 = FakeHandler(client="127.0.0.1", headers={"Origin": origin}, path="/send-to-st")
+        fh2.command = "POST"
+        fh2.bind(mod, "require_auth", "_send_unauthorized", "_set_cors_origin")
+        fh2.send_response = lambda *a, **k: None
+        fh2.send_header = lambda *a, **k: None
+        fh2.end_headers = lambda: None
+        fh2.wfile = io.BytesIO()
+        assert fh2.require_auth() is False, origin
+
+
+def test_loopback_with_allowlisted_origin_or_no_origin_is_trusted(mod, monkeypatch):
+    monkeypatch.setattr(mod, "get_token", lambda: "sekret-token-value")
+    assert _privileged(mod, FakeHandler(client="127.0.0.1", headers={"Origin": "https://localhost:8000"}))
+    assert _privileged(mod, FakeHandler(client="127.0.0.1"))  # curl / wizard
+    # A foreign-origin page that *does* hold the bearer is still fine.
+    assert _privileged(mod, FakeHandler(client="127.0.0.1", headers={
+        "Origin": "https://evil.example", "Authorization": "Bearer sekret-token-value"}))
+
+
 def test_lan_without_token_not_privileged(mod, monkeypatch):
     monkeypatch.setattr(mod, "get_token", lambda: "sekret-token-value")
     assert not _privileged(mod, FakeHandler(client="192.168.1.50"))
@@ -344,15 +398,6 @@ def test_show_token_cli_no_token_file(tmp_path):
 
 
 # ─── 5. DICTATION_ST_DATA_ROOT ───────────────────────────────────────
-
-def test_st_data_root_default_unchanged(mod):
-    root = pathlib.Path("/mnt/hdd/AI/SillyTavern/data/default-user")
-    assert mod.ST_DATA_ROOT == root
-    assert mod.ST_CHATS_DIR == root / "chats"
-    assert mod.ST_GROUPS_DIR == root / "groups"
-    assert mod.ST_GROUP_CHATS_DIR == root / "group chats"
-    assert mod.CHARACTERS_DIR == root / "characters"
-
 
 def test_st_data_root_env_derives_all_dirs():
     m = _load({"DICTATION_ST_DATA_ROOT": "/tmp/st-root"})

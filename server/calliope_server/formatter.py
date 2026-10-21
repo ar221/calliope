@@ -19,7 +19,9 @@ executable `calliope-server` script (Stage 4 split).
 import difflib
 import json
 import logging
+import os
 import re
+import tempfile
 import threading
 import time
 import urllib.request
@@ -1471,11 +1473,45 @@ def _parse_config(raw: bytes) -> list:
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
-    """Write bytes to path atomically via tmpfile + rename."""
+    """Write bytes to path atomically: unique tempfile + fsync + rename.
+
+    A fixed temp name let two concurrent writers (POST/DELETE /vocab, the
+    nightly learn-vocab run) truncate each other's half-written file.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_bytes(data)
-    tmp.replace(path)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+# Serialises read-modify-write cycles on the vocab file. Separate from
+# `vocab_lock` (which only guards the in-memory cache) because `load_vocab`
+# takes that one internally.
+_vocab_write_lock = threading.Lock()
+
+
+def update_vocab(mutate) -> list[dict]:
+    """Atomically read, transform and persist the vocab list.
+
+    `mutate(entries)` receives a copy of the current entries and returns the
+    new list. Returns the freshly loaded list after the write.
+    """
+    with _vocab_write_lock:
+        entries = [dict(e) for e in load_vocab()]
+        new_entries = mutate(entries)
+        _atomic_write(config.VOCAB_FILE, _serialize_config(new_entries))
+        _invalidate_vocab_cache()
+        return load_vocab()
 
 
 def _ensure_default_modes() -> None:

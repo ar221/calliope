@@ -422,9 +422,8 @@ def test_extension_ignores_dictation_transcript_text_preview():
     assert "const preview = 'speech'" in block
 
 
-def test_vocab_accept_path_persists_alias_only_without_repair_trace(monkeypatch, mod):
+def test_vocab_accept_path_persists_alias_only_without_repair_trace(monkeypatch, mod, tmp_path):
     sent = {}
-    writes = []
 
     class DummyHandler:
         def read_json_body(self):
@@ -437,12 +436,9 @@ def test_vocab_accept_path_persists_alias_only_without_repair_trace(monkeypatch,
         def send_error_json(self, message, **kwargs):  # pragma: no cover - failure path
             raise AssertionError((message, kwargs))
 
-    def fake_atomic_write(path, data):
-        writes.append((path, data))
-
-    monkeypatch.setattr(mod, "load_vocab", lambda: [])
-    monkeypatch.setattr(mod, "_atomic_write", fake_atomic_write)
-    monkeypatch.setattr(mod, "_invalidate_vocab_cache", lambda: None)
+    vocab_file = tmp_path / "vocab.yaml"
+    monkeypatch.setattr(mod.config, "VOCAB_FILE", vocab_file)
+    mod._invalidate_vocab_cache()
 
     mod.DictationHandler._handle_vocab_add(DummyHandler())
 
@@ -451,12 +447,14 @@ def test_vocab_accept_path_persists_alias_only_without_repair_trace(monkeypatch,
         "correct": "*Suzy steps closer.*",
         "aliases": ["um suzie steps closer"],
     }
-    assert len(writes) == 1
-    persisted = writes[0][1].decode("utf-8")
+    assert [e["correct"] for e in sent["data"]["vocab"]] == ["*Suzy steps closer.*"]
+    persisted = vocab_file.read_text(encoding="utf-8")
     assert "*Suzy steps closer.*" in persisted
     assert "um suzie steps closer" in persisted
     assert "repair_trace" not in persisted
     assert "in_ram_only" not in persisted
+    # Unique temp names: no leftover `.tmp` sibling after the rename.
+    assert [p.name for p in tmp_path.iterdir()] == ["vocab.yaml"]
 
 
 def test_rp_enhance_payload_includes_scene_continuity(monkeypatch, mod):

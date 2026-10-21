@@ -145,6 +145,7 @@ from calliope_server.config import (  # noqa: E402
     CHAT_CONTEXT_WINDOW,
     MAX_JSON_BODY_BYTES,
     MAX_AUDIO_BODY_BYTES,
+    CONNECTION_TIMEOUT_SECONDS,
     MODES_FILE,  # noqa: F401 — re-export for tests/back-compat
     VOCAB_FILE,
     CHAR_MODES_FILE,  # noqa: F401 — re-export for tests/back-compat
@@ -232,6 +233,8 @@ from calliope_server import tts  # noqa: E402, F401
 from calliope_server.tts import (  # noqa: E402
     _kokoro_probe,  # noqa: F401 — re-export for tests/back-compat
     _ensure_kokoro_alive,
+    _list_kokoro_voices,
+    validate_voices,
     _mark_tts_activity,
     _kokoro_idle_shutdown_loop,  # noqa: F401 — re-export for tests/back-compat
     _start_kokoro_idle_shutdown_thread,
@@ -338,7 +341,8 @@ from calliope_server.formatter import (  # noqa: E402
     resolve_formatter_model,  # noqa: F401 — re-export for tests
     _normalize_vocab_entry,
     load_vocab,
-    _invalidate_vocab_cache,
+    update_vocab,
+    _invalidate_vocab_cache,  # noqa: F401 — re-export for tests/back-compat
     _invalidate_modes_cache,  # noqa: F401 — re-export for tests/back-compat
     WHISPER_HALLUCINATIONS_EN,  # noqa: F401 — re-export for tests/back-compat
     SINGLE_TOKEN_DEGENERATES,  # noqa: F401 — re-export for tests/back-compat
@@ -869,6 +873,15 @@ def consume_pairing_code(code: str, *, now: float | None = None) -> tuple[str, s
     return str(entry["token"]), "ok"
 
 
+def _coerce_int(value, default: int, *, lo: int, hi: int) -> int:
+    """Client-supplied integer, clamped to [lo, hi]; junk → default."""
+    try:
+        n = int(value) if value is not None else default
+    except (TypeError, ValueError):
+        n = default
+    return min(max(n, lo), hi)
+
+
 def clamp_request_context(text: str) -> str:
     """Bound client-supplied chat context, keeping the most recent tail."""
     text = str(text or "")
@@ -961,9 +974,58 @@ def _is_icon_path(path: str) -> bool:
     return path.startswith("/icon-") and path.endswith(".png")
 
 
+class _TLSThreadingHTTPServer(http.server.ThreadingHTTPServer):
+    """ThreadingHTTPServer that wraps each accepted socket in TLS *without*
+    handshaking on the accept thread.
+
+    `ssl_context.wrap_socket(listening_socket)` makes `accept()` perform the
+    handshake inline, so one client that connects and sends nothing blocks
+    every other connection. Here the accepted socket is wrapped with
+    `do_handshake_on_connect=False`; the handler finishes the handshake in
+    its own thread under a socket timeout (`DictationHandler.setup`).
+    """
+    ssl_context: "ssl.SSLContext | None" = None
+    daemon_threads = True
+
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        if self.ssl_context is not None:
+            sock = self.ssl_context.wrap_socket(
+                sock, server_side=True, do_handshake_on_connect=False,
+            )
+        return sock, addr
+
+
 class DictationHandler(http.server.BaseHTTPRequestHandler):
+    # Per-connection socket timeout. Bounds the TLS handshake, request-line
+    # and header reads, and each body/response chunk; SSE keepalives and
+    # audio uploads complete well inside it.
+    timeout = CONNECTION_TIMEOUT_SECONDS
+
+    def setup(self):
+        super().setup()  # applies `timeout` to the connection
+        self._tls_failed = False
+        if isinstance(self.request, ssl.SSLSocket):
+            try:
+                self.request.do_handshake()
+            except (ssl.SSLError, OSError) as e:
+                # Port scanners, plain-HTTP probes and browsers that gave up
+                # all land here; not worth more than a debug line.
+                log.debug("TLS handshake failed from %s: %s", self.client_address, e)
+                self._tls_failed = True
+
+    def handle(self):
+        if self._tls_failed:
+            return
+        super().handle()
+
     def log_message(self, fmt, *args):
         log.info(_redact_sensitive_url_params(fmt % args))
+
+    def log_error(self, fmt, *args):
+        # Idle keep-alive sockets hit the connection timeout routinely and
+        # 404s from probes are noise; neither belongs in the INFO journal.
+        log.debug(_redact_sensitive_url_params(fmt % args))
 
     def handle_one_request(self):
         """Override to demote the benign mobile-browser TLS EOF spam.
@@ -1020,6 +1082,22 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
 
+    def _loopback_trusted(self) -> bool:
+        """Loopback bypass, denied to browser requests from foreign origins.
+
+        A page on any site open in the desktop browser can reach 127.0.0.1
+        too, and the browser attaches its `Origin`. Local tools (curl, the
+        wizard) send no Origin. So: loopback without Origin, or with an
+        allowlisted one, is trusted; loopback with a non-allowlisted Origin
+        (including `null`) must authenticate like a remote client.
+        """
+        if not _is_loopback_address(self._client_addr()):
+            return False
+        origin = self.headers.get("Origin", "")
+        if origin and not _origin_allowed(origin):
+            return False
+        return True
+
     def _request_is_privileged(self) -> bool:
         """Loopback client OR request carrying a valid bearer/query token.
 
@@ -1027,7 +1105,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         `/health`): they stay reachable for the pairing bootstrap, but
         non-loopback callers without the token only get minimal responses.
         """
-        if _is_loopback_address(self._client_addr()):
+        if self._loopback_trusted():
             return True
         tok = get_token()
         auth = self.headers.get("Authorization", "")
@@ -1056,8 +1134,8 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         Returns True if the request may proceed; on False the handler must
         stop (response already sent).
         """
-        # Loopback bypass
-        if _is_loopback_address(self._client_addr()):
+        # Loopback bypass (refused for browser requests from foreign origins)
+        if self._loopback_trusted():
             return True
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
@@ -1367,7 +1445,18 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             return {}
         if content_length > MAX_JSON_BODY_BYTES:
             raise ValueError("JSON body exceeds MAX_JSON_BODY_BYTES")
-        return json.loads(self.rfile.read(content_length))
+        # A browser may send `text/plain` cross-site without a CORS preflight;
+        # insisting on application/json makes every JSON write a preflighted
+        # request that the Origin allowlist can refuse.
+        ctype = (self.headers.get("Content-Type", "") or "").split(";", 1)[0].strip().lower()
+        if ctype != "application/json":
+            raise ValueError("Content-Type must be application/json")
+        parsed = json.loads(self.rfile.read(content_length))
+        # Every handler indexes the body as a mapping; a list/scalar used to
+        # escape as an uncaught AttributeError (connection dropped, traceback).
+        if not isinstance(parsed, dict):
+            raise ValueError("JSON body must be an object")
+        return parsed
 
     def send_error_json(self, error: str, code: str = "error", status: int = 400,
                         retry_ok: bool = False, details: dict | None = None):
@@ -1465,19 +1554,21 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             # Optional ?chat=<id> filter scopes the session log to a single chat.
             # Empty filter returns everything (legacy behavior).
             chat_filter = query.get("chat", [""])[0]
+            # Snapshot under the lock, write after releasing it: a slow client
+            # must not stall every transcribe/reformat append.
             with transcript_lock:
+                total = len(session_transcript)
                 if chat_filter:
-                    filtered = [
-                        e for e in session_transcript
+                    entries = [
+                        dict(e) for e in session_transcript
                         if e.get("chat_id", "") == chat_filter
                     ]
-                    self.send_json({
-                        "transcript": filtered,
-                        "total": len(session_transcript),
-                        "chat": chat_filter,
-                    })
                 else:
-                    self.send_json({"transcript": list(session_transcript)})
+                    entries = [dict(e) for e in session_transcript]
+            if chat_filter:
+                self.send_json({"transcript": entries, "total": total, "chat": chat_filter})
+            else:
+                self.send_json({"transcript": entries})
         elif path == "/transcript/export.md":
             self._handle_transcript_export()
         elif path == "/personas":
@@ -1545,7 +1636,14 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             chat_name = qs.get("name", [""])[0]
             chat_type = qs.get("type", ["individual"])[0]
-            last_n = int(qs.get("last", [str(CHAT_CONTEXT_WINDOW)])[0])
+            try:
+                last_n = int(qs.get("last", [str(CHAT_CONTEXT_WINDOW)])[0])
+            except (TypeError, ValueError):
+                self.send_error_json("'last' must be an integer", code="bad_input", status=400)
+                return
+            # Bounded: a huge value reads the whole chat file into the
+            # response; a negative one slices from the wrong end.
+            last_n = min(max(last_n, 1), 200)
             if not chat_name:
                 self.send_error_json("Missing 'name' parameter", code="missing_param", status=400)
             else:
@@ -1666,21 +1764,25 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 self.send_error_json("Missing vocab 'correct' value in path",
                                      code="missing_param", status=400)
                 return
-            entries = load_vocab()
-            remaining = [e for e in entries if e.get("correct") != target]
-            if len(remaining) == len(entries):
-                self.send_error_json(f"No vocab entry found for '{target}'",
-                                     code="not_found", status=404)
-                return
+            removed = {"hit": False}
+
+            def _drop(entries):
+                remaining = [e for e in entries if e.get("correct") != target]
+                removed["hit"] = len(remaining) != len(entries)
+                return remaining
+
             try:
-                _atomic_write(VOCAB_FILE, _serialize_config(remaining))
+                vocab = update_vocab(_drop)
             except Exception as e:
                 log.exception("Failed to write vocab")
                 self.send_error_json(f"Failed to persist vocab: {e}",
                                      code="write_failed", status=500, retry_ok=True)
                 return
-            _invalidate_vocab_cache()
-            self.send_json({"vocab": load_vocab(), "removed": target})
+            if not removed["hit"]:
+                self.send_error_json(f"No vocab entry found for '{target}'",
+                                     code="not_found", status=404)
+                return
+            self.send_json({"vocab": vocab, "removed": target})
         else:
             self.send_response(404)
             self.end_headers()
@@ -1805,7 +1907,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 "formatting_reason": str(body.get("formatting_reason", "")),
                 "model": str(body.get("model", "")),
                 "model_fallback": bool(body.get("model_fallback", False)),
-                "model_tier": int(body.get("model_tier", 0) or 0),
+                "model_tier": _coerce_int(body.get("model_tier"), 0, lo=0, hi=99),
                 "is_ooc": bool(body.get("is_ooc", False)),
                 "mode_override": "ooc" if body.get("is_ooc") else "",
                 "auto_send": bool(body.get("auto_send", False)),
@@ -1906,14 +2008,18 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 self.send_error_json("Missing entry id in path",
                                      code="missing_param", status=400)
                 return
+            toggled = None
             with transcript_lock:
                 for e in session_transcript:
                     if e.get("id") == entry_id:
                         e["starred"] = not bool(e.get("starred", False))
-                        self.send_json({"entry_id": entry_id, "starred": e["starred"]})
-                        return
-            self.send_error_json(f"No transcript entry with id '{entry_id}'",
-                                 code="entry_not_found", status=404, retry_ok=False)
+                        toggled = e["starred"]
+                        break
+            if toggled is None:
+                self.send_error_json(f"No transcript entry with id '{entry_id}'",
+                                     code="entry_not_found", status=404, retry_ok=False)
+                return
+            self.send_json({"entry_id": entry_id, "starred": toggled})
         elif path == "/tts":
             self._handle_tts()
         elif path == "/tts/audiobook":
@@ -1976,19 +2082,19 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_tts_voices(self) -> None:
         """GET /tts/voices — proxy kokoro-server's voices list with a 60s TTL cache."""
-        if not _ensure_kokoro_alive():
-            self.send_error_json(
-                "kokoro-server unreachable",
-                code="tts_unavailable", status=503, retry_ok=True,
-            )
-            return
         try:
-            payload = _fetch_kokoro_voices()
+            payload = _list_kokoro_voices()
         except RuntimeError as e:
             log.warning("/tts/voices upstream failed: %s", e)
             self.send_error_json(
                 f"Voice list unavailable: {e}",
                 code="tts_failed", status=502, retry_ok=True,
+            )
+            return
+        if payload is None:
+            self.send_error_json(
+                "kokoro-server unreachable",
+                code="tts_unavailable", status=503, retry_ok=True,
             )
             return
         self.send_json(payload)
@@ -2013,6 +2119,18 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             self.send_error_json(
                 "kokoro-server unreachable",
                 code="tts_unavailable", status=503, retry_ok=True,
+            )
+            return
+
+        # K7: reject unknown voice IDs before synthesizing anything, instead
+        # of failing on message N after N-1 segments of wasted synthesis.
+        wanted = {_voice_for_audiobook_message(m, narrator_voice, voice_map) for m in messages}
+        missing = validate_voices(wanted)
+        if missing:
+            self.send_error_json(
+                f"Unknown voice(s): {', '.join(missing)}",
+                code="bad_voice", status=400,
+                details={"unknown_voices": missing},
             )
             return
 
@@ -2072,7 +2190,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         existing = body.get("existing_voices")
         existing = existing if isinstance(existing, dict) else {}
         narrator = str(body.get("narrator") or "")
-        n = min(max(int(body.get("n") or 3), 1), 10)
+        n = _coerce_int(body.get("n"), 3, lo=1, hi=10)
         suggestions = _suggest_voices(name, description, personality, recent, existing, narrator, n)
         self.send_json({"suggestions": suggestions})
 
@@ -2127,19 +2245,16 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                                  code="missing_param", status=400)
             return
 
-        existing = load_vocab()
-        # Dedupe by `correct`
-        existing = [e for e in existing if e.get("correct") != norm["correct"]]
-        existing.append(norm)
         try:
-            _atomic_write(VOCAB_FILE, _serialize_config(existing))
+            vocab = update_vocab(
+                lambda entries: [e for e in entries if e.get("correct") != norm["correct"]] + [norm]
+            )
         except Exception as e:
             log.exception("Failed to write vocab")
             self.send_error_json(f"Failed to persist vocab: {e}",
                                  code="write_failed", status=500, retry_ok=True)
             return
-        _invalidate_vocab_cache()
-        self.send_json({"vocab": load_vocab(), "added": norm})
+        self.send_json({"vocab": vocab, "added": norm})
 
     def _build_chat_context(self, chat_source: str) -> str:
         """Build context string from ST chat history."""
@@ -2256,25 +2371,18 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         else:
             entry_id = None
 
-        target_index: int | None = None
         if persist_transcript and entry_id is not None:
             with transcript_lock:
-                for i, e in enumerate(session_transcript):
-                    if e.get("id") == entry_id:
-                        if e.get("role") != "user":
-                            self.send_error_json(
-                                "Entry not found or not a user entry",
-                                code="entry_not_found", status=404, retry_ok=False,
-                            )
-                            return
-                        target_index = i
-                        break
-                if target_index is None:
-                    self.send_error_json(
-                        "Entry not found or not a user entry",
-                        code="entry_not_found", status=404, retry_ok=False,
-                    )
-                    return
+                target_ok = any(
+                    e.get("id") == entry_id and e.get("role") == "user"
+                    for e in session_transcript
+                )
+            if not target_ok:
+                self.send_error_json(
+                    "Entry not found or not a user entry",
+                    code="entry_not_found", status=404, retry_ok=False,
+                )
+                return
 
         # Run pipeline (I/O; don't hold the lock).
         formatted, formatting_skipped, formatting_reason, cleaned_text = run_pipeline(
@@ -2296,9 +2404,17 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         chat_id_tag = ""
         with transcript_lock:
             if persist_transcript and is_enhancement and not formatting_skipped:
-                if target_index is not None and target_index < len(session_transcript):
+                # Re-resolve by id: the lock was released for the LLM call and
+                # a concurrent delete/append may have shifted indices since.
+                existing = None
+                if entry_id is not None:
+                    existing = next(
+                        (e for e in session_transcript
+                         if e.get("id") == entry_id and e.get("role") == "user"),
+                        None,
+                    )
+                if existing is not None:
                     # In-place replacement: keep id + starred, update text + timestamp.
-                    existing = session_transcript[target_index]
                     existing["text"] = formatted
                     existing["timestamp"] = datetime.now().isoformat()
                     # starred is preserved implicitly (dict mutation)
@@ -2505,6 +2621,9 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             timing["whisper"] = time.monotonic()
 
             if not raw_text:
+                # Terminal state first: `transcribing` was already broadcast
+                # and the extension's state bar otherwise sticks there.
+                self._emit_dictation_state(request_id, "done", no_speech=True)
                 self.send_error_json("No speech detected", code="no_speech",
                                      status=200, retry_ok=True)
                 return
@@ -2515,6 +2634,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             raw_text, mode, is_ooc = resolve_ooc_override(raw_text, mode)
             if is_ooc:
                 if not raw_text:
+                    self._emit_dictation_state(request_id, "done", no_speech=True)
                     self.send_error_json("No speech detected", code="no_speech",
                                          status=200, retry_ok=True)
                     return
@@ -3066,8 +3186,7 @@ def main():
     # _mark_tts_activity). Safe to start before kokoro-server is running.
     _start_kokoro_idle_shutdown_thread()
 
-    server = http.server.ThreadingHTTPServer((args.host, args.port), DictationHandler)
-    server.daemon_threads = True
+    server = _TLSThreadingHTTPServer((args.host, args.port), DictationHandler)
 
     if not args.no_ssl:
         ensure_ssl_cert()
@@ -3084,7 +3203,7 @@ def main():
                 log.warning(f"Could not persist cert fingerprint: {e}")
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(str(CERT_FILE), str(KEY_FILE))
-        server.socket = ctx.wrap_socket(server.socket, server_side=True)
+        server.ssl_context = ctx
         # Register the live context so the in-run renewal thread can hot-reload
         # a regenerated cert without a restart, then start that thread.
         global _ssl_context
