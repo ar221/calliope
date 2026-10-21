@@ -28,8 +28,9 @@ Environment=DICTATION_OMNIROUTE_CLEAN_CHAIN=codex/gpt-5.6-sol-low,claude/claude-
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.local/share/dictation-server %h/.local/share/whisper /tmp
-ReadOnlyPaths=/mnt/hdd/AI/SillyTavern/data %h/STWork/personas %h/STWork/rules
+# /tmp is already private (PrivateTmp=yes); whisper models are read-only.
+ReadWritePaths=%h/.local/share/dictation-server
+ReadOnlyPaths=%h/.local/share/whisper /mnt/hdd/AI/SillyTavern/data %h/STWork/personas %h/STWork/rules
 PrivateTmp=yes
 PrivateDevices=no
 DeviceAllow=/dev/kfd rw
@@ -40,10 +41,11 @@ MemoryDenyWriteExecute=no
 RestrictNamespaces=yes
 RestrictRealtime=yes
 SystemCallArchitectures=native
-# LogLevelMax filters journal verbosity per-unit (warning = warn+err+crit).
-# The roadmap (ADR-14) calls this "LogLevel=warning" — that key is [Manager]-only,
-# the per-unit equivalent is LogLevelMax.
-LogLevelMax=warning
+# LogLevelMax filters journal verbosity per-unit. info keeps the access log and
+# the per-request `timing` trace (`journalctl --user -u dictation-server | grep
+# timing`); debug lines are still dropped. ADR-14's "LogLevel=warning" was
+# relaxed because warning hid both.
+LogLevelMax=info
 
 [Install]
 WantedBy=default.target

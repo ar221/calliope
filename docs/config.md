@@ -6,7 +6,7 @@ Calliope is configured through three surfaces:
 2. Environment variables, usually via `~/.config/systemd/user/dictation-server.service.d/*.conf`.
 3. Runtime data under `~/.local/share/dictation-server/`.
 
-Secrets are never safe to paste into issues or screenshots. Redact bearer tokens and URLs containing `?token=`.
+Secrets are never safe to paste into issues or screenshots. Redact bearer tokens and pairing URLs (`?pair=` codes are one-use, but an unused one still hands out the bearer).
 
 ## CLI flags
 
@@ -20,7 +20,7 @@ Current server flags:
 - `--rotate-token` — rotate the bearer token and exit; prints the token path and live-rotation next steps, not the token value.
 - `--show-token` — print the current bearer token from the token file to stdout and exit.
 - `--force` — force wizard/setup regeneration paths where supported.
-- `--install-systemd` / `--no-install-systemd` — opt into/out of user-unit installation.
+- `--install-systemd` / `--no-install-systemd` — opt into/out of user-unit installation. The wizard copies the repo's `systemd/dictation-server.service`, `whisper-server.service` and `kokoro-server.service` into `~/.config/systemd/user/` (from the checkout, or from the copies `scripts/install-server` stages in `~/.local/share/dictation-server/units/`) and enables only `dictation-server`. Whisper and Kokoro have no `[Install]` section: dictation-server starts them on demand and stops them when idle, so they do not hold VRAM/RAM from login. If an older install enabled them, run `systemctl --user disable whisper-server kokoro-server` once.
 - `--skip-stage-N` — setup self-test escape hatch for known-bad local stages.
 
 ## Server environment
@@ -176,11 +176,12 @@ Under `~/.local/share/dictation-server/` by default. Set `CALLIOPE_DATA_DIR` for
 - `modes.yaml` — pipeline mode definitions.
 - `char-modes.yaml` — remembered mode choices.
 - voice macro/profile files as created by the TTS/profile UI.
-- `calliope_server/` + `voice_catalog.json` — installed by `scripts/install-server`; the wrapper searches for the package next to itself first, then here.
+- `calliope_server/` + `voice_catalog.json` — installed by `scripts/install-server`; the wrapper searches for the package next to itself first, then here. The installer syncs these before it replaces the wrapper.
+- `units/` — repo systemd units staged by `scripts/install-server` for `dictation-server --setup`; not a systemd load path.
 
 ## Pairing and state freshness
 
 - The ST extension stores the bearer token in `extension_settings.dictation-bridge.serverToken`.
-- The phone page receives a one-time `?token=` URL from the ST mic button, stores it in session storage, then scrubs it from the visible URL.
+- The phone page is opened with a one-time `?pair=<code>` URL, minted by the ST extension (**Re-pair this phone** / **Show local QR** / **Copy pairing URL**) or by `dictation-server --setup` stage 6 via authenticated `POST /pair/bootstrap`. The code expires after 120 seconds and works once: the page exchanges it at `POST /pair/exchange` for the bearer, keeps that in session storage, and scrubs the code from the visible URL. The bearer never appears in a URL or QR code.
 - `/health` only proves the server is reachable. `/state` with bearer auth proves the token is valid.
 - ST bridge state is fresh for about 60 seconds, stale by 120 seconds, and dead after that. If the phone says stale/not paired, reopen it from the current ST chat rather than reusing an old bookmark.

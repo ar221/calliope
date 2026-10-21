@@ -79,20 +79,21 @@ The TTS install lives at `~/.local/share/calliope-tts/`:
    chmod +x ~/.local/share/calliope-tts/kokoro-server.py
    ```
 
-4. **Install + enable the systemd unit:**
+4. **Install the systemd unit:**
 
    ```sh
    mkdir -p ~/.config/systemd/user
    cp systemd/kokoro-server.service ~/.config/systemd/user/
    systemctl --user daemon-reload
-   systemctl --user enable kokoro-server.service   # optional — Calliope starts it on demand
    ```
 
-   Note: `enable` is optional. Calliope's dictation-server runs
-   `systemctl --user start kokoro-server` on the first `/tts` request
-   and `systemctl --user stop kokoro-server` after
-   `KOKORO_IDLE_SHUTDOWN_SECONDS` of inactivity (default 600s). If
-   you keep many other services warm, leaving `enable` off is fine.
+   `dictation-server --setup` installs this unit too. There is nothing to
+   `enable`: the unit has no `[Install]` section on purpose. Calliope's
+   dictation-server runs `systemctl --user start kokoro-server` on the first
+   `/tts` request and `systemctl --user stop kokoro-server` after
+   `KOKORO_IDLE_SHUTDOWN_SECONDS` of inactivity (default 600s), so Kokoro
+   does not hold RAM from login. If an older unit was enabled, run
+   `systemctl --user disable kokoro-server` once.
 
 ## Verification
 

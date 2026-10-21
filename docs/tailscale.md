@@ -141,8 +141,9 @@ On the phone:
 1. Install the Tailscale app, sign in to the same tailnet.
 2. In the phone browser, visit `https://apollo-pc.tail-scale.ts.net:8384`
    — replacing the hostname with your own.
-3. **No cert warning.** The page loads, you log in with the bearer token
-   (auto-filled if you scanned the wizard QR), bookmark, install as PWA.
+3. **No cert warning.** The page loads. Pair it with a fresh one-time
+   `?pair=` URL from the ST extension's **Copy pairing URL** (swap in the
+   tailnet hostname if the extension points elsewhere), bookmark, install as PWA.
 
 The phone will reach Calliope over the tailnet from any network — coffee
 shop WiFi, cellular, friend's network — provided the phone is signed in
@@ -200,6 +201,6 @@ mobile data plan + your phone, no Funnel.
   the tailnet (`tailscale status` on the phone). Some Android VPN apps
   conflict — disable other VPNs while testing.
 - **Bearer token rejected after switching:** the token is independent of
-  the cert. Re-fetch the token from the wizard QR or
-  `cat ~/.local/share/dictation-server/token` and paste it into the
+  the cert. Re-pair with a fresh one-time `?pair=` URL from the ST extension,
+  or `cat ~/.local/share/dictation-server/token` and paste it into the
   phone PWA settings.

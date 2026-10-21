@@ -7,6 +7,7 @@ read through `calliope_server.config` at call time.
 """
 
 import difflib
+import hashlib
 import json
 import logging
 import os
@@ -45,102 +46,25 @@ class WizardDeps(NamedTuple):
 # through the audited urlopen → /audit/network ring buffer records it.
 
 WIZARD_MODELS = [
-    # (id, vram_min_mb, file_size_mb, label)
-    # vram_min_mb=0 sentinels CPU fallback.
-    ("large-v3-turbo", 8000, 1624, "fastest GPU path, default"),
-    ("distil-large-v3", 4000, 756, "good quality, ~700MB"),
-    ("base.en", 2000, 142, "basic, ~150MB"),
-    ("tiny.en",       0, 75,  "CPU fallback, ~75MB"),
+    # (id, vram_min_mb, file_size_mb, label, sha256)
+    # vram_min_mb=0 sentinels CPU fallback. sha256=None means no pinned hash
+    # is known for that file yet, so only the ±10% size check applies.
+    ("large-v3-turbo", 8000, 1624, "fastest GPU path, default",
+     "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"),
+    ("distil-large-v3", 4000, 756, "good quality, ~700MB", None),
+    ("base.en", 2000, 142, "basic, ~150MB", None),
+    ("tiny.en",       0, 75,  "CPU fallback, ~75MB", None),
 ]
 WIZARD_MODEL_BASE_URL = "https://huggingface.co/ggml-org/whisper.cpp/resolve/main"
 WIZARD_HEALTH_TIMEOUT_S = 30
-WIZARD_PAIR_TIMEOUT_S = 30
 WIZARD_GROUND_TRUTH = "the quick brown fox jumps over the lazy dog"
 
-WIZARD_DICTATION_UNIT_PATH = Path.home() / ".config/systemd/user/dictation-server.service"
-WIZARD_WHISPER_UNIT_PATH = Path.home() / ".config/systemd/user/whisper-server.service"
-
-# Inline templates — used when the dotfiles repo unit isn't reachable.
-# Mirror systemd/user/{dictation-server,whisper-server}.service in this repo.
-WIZARD_DICTATION_UNIT_TEMPLATE = """\
-[Unit]
-Description=Remote dictation server (whisper.cpp over HTTPS)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=%h/.local/bin/dictation-server
-Restart=on-failure
-RestartSec=5
-Environment=WHISPER_BIN=whisper-cli
-
-# Sandboxing per ADR-14 (Calliope roadmap, Phase 1).
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=%h/.local/share/dictation-server %h/.local/share/whisper /tmp
-PrivateTmp=yes
-PrivateDevices=no
-DeviceAllow=/dev/kfd rw
-DeviceAllow=/dev/dri rw
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-LockPersonality=yes
-MemoryDenyWriteExecute=no
-RestrictNamespaces=yes
-RestrictRealtime=yes
-SystemCallArchitectures=native
-LogLevelMax=warning
-
-[Install]
-WantedBy=default.target
-"""
-
-WIZARD_WHISPER_UNIT_TEMPLATE = """\
-[Unit]
-Description=Whisper.cpp HTTP server for Calliope dictation
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=%h/.local/bin/whisper-server \\
-    --host 127.0.0.1 \\
-    --port 9001 \\
-    --model %h/.local/share/whisper/ggml-large-v3-turbo.bin \\
-    --threads 8 \\
-    --processors 1 \\
-    --no-timestamps \\
-    --suppress-nst \\
-    --no-speech-thold 0.80 \\
-    --logprob-thold -0.7 \\
-    --entropy-thold 2.4 \\
-    --temperature 0.0 \\
-    --beam-size 5 \\
-    --best-of 5 \\
-    --flash-attn
-Restart=on-failure
-RestartSec=5
-
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=%h/.local/share/whisper /tmp
-PrivateTmp=yes
-PrivateDevices=no
-DeviceAllow=/dev/kfd rw
-DeviceAllow=/dev/dri rw
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-LockPersonality=yes
-MemoryDenyWriteExecute=no
-RestrictNamespaces=yes
-RestrictRealtime=yes
-SystemCallArchitectures=native
-LogLevelMax=warning
-
-[Install]
-WantedBy=default.target
-"""
+WIZARD_UNIT_DIR = Path.home() / ".config/systemd/user"
+# Units the wizard installs. Only dictation-server is enabled; whisper-server
+# and kokoro-server have no [Install] section because dictation-server starts
+# them on demand and stops them when idle.
+WIZARD_UNITS = ("dictation-server.service", "whisper-server.service",
+                "kokoro-server.service")
 
 
 def _wizard_say(stage: int, label: str, msg: str = "") -> None:
@@ -234,7 +158,7 @@ def _wizard_detect_gpu_vram_mb() -> tuple[str, int]:
 
 def _wizard_recommend_model(vram_mb: int) -> tuple[str, str]:
     """Pick the largest model that fits. Returns (model_id, label)."""
-    for model_id, vram_min, _size, label in WIZARD_MODELS:
+    for model_id, vram_min, _size, label, _sha in WIZARD_MODELS:
         if vram_mb >= vram_min:
             return (model_id, label)
     return (WIZARD_MODELS[-1][0], WIZARD_MODELS[-1][3])
@@ -274,7 +198,7 @@ def _wizard_stage_1(args) -> dict:
         _wizard_warn(f"VRAM <2GB — falling back to {rec_model}; CPU mode is "
                      "your real-world floor.")
     print("  Available models:")
-    for mid, vmin, size, label in WIZARD_MODELS:
+    for mid, vmin, size, label, _sha in WIZARD_MODELS:
         marker = " ← recommended" if mid == rec_model else ""
         print(f"    {mid:20s}  {size} MB  ({label}){marker}")
     chosen_model = _wizard_prompt(
@@ -318,28 +242,44 @@ def _wizard_stage_1(args) -> dict:
 
 
 # ----- Stage 2: pull model -------------------------------------------
+def _wizard_sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for buf in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(buf)
+    return h.hexdigest()
+
+
 def _wizard_stage_2(args, state: dict) -> None:
-    """Download whisper model. No-op if already cached at expected size."""
+    """Download whisper model. No-op if already cached and verified."""
     _wizard_say(2, "pull model")
     model = state["model_id"]
     target = config.MODEL_DIR / f"ggml-{model}.bin"
 
-    expected_mb = next(
-        (size for mid, _, size, _ in WIZARD_MODELS if mid == model), 0
+    expected_mb, expected_sha = next(
+        ((size, sha) for mid, _, size, _, sha in WIZARD_MODELS if mid == model),
+        (0, None),
     )
 
     if target.exists() and not args.force:
         actual_mb = target.stat().st_size // (1024 * 1024)
-        # Tolerate ±10% — HF mirror sizes drift slightly on re-encodes.
-        if expected_mb == 0 or abs(actual_mb - expected_mb) <= max(20, expected_mb // 10):
-            _wizard_skip(2, f"{target} already present ({actual_mb} MB)")
+        if expected_sha:
+            if _wizard_sha256_file(target) == expected_sha:
+                _wizard_skip(2, f"{target} already present (SHA-256 verified)")
+                return
+            _wizard_warn(f"{target} SHA-256 does not match the pinned hash; re-fetching")
+        # No pinned hash: tolerate ±10% — HF mirror sizes drift slightly on re-encodes.
+        elif expected_mb == 0 or abs(actual_mb - expected_mb) <= max(20, expected_mb // 10):
+            _wizard_skip(2, f"{target} already present ({actual_mb} MB, size check only)")
             return
-        _wizard_warn(f"{target} exists but size {actual_mb} MB differs from "
-                     f"expected ~{expected_mb} MB; re-fetching")
+        else:
+            _wizard_warn(f"{target} exists but size {actual_mb} MB differs from "
+                         f"expected ~{expected_mb} MB; re-fetching")
 
     url = f"{WIZARD_MODEL_BASE_URL}/ggml-{model}.bin"
     print(f"  URL:   {url}")
     print(f"  Size:  ~{expected_mb} MB")
+    print(f"  SHA-256: {expected_sha or '(not pinned; size check only)'}")
     print(f"  Dest:  {target}")
     if not _wizard_confirm("  Download now?", default_yes=True):
         _wizard_skip(2, "user declined download")
@@ -351,6 +291,7 @@ def _wizard_stage_2(args, state: dict) -> None:
         # Audited urlopen records this in /audit/network. Acceptable: every
         # outbound call should be auditable, model fetch included.
         req = urllib.request.Request(url, headers={"User-Agent": "calliope-setup/1"})
+        digest = hashlib.sha256()
         with urllib.request.urlopen(req, timeout=60) as resp:  # nosec - HTTPS to known host
             total = int(resp.headers.get("Content-Length") or 0)
             got = 0
@@ -361,18 +302,25 @@ def _wizard_stage_2(args, state: dict) -> None:
                     if not buf:
                         break
                     out.write(buf)
+                    digest.update(buf)
                     got += len(buf)
                     if total:
                         pct = (got * 100) // total
                         print(f"  ...{pct:3d}%  ({got // (1024 * 1024)} / {total // (1024 * 1024)} MB)",
                               end="\r", flush=True)
             print()  # newline after progress
+        if expected_sha and digest.hexdigest() != expected_sha:
+            raise ValueError(f"SHA-256 mismatch: got {digest.hexdigest()}, "
+                             f"expected {expected_sha}")
         tmp.rename(target)
         actual_mb = target.stat().st_size // (1024 * 1024)
-        _wizard_ok(f"saved {target} ({actual_mb} MB)")
-        if expected_mb and abs(actual_mb - expected_mb) > max(20, expected_mb // 10):
-            _wizard_warn(f"size {actual_mb} MB differs notably from expected ~{expected_mb} MB; "
-                         "verify upstream mirror integrity")
+        if expected_sha:
+            _wizard_ok(f"saved {target} ({actual_mb} MB, SHA-256 verified)")
+        else:
+            _wizard_ok(f"saved {target} ({actual_mb} MB)")
+            if expected_mb and abs(actual_mb - expected_mb) > max(20, expected_mb // 10):
+                _wizard_warn(f"size {actual_mb} MB differs notably from expected ~{expected_mb} MB; "
+                             "verify upstream mirror integrity")
     except Exception as e:
         _wizard_warn(f"download failed: {e}")
         try:
@@ -457,37 +405,34 @@ def _wizard_stage_3(args, deps: WizardDeps) -> str:
 
 
 # ----- Stage 4: systemd units ----------------------------------------
-def _wizard_dotfiles_unit(name: str) -> Path | None:
-    """Locate the canonical unit file in this repo, if reachable."""
-    candidates = [Path.home() / "Github/dotfiles/systemd/user" / name]
-    # Repo-relative candidate only when actually running from a checkout —
-    # in the installed layout parents[2] is ~/.local/share, and
-    # ~/.local/share/systemd/user is a real systemd load path whose stale
-    # units must not masquerade as repo-canonical.
-    repo_root = Path(__file__).resolve().parents[2]
+def _wizard_repo_unit(name: str, package_dir: Path | None = None) -> Path | None:
+    """Locate the repo's copy of a systemd unit, if reachable.
+
+    Checkout layout: `<repo>/server/calliope_server/` → `<repo>/systemd/<name>`.
+    Installed layout: scripts/install-server stages the repo units next to the
+    package as `<DATADIR>/units/<name>` (not a systemd load path).
+    """
+    pkg = (package_dir or Path(__file__).resolve().parent)
+    repo_root = pkg.parents[1]
     if (repo_root / "server" / "calliope-server").is_file():
-        candidates.append(repo_root / "systemd/user" / name)
-    for c in candidates:
-        if c.is_file():
-            return c
-    return None
+        candidate = repo_root / "systemd" / name
+    else:
+        candidate = pkg.parent / "units" / name
+    return candidate if candidate.is_file() else None
 
 
-def _wizard_install_unit(name: str, fallback_template: str) -> bool:
-    """Drop a unit file into ~/.config/systemd/user/. Return True if a write happened."""
-    dst = Path.home() / ".config/systemd/user" / name
+def _wizard_install_unit(src: Path) -> bool:
+    """Copy a repo unit into ~/.config/systemd/user/. Return True if a write happened."""
+    dst = WIZARD_UNIT_DIR / src.name
     dst.parent.mkdir(parents=True, exist_ok=True)
+    new_content = src.read_text(encoding="utf-8")
 
-    src = _wizard_dotfiles_unit(name)
-    new_content = src.read_text(encoding="utf-8") if src else fallback_template
-
-    if dst.exists():
-        if dst.read_text(encoding="utf-8") == new_content:
-            _wizard_skip(4, f"{dst.name} already up-to-date")
-            return False
+    if dst.exists() and dst.read_text(encoding="utf-8") == new_content:
+        _wizard_skip(4, f"{dst.name} already up-to-date")
+        return False
 
     dst.write_text(new_content, encoding="utf-8")
-    _wizard_ok(f"wrote {dst} ({'from repo' if src else 'inline template'})")
+    _wizard_ok(f"wrote {dst} (from {src})")
     return True
 
 
@@ -515,8 +460,8 @@ def _wizard_stage_4(args) -> None:
     _wizard_say(4, "systemd unit")
     if not args.install_systemd:
         _wizard_warn("--no-install-systemd — printing intent only")
-        print(f"  WOULD WRITE: {WIZARD_DICTATION_UNIT_PATH}")
-        print(f"  WOULD WRITE: {WIZARD_WHISPER_UNIT_PATH}")
+        for name in WIZARD_UNITS:
+            print(f"  WOULD WRITE: {WIZARD_UNIT_DIR / name}")
         print("  WOULD RUN:   systemctl --user daemon-reload && enable --now "
               "dictation-server")
         print("  ASSUMING:    server is already reachable on https://127.0.0.1:8384/health")
@@ -526,8 +471,17 @@ def _wizard_stage_4(args) -> None:
         _wizard_warn("systemctl not on PATH — skipping unit install")
         return
 
-    _wizard_install_unit("dictation-server.service", WIZARD_DICTATION_UNIT_TEMPLATE)
-    _wizard_install_unit("whisper-server.service", WIZARD_WHISPER_UNIT_TEMPLATE)
+    sources = {name: _wizard_repo_unit(name) for name in WIZARD_UNITS}
+    missing = [name for name, src in sources.items() if src is None]
+    if missing:
+        _wizard_warn(f"repo unit files not found: {', '.join(missing)}")
+        print("  The calliope checkout is not reachable from this install. Re-run")
+        print("  scripts/install-server from the checkout (it stages the units),")
+        print("  then run `dictation-server --setup` again.")
+        raise SystemExit(2)
+
+    for src in sources.values():
+        _wizard_install_unit(src)
 
     try:
         subprocess.run(["systemctl", "--user", "daemon-reload"],
@@ -693,75 +647,59 @@ def _wizard_lan_ip() -> str:
         return "127.0.0.1"
 
 
-def _wizard_wait_pair(timeout_s: int, deps: WizardDeps) -> bool:
-    """Subscribe to /events SSE, wait for pair-success, ignore self-signed."""
-    token = deps.get_token()
-    url = f"https://127.0.0.1:{config.DEFAULT_PORT}/events?token={urllib.parse.quote(token)}"
+def _wizard_mint_pairing_code(token: str) -> tuple[str, int]:
+    """Ask the running server for a one-time phone pairing code.
+
+    POST /pair/bootstrap requires the durable bearer in the Authorization
+    header (even on loopback). Returns (code, expires_in_seconds).
+    """
+    url = f"https://127.0.0.1:{config.DEFAULT_PORT}/pair/bootstrap"
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    deadline = time.monotonic() + timeout_s
-    try:
-        req = urllib.request.Request(url, headers={"Accept": "text/event-stream"})
-        with urllib.request.urlopen(req, context=ctx, timeout=timeout_s + 5) as resp:
-            current_event = ""
-            while time.monotonic() < deadline:
-                line = resp.readline()
-                if not line:
-                    break
-                s = line.decode("utf-8", errors="replace").rstrip("\r\n")
-                if s.startswith("event:"):
-                    current_event = s[len("event:"):].strip()
-                elif s.startswith("data:") and current_event == "pair-success":
-                    return True
-                elif s == "":
-                    current_event = ""
-    except Exception as e:
-        log.debug(f"wait_pair: SSE error: {e}")
-    return False
+    req = urllib.request.Request(
+        url, data=b"", method="POST",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    code = str(body.get("code") or "")
+    if not code:
+        raise ValueError("server returned no pairing code")
+    return code, int(body.get("expires_in") or 0)
 
 
 def _wizard_stage_6(args, fingerprint: str, deps: WizardDeps) -> None:
     _wizard_say(6, "phone pairing")
-    token = deps.get_token()
-    lan_ip = _wizard_lan_ip()
-    base_url = f"https://{lan_ip}:{config.DEFAULT_PORT}"
+    try:
+        code, expires_in = _wizard_mint_pairing_code(deps.get_token())
+    except Exception as e:
+        _wizard_warn(f"could not mint a pairing code: {e}")
+        print("  Pair later from the SillyTavern extension (Show local QR /")
+        print("  Copy pairing URL) once dictation-server is running.")
+        return
 
-    payload = {
-        "url": base_url,
-        "token": token,
-        "fingerprint": fingerprint or "",
-    }
-    pair_url = (f"{base_url}/pair?token={urllib.parse.quote(token)}"
-                f"&fingerprint={urllib.parse.quote(fingerprint or '')}")
-    qr_payload = json.dumps(payload, separators=(",", ":"))
+    base_url = f"https://{_wizard_lan_ip()}:{config.DEFAULT_PORT}"
+    pair_url = f"{base_url}/?{urllib.parse.urlencode({'pair': code})}"
 
     if shutil.which("qrencode"):
         try:
             res = subprocess.run(
-                ["qrencode", "-t", "UTF8", "-o", "-", qr_payload],
+                ["qrencode", "-t", "UTF8", "-o", "-", pair_url],
                 check=True, capture_output=True, text=True, timeout=5,
             )
             print(res.stdout)
         except Exception as e:
             _wizard_warn(f"qrencode failed: {e}")
     else:
-        _wizard_warn("install `qrencode` for phone QR pairing")
+        _wizard_warn("install `qrencode` to show this URL as a QR code")
 
-    print(f"  Phone URL:    {base_url}")
-    print(f"  Token:        {token}")
+    print(f"  Pairing URL:  {pair_url}")
+    print(f"  Code:         {code}  (one use, expires in {expires_in}s)")
     print(f"  Fingerprint:  {fingerprint or '(none)'}")
-    print(f"  POST target:  {pair_url}")
-    print(f"  Waiting for /pair hit (timeout {WIZARD_PAIR_TIMEOUT_S}s) — Ctrl-C to skip.")
-    try:
-        ok = _wizard_wait_pair(WIZARD_PAIR_TIMEOUT_S, deps)
-    except KeyboardInterrupt:
-        _wizard_warn("pairing skipped by user")
-        return
-    if ok:
-        _wizard_ok("phone paired")
-    else:
-        _wizard_warn(f"no pair within {WIZARD_PAIR_TIMEOUT_S}s — re-run --setup --skip-stage-1 ... when ready")
+    print("  Scan or open the URL on the phone and check the cert fingerprint")
+    print("  matches. Phone needs LAN access (DICTATION_BIND_HOST=0.0.0.0) or")
+    print("  Tailscale. Expired? Re-pair from the SillyTavern extension.")
 
 
 # ----- Stage 7: summary ----------------------------------------------

@@ -98,15 +98,17 @@ server from the checkout:
 scripts/install-server
 ```
 
-This puts the executable wrapper at `~/.local/bin/dictation-server` and the
-`calliope_server/` package (plus `voice_catalog.json`) under
-`~/.local/share/dictation-server/`, where the wrapper finds it at runtime.
+This syncs the `calliope_server/` package (plus `voice_catalog.json` and the
+repo's systemd units, staged under `units/`) into
+`~/.local/share/dictation-server/`, then puts the executable wrapper at
+`~/.local/bin/dictation-server`, which finds the package there at runtime.
 
 (AUR `calliope-git` and pipx packaging via `calliope-dictation` are tracked in
 [the roadmap](docs/roadmap.md); neither channel is published yet.)
 
 **5. Run the wizard.** It probes audio, picks a model size from your VRAM,
-generates a self-signed cert + bearer token, installs the systemd unit, and
+generates a self-signed cert + bearer token, installs the repo's systemd units
+(enabling only `dictation-server`; Whisper and Kokoro start on demand), and
 runs a 10-second self-test:
 
 ```bash
@@ -115,7 +117,8 @@ dictation-server --setup
 
 The wizard prints the cert SHA-256 fingerprint and stores the bearer token.
 Save the fingerprint somewhere — you will match it on first phone connect.
-Pair phones from the SillyTavern extension after it is installed.
+Its last stage prints a QR code for a one-time `?pair=` URL (valid 120 s,
+one use); after that, pair phones from the SillyTavern extension.
 
 **6. Install the SillyTavern extension.** Copy or symlink `extension/` into
 ST's third-party extensions tree:
@@ -134,9 +137,9 @@ Mod+Shift+M  { spawn "bash" "-c" "$HOME/.local/bin/dictate toggle"; }
 ```
 
 **8. First phone connection.** In ST, open Extensions → Dictation Bridge and
-use **Re-pair this phone**, **Show local QR**, or **Copy pairing URL**. The QR
-is rendered locally in the ST browser and contains the bearer-token pairing
-URL, so treat it like a password. Visit the URL, trust the cert (one-time per
+use **Re-pair this phone**, **Show local QR**, or **Copy pairing URL**. Each
+mints a one-time `?pair=` code (one use, expires after 120 s); the bearer token
+never goes into the URL or QR. Visit the URL, trust the cert (one-time per
 browser profile, see [`docs/cert-trust.md`](docs/cert-trust.md)), bookmark it,
 install as PWA, then test recording.
 

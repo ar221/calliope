@@ -172,9 +172,10 @@ journalctl --user -u dictation-server | grep -i fingerprint | tail -1
 ```
 
 For phone pairing, use the SillyTavern extension's **Show local QR** or
-**Copy pairing URL** controls. The QR is rendered locally in the browser and
-contains the bearer-token pairing URL, so treat it like a password and avoid
-screenshots/logs.
+**Copy pairing URL** controls (or the QR printed by `dictation-server --setup`).
+The URL carries a one-time `?pair=` code that expires after 120 seconds; the
+bearer token is never in it. An unused code still grants access, so keep it
+out of screenshots and logs.
 
 ## When the cert rotates
 

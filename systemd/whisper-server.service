@@ -10,7 +10,8 @@ Type=simple
 # Idle shutdown: whisper-server has no native --idle-timeout flag. The Calliope
 # dictation-server (Phase 2 sibling) is responsible for stopping/starting this
 # unit on demand via `systemctl --user {start,stop} whisper-server` when N
-# minutes of inactivity pass. Do not wire idle logic here.
+# minutes of inactivity pass. Do not wire idle logic here. No [Install]
+# section on purpose: enabling it would start whisper at login and hold VRAM.
 ExecStart=%h/.local/bin/whisper-server \
     --host 127.0.0.1 \
     --port 9001 \
@@ -34,7 +35,7 @@ RestartSec=5
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.local/share/whisper /tmp
+ReadOnlyPaths=%h/.local/share/whisper
 PrivateTmp=yes
 PrivateDevices=no
 DeviceAllow=/dev/kfd rw
@@ -46,6 +47,3 @@ RestrictNamespaces=yes
 RestrictRealtime=yes
 SystemCallArchitectures=native
 LogLevelMax=warning
-
-[Install]
-WantedBy=default.target

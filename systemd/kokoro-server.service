@@ -1,6 +1,5 @@
 [Unit]
 Description=Kokoro-82M TTS server for Calliope dictation
-After=default.target
 
 [Service]
 Type=simple
@@ -19,7 +18,8 @@ RestartSec=5
 # Idle-shutdown is driven by Calliope's dictation-server (mirrors the
 # whisper-server.service contract): when KOKORO_IDLE_SHUTDOWN_SECONDS of
 # inactivity pass, dictation-server runs `systemctl --user stop
-# kokoro-server`. Do not wire idle logic into this unit.
+# kokoro-server`. Do not wire idle logic into this unit. No [Install]
+# section on purpose: Calliope starts it on demand, not at login.
 
 # Sandboxing — CPU-only path is the default (kokoro-onnx CPU provider).
 # If the install upgrades to ROCm, swap ProtectHome=read-only to a
@@ -28,7 +28,7 @@ RestartSec=5
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.local/share/calliope-tts /tmp
+ReadWritePaths=%h/.local/share/calliope-tts
 PrivateTmp=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=yes
@@ -36,6 +36,3 @@ RestrictNamespaces=yes
 RestrictRealtime=yes
 SystemCallArchitectures=native
 LogLevelMax=warning
-
-[Install]
-WantedBy=default.target

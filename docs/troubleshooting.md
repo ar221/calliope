@@ -87,14 +87,15 @@ streams under background-tab throttling. The server's stdlib HTTP
 handler logs the broken handshake at WARNING.
 
 **Fix (MVP-18, shipped):** these benign EOFs are now demoted to DEBUG.
-You should not see them at the default `LogLevel=warning` (now baked
-into the systemd unit).
+The unit ships `LogLevelMax=info`, which keeps the access log and the
+`timing` trace but drops DEBUG, so you should not see them.
 
 If you still see them on an older build:
 
 1. Confirm you are on `46fc429 feat(calliope): MVP-18` or newer.
-2. Add `LogLevel=warning` to your `dictation-server.service.d/override.conf`
-   if you're running a fork without the demotion.
+2. Set `LogLevelMax=info` in your `dictation-server.service.d/override.conf`
+   (or `warning` if you are running a fork without the demotion; that also
+   hides the `timing` trace).
 3. Confirm the service is actually healthy: `curl -k https://localhost:8384/health`
    should return `{"status": "ok", ...}`. The EOF spam is **cosmetic
    only** — the service is fine.
@@ -389,10 +390,11 @@ If you still see >30s hangs:
    ```bash
    journalctl --user -u dictation-server | grep timing | tail -1 | jq
    ```
-   `stages_ms.whisper` >> 1000 = the model isn't warm. Ensure
-   `whisper-server` started before `dictation-server`
-   (the unit dependency `After=whisper-server.service` handles this; if
-   you've overridden, check ordering).
+   `stages_ms.whisper` >> 1000 = the model isn't warm. dictation-server
+   starts `whisper-server` on the first request (the unit has no
+   `[Install]` section, so it does not start at login). To keep it warm,
+   leave `WHISPER_IDLE_SHUTDOWN_DISABLED=1` set (the shipped unit does) and
+   run `systemctl --user start whisper-server` once after login.
 3. Test ROCm / CUDA from the host:
    ```bash
    rocm-smi   # or nvidia-smi
