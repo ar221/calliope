@@ -143,7 +143,9 @@ def test_phone_regen_uses_a_formatter_mode_and_reports_http_errors():
     source = WEB_UI_SRC.read_text()
 
     assert "function resolveRegenMode()" in source
-    assert source.count("const regenMode = resolveRegenMode();") == 2
+    # Main regen honours an OOC utterance; the transcript-entry regen keeps the plain resolver.
+    assert "const regenMode = lastWasOoc ? 'grammar_clean' : resolveRegenMode();" in source
+    assert source.count("const regenMode = resolveRegenMode();") == 1
     assert "if (!resp.ok || data.error)" in source
     assert "Regen failed (HTTP ${resp.status})" in source
 

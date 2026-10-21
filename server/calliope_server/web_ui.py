@@ -1684,6 +1684,7 @@ let availableModes = [];       // [{id, label, icon, whisper_model, use_persona,
 let durationInterval = null;
 let recordStart = 0;
 let lastRawText = '';          // raw whisper output (before RP formatting)
+let lastWasOoc = false;        // last utterance carried an `OOC:` prefix (server stripped it)
 let sessionLog = [];           // local mirror of server transcript
 let selectedPersona = 'none';
 let personaPinned = false;       // explicit URL/UI persona survives ST state refreshes
@@ -2673,11 +2674,8 @@ async function sendAudio() {
       lastRawText = data.raw || data.text;
       // Backend echoes the resolved mode id; fall back if missing.
       lastUsedMode = data.mode || currentMode;
-      // POL-1: the server strips `OOC:` before formatting; put it back so the
-      // aside is not pasted into SillyTavern as an in-character line.
-      const resultText = (data.is_ooc === true && !/^\s*ooc\b/i.test(data.text || ''))
-        ? `OOC: ${data.text}` : data.text;
-      showResult(resultText, { raw: lastRawText, cleaned: data.cleaned || '',
+      lastWasOoc = data.is_ooc === true;
+      showResult(withOocPrefix(data.text), { raw: lastRawText, cleaned: data.cleaned || '',
                               repair_trace: data.repair_trace || null,
                               mode: lastUsedMode,
                               formatting_skipped: !!data.formatting_skipped,
@@ -2724,6 +2722,13 @@ function resolveRegenMode() {
   return 'rp_enhance';
 }
 
+// POL-1: the server strips `OOC:` before formatting; put it back on every
+// result derived from that utterance so it is never pasted in-character.
+function withOocPrefix(text) {
+  const t = String(text || '');
+  return (lastWasOoc && !/^\s*ooc\b/i.test(t)) ? `OOC: ${t}` : t;
+}
+
 async function regenerate() {
   if (!lastRawText) return;
 
@@ -2734,7 +2739,9 @@ async function regenerate() {
 
   const context = getContext();
   // Preserve a formatter-capable prior mode; Plain cannot regenerate prose.
-  const regenMode = resolveRegenMode();
+  // An OOC aside stays in grammar_clean: regenerating it as RP prose would
+  // paste the aside in-character.
+  const regenMode = lastWasOoc ? 'grammar_clean' : resolveRegenMode();
 
   try {
     const resp = await fetch('/reformat', {
@@ -2760,7 +2767,7 @@ async function regenerate() {
     } else {
       const resolvedMode = data.mode || regenMode;
       lastUsedMode = resolvedMode;
-      showResult(data.text, { raw: lastRawText, cleaned: data.cleaned || '',
+      showResult(withOocPrefix(data.text), { raw: lastRawText, cleaned: data.cleaned || '',
                               repair_trace: data.repair_trace || null,
                               mode: resolvedMode,
                               formatting_skipped: !!data.formatting_skipped,
@@ -3745,6 +3752,7 @@ async function pillSend() {
         raw: lastResult.raw,
         cleaned: lastResult.cleaned,
         mode: lastResult.mode,
+        is_ooc: lastWasOoc,
         auto_send: autoSendToST,
       }),
     });
@@ -3775,6 +3783,7 @@ async function sendToST() {
     text,
     raw: lastRawText || '',
     mode: lastUsedMode || currentMode || '',
+    is_ooc: lastWasOoc,
     auto_send: autoSendToST,
   };
   try {
