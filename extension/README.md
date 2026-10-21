@@ -77,6 +77,7 @@ fails (cert rejection or server down).
 ## Limitations / known issues
 
 - **Pairing state** — a page can be token-valid but not following the current SillyTavern chat if it was opened from an old bookmark/tab. Open from the refreshed ST mic button when the phone says stale/not paired.
+- **Multiple SillyTavern tabs** — every open tab receives the same server events, so tabs arbitrate per request (Web Locks, with a BroadcastChannel/localStorage fallback that only shares opaque request IDs). The tab that wins a streamed request is the only one that clears its textarea, paints streamed tokens, and applies the final result; other tabs leave their draft untouched. If a stream stalls for 45 s or the SSE connection drops, the owning tab restores its pre-stream text. One "undo" after a dictation restores the pre-dictation text; the undo history is cleared on chat switch.
 - **Self-signed cert** — one-time trust prompt on every browser profile.
   Some browsers will silently block cross-origin `fetch` to an untrusted
   cert; the probe will fail cleanly and instruct the user.

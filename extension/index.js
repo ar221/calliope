@@ -539,23 +539,27 @@ function setupMobileLifecycleStatePush() {
 // arrived) for perceived-latency wins. The terminal 'dictation-result' is
 // still source-of-truth; when it arrives, we replace the streamed span with
 // the canonical text.
+//
+// Every open ST tab receives the same SSE stream, so stream START goes through
+// the same cross-tab arbitration as results (ownIncomingSideEffect, keyed by
+// requestId). Only the owner snapshots/clears its textarea and paints deltas;
+// other tabs ignore that requestId entirely, including its final result.
 const STREAMING_SESSION_TIMEOUT_MS = 45_000;
-let streamingSession = null; // { requestId, base, accumulated, raf, inactivityTimer }
+const STREAM_OWNERSHIP_CAP = 32;
+// { requestId, base, preStreamValue, undoEntry, accumulated, raf, appendMode, inactivityTimer }
+let streamingSession = null;
+// requestId -> { state: 'pending' | 'owner' | 'lost', queue: [{delta, done}], settled: Promise }
+const streamOwnership = new Map();
 
 function refreshStreamingSessionTimeout() {
     if (!streamingSession) return;
-    if (streamingSession.inactivityTimer) clearTimeout(streamingSession.inactivityTimer);
+    clearTimeout(streamingSession.inactivityTimer);
     const requestId = streamingSession.requestId;
     streamingSession.inactivityTimer = setTimeout(() => {
         if (streamingSession?.requestId !== requestId) return;
-        const ta = document.getElementById('send_textarea');
-        if (ta) {
-            // Remove stale partials so a late batch result cannot duplicate an
-            // append-mode base or leave abandoned formatter text behind.
-            ta.value = streamingSession.base;
-            ta.dispatchEvent(new Event('input', { bubbles: true }));
-        }
-        endStreamingSession();
+        // Remove stale partials so a late batch result cannot duplicate an
+        // append-mode base or leave abandoned formatter text behind.
+        abortStreamingSession();
     }, STREAMING_SESSION_TIMEOUT_MS);
 }
 
@@ -573,10 +577,130 @@ function endStreamingSession() {
     if (streamingSession?.raf) {
         try { cancelAnimationFrame(streamingSession.raf); } catch {}
     }
-    if (streamingSession?.inactivityTimer) clearTimeout(streamingSession.inactivityTimer);
+    clearTimeout(streamingSession?.inactivityTimer);
     streamingSession = null;
     if (pendingCanonicalResults.length) queueMicrotask(flushPendingCanonicalResults);
 }
+
+/** Drop the active stream and put the textarea back to its pre-stream value.
+ *  Only the owning tab ever has a session, so only the owner is touched. */
+function abortStreamingSession() {
+    const session = streamingSession;
+    if (!session) return;
+    const ta = document.getElementById('send_textarea');
+    if (ta) {
+        ta.value = session.preStreamValue;
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    // The stream never landed, so its pre-stream undo entry is now a no-op.
+    if (session.undoEntry && undoStack[undoStack.length - 1] === session.undoEntry) undoStack.pop();
+    endStreamingSession();
+}
+
+/** Owner-only stream start: snapshot the pre-stream value once (for undo and
+ *  abort) and clear the textarea in replace mode. Returns false when there is
+ *  no textarea so another tab may take ownership instead. */
+function beginStreamingSession(requestId) {
+    const ta = document.getElementById('send_textarea');
+    if (!ta) return false;
+    const cfg = settings();
+    clearRepairTrace();
+    abortStreamingSession();
+    const preStreamValue = ta.value || '';
+    const base = cfg.appendMode === 'append' ? preStreamValue.replace(/\s+$/, '') : '';
+    const undoEntry = pushUndoSnapshot('dictation-stream');
+    streamingSession = {
+        requestId,
+        base,
+        preStreamValue,
+        undoEntry,
+        accumulated: '',
+        raf: null,
+        appendMode: cfg.appendMode,
+        inactivityTimer: null,
+    };
+    if (cfg.appendMode !== 'append') {
+        // Clear textarea so the streamed text shows from a clean slate.
+        ta.value = '';
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    refreshStreamingSessionTimeout();
+    return true;
+}
+
+function applyStreamToken({ delta, done }) {
+    if (!streamingSession) return;
+    refreshStreamingSessionTimeout();
+    if (delta) {
+        streamingSession.accumulated += delta;
+        if (!streamingSession.raf) {
+            streamingSession.raf = requestAnimationFrame(flushStreamingFrame);
+        }
+    }
+    if (done) {
+        // Force a final flush so the user sees the fully streamed text
+        // before the canonical dictation-result lands. Keep the session alive
+        // so the result handler can replace the streamed span.
+        flushStreamingFrame();
+        if (streamingSession) streamingSession.streamComplete = true;
+    }
+}
+
+function handleDictationToken(data) {
+    const requestId = String(data?.requestId || '');
+    if (!requestId) return;
+    const token = { delta: String(data.delta || ''), done: !!data.done };
+    if (streamingSession?.requestId === requestId) {
+        applyStreamToken(token);
+        return;
+    }
+    const known = streamOwnership.get(requestId);
+    if (known) {
+        // Pending: buffer until arbitration settles. Lost: another tab owns
+        // it. Owner without a session: stream already ended/aborted here.
+        if (known.state === 'pending') known.queue.push(token);
+        return;
+    }
+    const claim = { state: 'pending', queue: [token], settled: null };
+    streamOwnership.set(requestId, claim);
+    while (streamOwnership.size > STREAM_OWNERSHIP_CAP) {
+        streamOwnership.delete(streamOwnership.keys().next().value);
+    }
+    claim.settled = ownIncomingSideEffect('stream', requestId, () => {
+        if (!beginStreamingSession(requestId)) return false;
+        claim.state = 'owner';
+        const queued = claim.queue;
+        claim.queue = [];
+        for (const queuedToken of queued) applyStreamToken(queuedToken);
+        return true;
+    }).catch(err => {
+        WARN('dictation-token ownership failed', err?.message || err);
+        return false;
+    }).then(owned => {
+        if (claim.state !== 'owner' || owned !== true) {
+            claim.state = 'lost';
+            claim.queue = [];
+        }
+    });
+}
+
+/** Final result: a tab that lost the stream for this requestId leaves the
+ *  result to the stream owner; everyone else contends as before. */
+async function handleDictationResultEvent(data, lastEventId) {
+    const requestId = String(data.requestId || data.request_id || '');
+    const claim = requestId ? streamOwnership.get(requestId) : null;
+    if (claim?.settled) await claim.settled;
+    if (claim?.state === 'lost') return false;
+    return ownIncomingSideEffect('result', data.requestId || data.request_id || data.ts || lastEventId, () => {
+        const applied = applyDictationResult(data, { source: desktopCapture ? 'desktop' : 'phone' });
+        if (!applied && !String(data?.text ?? '').trim()
+                && streamingSession && (!requestId || streamingSession.requestId === requestId)) {
+            abortStreamingSession();
+        }
+        return applied;
+    });
+}
+
 
 // ─── MVP-16: state-machine bar above #send_textarea ───────────────────────
 // Server emits SSE 'dictation-state' events with
@@ -1291,15 +1415,18 @@ function onEscDismissBanner(e) {
 const UNDO_STACK_CAP = 8;
 const undoStack = [];
 
+/** Push the textarea's current value; returns the new entry (null if deduped). */
 function pushUndoSnapshot(reason) {
     const ta = document.getElementById('send_textarea');
-    if (!ta) return;
+    if (!ta) return null;
     const prev = ta.value || '';
     // Skip duplicate snapshots — repeated identical state pollutes the stack.
     const top = undoStack[undoStack.length - 1];
-    if (top && top.prevValue === prev) return;
-    undoStack.push({ prevValue: prev, ts: Date.now(), reason: reason || '' });
+    if (top && top.prevValue === prev) return null;
+    const entry = { prevValue: prev, ts: Date.now(), reason: reason || '' };
+    undoStack.push(entry);
     while (undoStack.length > UNDO_STACK_CAP) undoStack.shift();
+    return entry;
 }
 
 function popUndoSnapshot() {
@@ -1673,65 +1800,14 @@ function connectSSE() {
     // assembled version once formatting finishes).
     sseSource.addEventListener('dictation-token', (e) => {
         sseStatus.lastEventAt = Date.now();
+        let data;
+        try { data = JSON.parse(e.data); }
+        catch { WARN('SSE dictation-token: bad JSON'); return; }
         try {
-            let data;
-            try { data = JSON.parse(e.data); }
-            catch { WARN('SSE dictation-token: bad JSON'); return; }
-            const requestId = String(data.requestId || '');
-            const delta = String(data.delta || '');
-            const done = !!data.done;
-            if (!requestId) return;
-
-            const ta = document.getElementById('send_textarea');
-            if (!ta) return;
-            const cfg = settings();
-
-            // First token for a new request: snapshot base and init session.
-            if (!streamingSession || streamingSession.requestId !== requestId) {
-                clearRepairTrace();
-                endStreamingSession();
-                const base = (cfg.appendMode === 'append' && ta.value)
-                    ? ta.value.replace(/\s+$/, '')
-                    : '';
-                streamingSession = {
-                    requestId,
-                    base,
-                    accumulated: '',
-                    raf: null,
-                    appendMode: cfg.appendMode,
-                    inactivityTimer: null,
-                };
-                if (cfg.appendMode !== 'append') {
-                    // Snapshot before clearing so a user's in-progress draft is
-                    // recoverable via undo — this branch runs once per stream
-                    // (only on first-token-of-new-request, guarded above).
-                    pushUndoSnapshot('dictation-token-stream-clear');
-                    // Clear textarea so the streamed text shows from a clean slate.
-                    ta.value = '';
-                    ta.dispatchEvent(new Event('input', { bubbles: true }));
-                }
-            }
-
-            refreshStreamingSessionTimeout();
-            if (delta) {
-                streamingSession.accumulated += delta;
-                if (!streamingSession.raf) {
-                    streamingSession.raf = requestAnimationFrame(flushStreamingFrame);
-                }
-            }
-
-            if (done) {
-                // Force a final flush so the user sees the fully streamed text
-                // before the canonical dictation-result lands.
-                flushStreamingFrame();
-                // Keep the session alive (don't null) so the upcoming
-                // dictation-result handler can detect + replace the streamed
-                // span with the canonical polished text.
-                if (streamingSession) streamingSession.streamComplete = true;
-            }
+            handleDictationToken(data);
         } catch (err) {
             WARN('dictation-token handler failed; falling back to batch result', err?.message || err);
-            endStreamingSession();
+            abortStreamingSession();
         }
     });
 
@@ -1790,13 +1866,8 @@ function connectSSE() {
         let data;
         try { data = JSON.parse(e.data); }
         catch { WARN('SSE dictation-result: bad JSON'); return; }
-        ownIncomingSideEffect('result', data.requestId || data.request_id || data.ts || e.lastEventId, () => {
-            const applied = applyDictationResult(data, { source: desktopCapture ? 'desktop' : 'phone' });
-            if (!applied) {
-                if (!String(data?.text ?? '').trim()) endStreamingSession();
-            }
-            return applied;
-        }).catch(err => WARN('dictation-result ownership failed', err?.message || err));
+        handleDictationResultEvent(data, e.lastEventId)
+            .catch(err => WARN('dictation-result ownership failed', err?.message || err));
     });
 
     sseSource.addEventListener('error', (e) => {
@@ -1835,9 +1906,10 @@ function disconnectSSE() {
     }
     sseStatus.state = 'disconnected';
     updateSseStatusIndicator();
-    // MVP-13: drop any in-flight stream — caller will reconnect and the next
-    // dictation-result will land via the batch path.
-    endStreamingSession();
+    // MVP-13: drop any in-flight stream and restore the pre-stream value —
+    // caller will reconnect and the next dictation-result will land via the
+    // batch path.
+    abortStreamingSession();
 }
 
 function rememberAppliedDictationRequest(requestId) {
@@ -1905,7 +1977,8 @@ function applyDictationResult(data, { source = 'phone' } = {}) {
         const sessAppendMode = streamingSession.appendMode;
         const base = streamingSession.base;
         endStreamingSession();
-        pushUndoSnapshot('dictation-result-stream');
+        // No snapshot here: the pre-stream value was pushed once at stream
+        // start, so one undo restores it instead of the half-streamed text.
         const sep = (sessAppendMode === 'append' && base) ? '\n\n' : '';
         ta.value = (sessAppendMode === 'append' ? base + sep : '') + text;
         ta.dispatchEvent(new Event('input', { bubbles: true }));
@@ -5620,6 +5693,9 @@ export async function init() {
         ttsLastDictatedPersonaAt = 0;
         stopTts();
         clearRepairTrace();
+        // Undo snapshots belong to the previous chat's draft; never restore
+        // them into a different conversation.
+        undoStack.length = 0;
         setTimeout(() => {
             sweepInjectTtsButtons();
             // Mark init complete a tick after the chat is fully painted so

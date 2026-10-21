@@ -157,8 +157,8 @@ def test_http_and_sse_results_share_request_id_dedupe_path():
 
     sse = _block(
         source,
-        "sseSource.addEventListener('dictation-result'",
-        "sseSource.addEventListener('error'",
+        "async function handleDictationResultEvent(data, lastEventId)",
+        "// ─── MVP-16",
     )
     submit = _block(source, "async function submitDesktopRecording(capture)", "async function onMicClick()")
     assert "applyDictationResult(data" in sse

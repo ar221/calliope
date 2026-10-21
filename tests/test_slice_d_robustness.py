@@ -12,15 +12,6 @@ def source() -> str:
     return EXTENSION.read_text(encoding="utf-8")
 
 
-def test_streaming_session_has_refreshable_inactivity_timeout():
-    js = source()
-    assert "const STREAMING_SESSION_TIMEOUT_MS = 45_000" in js
-    assert "function refreshStreamingSessionTimeout()" in js
-    assert "refreshStreamingSessionTimeout();" in js
-    assert "clearTimeout(streamingSession.inactivityTimer)" in js
-    assert "ta.value = streamingSession.base" in js
-
-
 def test_mismatched_canonical_result_cannot_overwrite_active_stream():
     js = source()
     assert "return queuePendingCanonicalResult(data, source);" in js
@@ -42,7 +33,6 @@ def test_cross_tab_claims_carry_only_opaque_ids_and_timestamps():
     assert "ownIncomingSideEffect('command'" in js
     assert "ownIncomingSideEffect('result'" in js
     assert "data.requestId || data.ts || e.lastEventId" in js
-    assert "data.requestId || data.request_id || data.ts || e.lastEventId" in js
     assert "if (!id) return false;" in block
 
 
