@@ -71,15 +71,21 @@ exclusion). The token is a credential.
 
 ### Transcribed text — not audio — to OmniRoute
 
-When you select a `grammar_clean`, `rp_format`, `rp_enhance`, or
-`persona_pov` mode, the transcribed *text* (not audio) is sent to the local
-OmniRoute gateway at `http://127.0.0.1:20128`. The request is authenticated
-with `OMNIROUTE_API_KEY`, and OmniRoute relays it to the provider named by the
-catalog-qualified model ID. That upstream provider's privacy policy applies to
-the text hop. Calliope has no direct-provider or unauthenticated fallback.
+When you select a `grammar_clean`, `rp_format`, `rp_enhance`, `persona_pov`,
+`narrator_past`, or `narrator_present` mode, the transcribed *text* (not
+audio) is sent to the local OmniRoute gateway at `http://127.0.0.1:20128`.
+The request is authenticated with `OMNIROUTE_API_KEY`, and OmniRoute relays
+it to the provider named by the catalog-qualified model ID. That upstream
+provider's privacy policy applies to the text hop. Calliope has no
+direct-provider or unauthenticated fallback. The "last AI message" context
+the clients attach travels in a request header, never in the URL, so it does
+not appear in journaled request lines.
 
-The `plain` mode bypasses all LLM providers entirely. Pick `plain` if you
-want hard certainty that no text leaves your machine.
+The `plain` and `command` modes bypass all LLM providers entirely. Pick
+`plain` if you want hard certainty that no text leaves your machine. An
+`OOC:` prefix in one of the formatter modes above reroutes that utterance to
+`grammar_clean` (still OmniRoute, but no persona/chat context); in `plain`
+the prefix is kept verbatim and nothing is sent.
 
 ### Active provider visibility
 
@@ -87,11 +93,12 @@ The server's outbound calls are observable:
 
 - **At startup:** the log line declares the OmniRoute endpoint, whether a key
   was loaded, and the configured RP model chain without exposing the key.
-- **At runtime:** `GET /audit/network` returns a ring buffer of the last 50
-  outbound non-loopback connection events with timestamp, host, port, and
-  byte count (MVP-22). The phone PWA exposes this behind the privacy badge
-  in the header (MVP-23). External destinations (anything outside
-  `127.0.0.0/8` and your configured LAN CIDR) are flagged.
+- **At runtime:** `GET /audit/network` returns a ring buffer of the last 200
+  outbound connection events with timestamp, host, port, byte count, and
+  whether the destination was loopback (MVP-22). The phone PWA exposes this
+  behind the privacy badge in the header (MVP-23). Non-loopback destinations
+  are flagged. Note that OmniRoute itself is loopback: the hop from OmniRoute
+  to the upstream provider is not visible here, only in OmniRoute's own logs.
 - The startup banner pins the configured OmniRoute URL so a misconfigured
   upstream cannot silently re-route.
 
