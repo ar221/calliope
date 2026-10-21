@@ -347,6 +347,9 @@ def test_transcribe_endpoint_keeps_repair_trace_out_of_sse_and_persistence(monke
         def _emit_dictation_transcript(self, *args, **kwargs):
             pass
 
+        # Real header-reading path: this handler sends no X-Dictation-Context.
+        request_context = mod.DictationHandler.request_context
+
     def fake_transcribe(path, **kwargs):
         assert pathlib.Path(path).exists()
         return "um suzie steps closer", []

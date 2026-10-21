@@ -1080,7 +1080,20 @@ def _stream_formatter(url: str, payload: bytes,
         return "".join(visible_buf), f"stream failed: {e}"
 
 
-def format_rp(text: str, mode: int = 1, context: str = "",
+def format_rp(*args, **kwargs) -> tuple[str, bool, str]:
+    """`_format_rp`, but a skipped/failed run clears the attribution slot.
+
+    A pipeline may run `disfluency_clean` (which records its own model)
+    before the formatter step. If the formatter chain then fails, the result
+    must not report the cleanup model as the one that "formatted" the text.
+    """
+    out, skipped, reason = _format_rp(*args, **kwargs)
+    if skipped:
+        reset_model_attribution()
+    return out, skipped, reason
+
+
+def _format_rp(text: str, mode: int = 1, context: str = "",
                persona_id: str = "", use_rules: bool = False,
                prose_format: bool = False, character_id: str = "",
                chat_context: str = "",
@@ -1850,11 +1863,30 @@ _voice_macros_cache: dict = {
 voice_macros_lock = threading.Lock()
 
 # Backwards-compat: SillyTavern's OOC convention. Detected separately in
-# `_handle_transcribe` so it can flip the mode override to grammar_clean.
+# `_handle_transcribe` (via `resolve_ooc_override`) so it can flip the mode
+# to grammar_clean before the pipeline runs.
 OOC_PREFIX_RE = re.compile(
     r"^\s*(?:OOC|out[\s\-]of[\s\-]character)[\s:.]+",
     re.IGNORECASE,
 )
+
+
+def resolve_ooc_override(raw_text: str, mode: dict) -> tuple[str, dict, bool]:
+    """Apply the `OOC:` convention: strip the prefix and route to grammar_clean.
+
+    Returns (text, mode, is_ooc). Only modes that already send text to the
+    formatter are rerouted — an OOC aside in an RP mode must not reach the RP
+    prompt. Modes with no formatter step (plain, command) are left untouched,
+    prefix included: the privacy promise is that plain mode never sends text
+    to a provider, and rerouting would break it.
+    """
+    m = OOC_PREFIX_RE.match(raw_text)
+    if not m or not mode_has_formatter_step(mode):
+        return raw_text, mode, False
+    ooc_mode = get_mode("grammar_clean")
+    if ooc_mode is None or not mode_has_formatter_step(ooc_mode):
+        return raw_text, mode, False
+    return raw_text[m.end():].strip(), ooc_mode, True
 
 
 def _build_voice_macros_regex(sentinel: str, intents: list[dict]) -> re.Pattern:

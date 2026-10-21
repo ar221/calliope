@@ -2382,7 +2382,10 @@ async function submitDesktopRecording(capture) {
         const language = /^(?:[a-z]{2,4}|auto)$/.test(requestedLanguage) ? requestedLanguage : 'auto';
         const params = new URLSearchParams();
         params.set('mode', modeId);
-        params.set('context', cfg.pushContext ? (ctx.lastAi || '') : '');
+        // Chat context travels in a header, not the query string: the server
+        // journals request lines and must never see private chat text there.
+        const contextText = cfg.pushContext ? String(ctx.lastAi || '').slice(-4000) : '';
+        const contextHeaders = contextText ? { 'X-Dictation-Context': encodeURIComponent(contextText) } : {};
         params.set('persona', cfg.reformatPersona || ctx.personaId || '');
         if (cfg.formatterModel) params.set('formatter_model', cfg.formatterModel);
         params.set('character', character);
@@ -2392,7 +2395,7 @@ async function submitDesktopRecording(capture) {
             method: 'POST',
             mode: 'cors',
             cache: 'no-store',
-            headers: { 'Content-Type': capture.format.mimeType, ...authHeaders() },
+            headers: { 'Content-Type': capture.format.mimeType, ...contextHeaders, ...authHeaders() },
             body: blob,
             signal: capture.abortController.signal,
         });

@@ -134,6 +134,7 @@ from calliope_server.config import (  # noqa: E402
     OMNIROUTE_RP_CHAIN,
     DEFAULT_MODEL,
     TRANSCRIPT_CONTEXT_LIMIT,  # noqa: F401 — re-export for tests/back-compat
+    REQUEST_CONTEXT_LIMIT,
     PERSONAS_DIR,  # noqa: F401 — re-export for tests/back-compat
     RULES_DIR,  # noqa: F401 — re-export for tests/back-compat
     ST_DATA_ROOT,  # noqa: F401 — re-export for tests/back-compat
@@ -347,7 +348,8 @@ from calliope_server.formatter import (  # noqa: E402
     PURE_COMMAND_INTENTS,  # noqa: F401 — re-export for tests/back-compat
     _voice_macros_cache,  # noqa: F401 — re-export for tests/back-compat
     voice_macros_lock,  # noqa: F401 — re-export for tests/back-compat
-    OOC_PREFIX_RE,
+    OOC_PREFIX_RE,  # noqa: F401 — re-export for tests/back-compat
+    resolve_ooc_override,
     _build_voice_macros_regex,  # noqa: F401 — re-export for tests/back-compat
     _ensure_voice_macros_compiled,  # noqa: F401 — re-export for tests/back-compat
     load_voice_macros,  # noqa: F401 — re-export for tests/back-compat
@@ -867,13 +869,23 @@ def consume_pairing_code(code: str, *, now: float | None = None) -> tuple[str, s
     return str(entry["token"]), "ok"
 
 
+def clamp_request_context(text: str) -> str:
+    """Bound client-supplied chat context, keeping the most recent tail."""
+    text = str(text or "")
+    if len(text) > REQUEST_CONTEXT_LIMIT:
+        return text[-REQUEST_CONTEXT_LIMIT:]
+    return text
+
+
 def _redact_sensitive_url_params(text: str) -> str:
-    """Redact bearer-like query parameters before request lines reach the journal."""
+    """Redact secret- or chat-bearing query parameters before request lines reach the journal."""
     # BaseHTTPRequestHandler log lines include the raw request target, so
     # EventSource/pairing URLs such as /events?token=... otherwise persist the
-    # bearer token in journalctl. Keep the path useful while removing secrets.
+    # bearer token in journalctl. `context` is covered too: current clients
+    # send chat context in a header, but an older client putting it in the
+    # URL must not land private chat text in the journal.
     return re.sub(
-        r"([?&](?:token|pair|access_token|auth|authorization)=)([^\s&]+)",
+        r"([?&](?:token|pair|access_token|auth|authorization|context)=)([^\s&]+)",
         r"\1[REDACTED]",
         text,
         flags=re.IGNORECASE,
@@ -985,6 +997,18 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             return self.client_address[0]
         except Exception:
             return ""
+
+    def request_context(self) -> str:
+        """Client-supplied chat context from the `X-Dictation-Context` header.
+
+        Percent-encoded UTF-8 so arbitrary chat text survives the header
+        charset. Header, not query string: request lines are journaled and
+        must never carry private chat text.
+        """
+        raw = self.headers.get("X-Dictation-Context", "")
+        if not raw:
+            return ""
+        return clamp_request_context(urllib.parse.unquote(raw))
 
     def _set_cors_origin(self) -> None:
         """Echo the request Origin if it's in the allowlist; otherwise no header."""
@@ -1782,6 +1806,8 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 "model": str(body.get("model", "")),
                 "model_fallback": bool(body.get("model_fallback", False)),
                 "model_tier": int(body.get("model_tier", 0) or 0),
+                "is_ooc": bool(body.get("is_ooc", False)),
+                "mode_override": "ooc" if body.get("is_ooc") else "",
                 "auto_send": bool(body.get("auto_send", False)),
                 "ts": time.time(),
             }
@@ -2178,7 +2204,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             )
             return
 
-        context = data.get("context", "")
+        context = clamp_request_context(data.get("context", ""))
         chat_source = data.get("chat_source", "")
         persona_id = data.get("persona", "")
         character_id = data.get("character", "")
@@ -2364,7 +2390,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         if not re.fullmatch(r"[a-z]{2,4}|auto", language):
             language = "en"
 
-        context = urllib.parse.unquote(params.get("context", [""])[0])
+        context = self.request_context()
         chat_source = params.get("chat_source", [""])[0]
         persona_id = params.get("persona", [""])[0]
         character_id = params.get("character", [""])[0]
@@ -2483,22 +2509,16 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                                      status=200, retry_ok=True)
                 return
 
-            # POL-1 — backwards-compat ST `OOC:` convention. Detected here,
-            # BEFORE the pipeline runs, so it can flip the resolved mode to
-            # `grammar_clean` and strip the prefix from the text. No
-            # `dictation-command` event is emitted — OOC is a content marker,
-            # not a UI action. Agent 3 §3.
-            ooc_match = OOC_PREFIX_RE.match(raw_text)
-            if ooc_match:
-                raw_text = raw_text[ooc_match.end():].strip()
+            # POL-1 — backwards-compat ST `OOC:` convention. Resolved here,
+            # BEFORE the pipeline runs. No `dictation-command` event is
+            # emitted — OOC is a content marker, not a UI action. Agent 3 §3.
+            raw_text, mode, is_ooc = resolve_ooc_override(raw_text, mode)
+            if is_ooc:
                 if not raw_text:
                     self.send_error_json("No speech detected", code="no_speech",
                                          status=200, retry_ok=True)
                     return
-                ooc_mode = get_mode("grammar_clean")
-                if ooc_mode is not None:
-                    mode = ooc_mode
-                    log.info("OOC prefix detected — mode override -> grammar_clean")
+                log.info("OOC prefix detected — mode override -> grammar_clean")
 
             self._emit_dictation_transcript(
                 request_id,
@@ -2579,6 +2599,8 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                     "model": attribution["model"],
                     "model_fallback": attribution["fallback"],
                     "model_tier": attribution["tier"],
+                    "is_ooc": is_ooc,
+                    "mode_override": "ooc" if is_ooc else "",
                     "auto_send": False,
                     "ts": time.time(),
                 })
@@ -2635,6 +2657,10 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 "model_fallback": attribution["fallback"],
                 "model_tier": attribution["tier"],
                 "chat_id": chat_id_for_entry or "",
+                # POL-1: tells the extension to re-prefix `OOC: ` so the aside
+                # is not pasted as an in-character line.
+                "is_ooc": is_ooc,
+                "mode_override": "ooc" if is_ooc else "",
                 # MVP-9: per-word confidences from whisper-server JSON output.
                 # Empty when subprocess fallback ran or response carried no
                 # token-level data. Phase 4 UI consumer not yet wired.
@@ -2673,7 +2699,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(204)
         self._set_cors_origin()
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Dictation-Context")
         self.end_headers()
 
 

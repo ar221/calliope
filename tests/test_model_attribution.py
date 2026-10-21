@@ -123,3 +123,25 @@ def test_run_pipeline_resets_stale_attribution(tmp_path, monkeypatch):
     mode = {"id": "vocab_only", "pipeline": ["whisper", "vocab_correct"]}
     mod.run_pipeline("just some words", mode)
     assert mod.get_model_attribution()["model"] == ""
+
+
+def test_failed_formatter_does_not_report_cleanup_model(tmp_path, monkeypatch):
+    """disfluency_clean records its own model. If the formatter step that
+    follows fails, the result must not claim the cleanup model "formatted"
+    the text — the client renders `model` as the formatter attribution."""
+    mod = _load_server(tmp_path, monkeypatch)
+    monkeypatch.setattr(mod.config, "OMNIROUTE_CLEAN_CHAIN", ["clean/model"])
+    _install(
+        monkeypatch,
+        mod,
+        {"clean/model": _ok_body("one two three four five six seven eight nine ten eleven twelve"),
+         "claude/claude-opus-4-8": _err_body("internal explosion")},
+    )
+    mode = {"id": "narrator_past",
+            "pipeline": ["whisper", "disfluency_clean", "rp_enhance"],
+            "system_prompt": "narrate"}
+    out, skipped, _reason, cleaned = mod.run_pipeline(
+        "um one two three four five six seven eight nine ten eleven twelve", mode)
+    assert skipped is True
+    assert cleaned  # cleanup did run and recorded its model...
+    assert mod.get_model_attribution()["model"] == ""  # ...but it is not the formatter

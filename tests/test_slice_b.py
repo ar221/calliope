@@ -64,9 +64,13 @@ def test_capture_modes_preserve_phone_popup_and_define_desktop_semantics():
 def test_transcribe_request_carries_canonical_context_language_and_auth():
     source = _source()
     submit = _block(source, "async function submitDesktopRecording(capture)", "async function onMicClick()")
-    for param in ("mode", "context", "persona", "character", "language"):
+    for param in ("mode", "persona", "character", "language"):
         assert f"params.set('{param}'" in submit
-    assert "cfg.pushContext ? (ctx.lastAi || '') : ''" in submit
+    # Chat context must travel in a header, never the journaled request line.
+    assert "params.set('context'" not in submit
+    assert "'X-Dictation-Context': encodeURIComponent(contextText)" in submit
+    assert "cfg.pushContext ? String(ctx.lastAi || '').slice(-4000) : ''" in submit
+    assert "...contextHeaders" in submit
     assert "currentReformatCharacterKey()" in submit
     assert "await fetchCharMode(character)" in submit
     assert "/^(?:[a-z]{2,4}|auto)$/" in submit

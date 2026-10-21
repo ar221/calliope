@@ -204,6 +204,11 @@ OMNIROUTE_SELECTABLE_MODELS = _parse_model_chain(
 
 DEFAULT_MODEL = "large-v3-turbo"
 TRANSCRIPT_CONTEXT_LIMIT = 3000  # max chars of transcript to include in RP+ prompt
+# Max chars of client-supplied "last AI message" context per request. Clients
+# send it in the `X-Dictation-Context` header (percent-encoded), never in the
+# URL, so it stays out of journaled request lines; the cap keeps the header
+# well under http.server's 64 KiB line limit after encoding.
+REQUEST_CONTEXT_LIMIT = 4000
 PERSONAS_DIR = Path(os.environ.get("DICTATION_PERSONAS_DIR", Path.home() / "STWork/personas"))
 RULES_DIR = Path(os.environ.get("DICTATION_RULES_DIR", Path.home() / "STWork/rules"))
 # SillyTavern data root. `DICTATION_ST_DATA_ROOT` relocates the whole

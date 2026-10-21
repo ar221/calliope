@@ -2641,7 +2641,9 @@ async function sendAudio() {
   if (currentFormatterModel) params.set('formatter_model', currentFormatterModel);
   params.set('language', transcriptionLanguage);
   if (currentMode) params.set('mode', currentMode);
-  if (context) params.set('context', context);
+  // Chat context goes in a header, never the URL (request lines are journaled).
+  const contextHeaders = context
+    ? { 'X-Dictation-Context': encodeURIComponent(String(context).slice(-4000)) } : {};
 
   // Only send cast/chat params when the current mode actually uses them.
   const useCast = mode && (mode.use_persona || mode.use_character);
@@ -2659,7 +2661,7 @@ async function sendAudio() {
   try {
     const resp = await fetch(`/transcribe?${params}`, {
       method: 'POST',
-      headers: { 'Content-Type': mediaRecorder.mimeType },
+      headers: { 'Content-Type': mediaRecorder.mimeType, ...contextHeaders },
       body: blob,
     });
 
@@ -2671,7 +2673,11 @@ async function sendAudio() {
       lastRawText = data.raw || data.text;
       // Backend echoes the resolved mode id; fall back if missing.
       lastUsedMode = data.mode || currentMode;
-      showResult(data.text, { raw: lastRawText, cleaned: data.cleaned || '',
+      // POL-1: the server strips `OOC:` before formatting; put it back so the
+      // aside is not pasted into SillyTavern as an in-character line.
+      const resultText = (data.is_ooc === true && !/^\s*ooc\b/i.test(data.text || ''))
+        ? `OOC: ${data.text}` : data.text;
+      showResult(resultText, { raw: lastRawText, cleaned: data.cleaned || '',
                               repair_trace: data.repair_trace || null,
                               mode: lastUsedMode,
                               formatting_skipped: !!data.formatting_skipped,
