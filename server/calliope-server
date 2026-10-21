@@ -201,6 +201,7 @@ from calliope_server.sillytavern import (  # noqa: E402
     discover_group_characters,
     load_character_card,  # noqa: F401 — re-export for tests/back-compat
     build_character_context,  # noqa: F401 — re-export for tests/back-compat
+    canonical_character_key,
     ChatReader,
     ContextBuilder,
     _recent_chats_cache,  # noqa: F401 — re-export for tests/back-compat
@@ -1673,7 +1674,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/state/mode-memory":
             # GET /state/mode-memory            -> full {char_id: mode_id} map
             # GET /state/mode-memory?character= -> { character, mode } for one char
-            char = query.get("character", [""])[0]
+            char = canonical_character_key(query.get("character", [""])[0])
             if char:
                 self.send_json({
                     "character": char,
@@ -1853,7 +1854,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                                      code="missing_param", status=400)
                 return
             ctx = str(body.get("context", "") or "")
-            char = str(body.get("character_id", "") or body.get("character", "") or "")
+            char = canonical_character_key(body.get("character_id", "") or body.get("character", "") or "")
             try:
                 alts = word_alternatives(word, context=ctx, character_id=char)
             except Exception as e:
@@ -1926,7 +1927,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             except Exception:
                 self.send_error_json("Invalid JSON", code="bad_json", status=400)
                 return
-            char = str((body or {}).get("character", "")).strip()
+            char = canonical_character_key((body or {}).get("character", ""))
             mode_id = str((body or {}).get("mode", "")).strip()
             if not char:
                 self.send_error_json("Missing 'character'",
@@ -2322,7 +2323,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         context = clamp_request_context(data.get("context", ""))
         chat_source = data.get("chat_source", "")
         persona_id = data.get("persona", "")
-        character_id = data.get("character", "")
+        character_id = canonical_character_key(data.get("character", ""))
         scene_continuity = str(data.get("sceneContinuity") or "")[:2000]
         use_rules = bool(data.get("rules", False))
         prose_format = bool(data.get("prose", False))
@@ -2533,6 +2534,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 ctype = state_snap.get("chatType", "individual") or "individual"
                 chat_source = f"{ctype}:{state_snap['chatId']}"
             scene_continuity = str(state_snap.get("sceneContinuity") or "")[:2000]
+        character_id = canonical_character_key(character_id)
 
         # chat_id tag for per-chat transcript filtering (Phase 3)
         chat_id_for_entry = ""

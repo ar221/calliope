@@ -26,12 +26,12 @@ def _load_server(tmp_path, monkeypatch):
 def test_save_char_mode_empty_mode_deletes_persisted_key(tmp_path, monkeypatch):
     mod = _load_server(tmp_path, monkeypatch)
 
-    assert mod.save_char_mode("Camilla", "rp_enhance")["Camilla"] == "rp_enhance"
+    assert mod.save_char_mode("Camilla", "rp_enhance")["camilla"] == "rp_enhance"
     persisted = mod.save_char_mode("Camilla", "")
 
-    assert "Camilla" not in persisted
+    assert "camilla" not in persisted
     assert mod.get_char_mode("Camilla") == ""
-    assert "Camilla" not in mod.CHAR_MODES_FILE.read_text()
+    assert "camilla" not in mod.CHAR_MODES_FILE.read_text()
 
 
 def test_mode_memory_endpoint_returns_persisted_clear(tmp_path, monkeypatch):
@@ -62,7 +62,7 @@ def test_mode_memory_endpoint_returns_persisted_clear(tmp_path, monkeypatch):
 
     assert sent["status"] == 200
     assert sent["data"]["mode"] == ""
-    assert "Camilla" not in sent["data"]["modes"]
+    assert "camilla" not in sent["data"]["modes"]
     assert mod.get_char_mode("Camilla") == ""
 
 

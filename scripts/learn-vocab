@@ -17,8 +17,11 @@ Behaviour:
   - Dry-run by default. --apply writes vocab.yaml atomically.
   - De-dup against existing vocab.yaml (case-insensitive on `correct`).
   - Existing entry scoped to a DIFFERENT character: skip silently unless
-    --apply --merge-characters, in which case current character (lowered)
-    is appended to its `characters:` list.
+    --apply --merge-characters, in which case the current character's
+    canonical key is appended to its `characters:` list.
+  - Character scope keys use the server's canonical character key
+    (`canonical_character_key`: no image extension, casefolded), so an
+    entry learned from chats/Elara/ applies when ST sends `Elara.png`.
   - Casing: keeps the longest-form representative (Kael'thas > kael).
 
 Optional follow-ups (NOT implemented):
@@ -51,6 +54,7 @@ import pathlib
 import re
 import sys
 import tempfile
+import unicodedata
 from typing import Iterable
 
 # ─── Optional deps ───────────────────────────────────────────────────
@@ -398,12 +402,32 @@ def find_existing(vocab: list[dict], correct: str) -> int | None:
     return None
 
 
+# Mirror of calliope_server.sillytavern.canonical_character_key. This script
+# ships standalone (packaging installs it without the server package), so it
+# keeps its own copy; tests/test_character_key.py pins parity.
+_CHARACTER_IMAGE_EXT_RE = re.compile(r"\.(?:png|webp|jpe?g|gif)$", re.IGNORECASE)
+
+
+def canonical_character_key(raw: object) -> str:
+    """Return the server's canonical key for a character reference."""
+    text = unicodedata.normalize("NFC", str(raw or ""))
+    text = text.replace("\\", "/").rsplit("/", 1)[-1]
+    text = " ".join(text.split())
+    text = _CHARACTER_IMAGE_EXT_RE.sub("", text).strip()
+    return unicodedata.normalize("NFC", " ".join(text.casefold().split()))
+
+
 def entry_chars(entry: dict) -> list[str]:
-    """Return lowercased characters list (matching server normalization)."""
+    """Return canonical character keys (matching server normalization)."""
     raw = entry.get("characters") or []
     if isinstance(raw, str):
         raw = [raw]
-    return [str(c).strip().lower() for c in raw if str(c).strip()]
+    out: list[str] = []
+    for c in raw:
+        key = canonical_character_key(c)
+        if key and key not in out:
+            out.append(key)
+    return out
 
 
 # ─── Per-character processing ────────────────────────────────────────
@@ -448,7 +472,7 @@ def process_character(
     result["chats"] = chat_count
     result["messages"] = msg_count
 
-    char_lo = character.strip().lower()
+    char_lo = canonical_character_key(character)
 
     for word, count in proposals:
         idx = find_existing(vocab, word)

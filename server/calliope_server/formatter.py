@@ -38,6 +38,7 @@ from . import config, events
 from .sillytavern import (
     ChatReader,
     build_character_context,
+    canonical_character_key,
     load_character_card,
     load_persona_full,
     load_persona_voice,
@@ -587,8 +588,27 @@ def _ensure_char_modes_file() -> None:
         log.warning(f"Could not seed {config.CHAR_MODES_FILE}: {e}")
 
 
+def _canonicalize_char_modes(data: dict) -> dict:
+    """Re-key a char-modes mapping through `canonical_character_key`.
+
+    Legacy files can hold `Elara.png` and `elara` side by side; they merge
+    into one key with last-write-wins (later file entries override earlier).
+    """
+    out: dict = {}
+    for raw_key, mode_id in data.items():
+        key = canonical_character_key(raw_key)
+        if key:
+            out.pop(key, None)  # re-insert so file order reflects the winner
+            out[key] = mode_id
+    return out
+
+
 def load_char_modes() -> dict:
-    """Load the per-character mode memory dict. Cached by mtime."""
+    """Load the per-character mode memory dict. Cached by mtime.
+
+    Keys are canonical character keys. A legacy file with non-canonical keys
+    is migrated in memory and written back once.
+    """
     try:
         mtime = config.CHAR_MODES_FILE.stat().st_mtime
     except FileNotFoundError:
@@ -617,25 +637,34 @@ def load_char_modes() -> dict:
         except Exception as e:
             log.warning(f"Failed to parse {config.CHAR_MODES_FILE}: {e} — using empty")
             data = {}
-        _char_modes_cache["data"] = data
+        canonical = _canonicalize_char_modes(data)
+        if list(canonical.items()) != list(data.items()):
+            try:
+                _atomic_write(config.CHAR_MODES_FILE, _serialize_config(canonical))
+                mtime = config.CHAR_MODES_FILE.stat().st_mtime
+                log.info(f"Migrated {config.CHAR_MODES_FILE} to canonical character keys")
+            except Exception as e:
+                log.warning(f"Failed to migrate {config.CHAR_MODES_FILE}: {e}")
+        _char_modes_cache["data"] = canonical
         _char_modes_cache["mtime"] = mtime
-        return data
+        return canonical
 
 
 def save_char_mode(character_id: str, mode_id: str) -> dict:
     """Persist or clear a character mode. Returns the full persisted mapping."""
-    if not character_id:
+    key = canonical_character_key(character_id)
+    if not key:
         return load_char_modes()
     with char_modes_lock:
         current = dict(load_char_modes())  # copy
         if mode_id:
-            if current.get(character_id) == mode_id:
+            if current.get(key) == mode_id:
                 return current
-            current[character_id] = mode_id
+            current[key] = mode_id
         else:
-            if character_id not in current:
+            if key not in current:
                 return current
-            del current[character_id]
+            del current[key]
         try:
             _atomic_write(config.CHAR_MODES_FILE, _serialize_config(current))
         except Exception as e:
@@ -651,9 +680,10 @@ def save_char_mode(character_id: str, mode_id: str) -> dict:
 
 def get_char_mode(character_id: str) -> str:
     """Return the remembered mode id for a character, or empty string."""
-    if not character_id:
+    key = canonical_character_key(character_id)
+    if not key:
         return ""
-    return load_char_modes().get(character_id, "")
+    return load_char_modes().get(key, "")
 
 
 # ─── Phase 3: ST state helpers ───────────────────────────
@@ -1687,7 +1717,11 @@ def _normalize_vocab_entry(entry: dict) -> dict | None:
     characters_raw = entry.get("characters") or []
     if isinstance(characters_raw, str):
         characters_raw = [characters_raw]
-    characters = [str(c).strip().lower() for c in characters_raw if str(c).strip()]
+    characters: list[str] = []
+    for c in characters_raw:
+        key = canonical_character_key(c)
+        if key and key not in characters:
+            characters.append(key)
     out: dict = {"correct": correct, "aliases": aliases}
     if characters:
         out["characters"] = characters
@@ -2111,14 +2145,14 @@ def _invalidate_voice_macros_cache() -> None:
 
 
 def _applies_to_character(entry: dict, character_id: str) -> bool:
-    """Vocab entry's optional `characters` scope check (case-insensitive)."""
+    """Vocab entry's optional `characters` scope check (canonical keys)."""
     chars = entry.get("characters") or []
     if not chars:
         return True
-    cid = (character_id or "").lower()
+    cid = canonical_character_key(character_id)
     if not cid:
         return False
-    return cid in chars
+    return any(canonical_character_key(c) == cid for c in chars)
 
 
 def vocab_correct(text: str, character_id: str = "") -> str:

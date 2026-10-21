@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import threading
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 
@@ -17,6 +18,26 @@ from . import config
 from .config import _safe_child
 
 log = logging.getLogger("dictation-server")
+
+# ST avatars arrive as image filenames (`Elara.png`); learn-vocab scopes by
+# chat directory (`elara`); the phone may send a display stem. All collapse to
+# one key via `canonical_character_key`.
+_CHARACTER_IMAGE_EXT_RE = re.compile(r"\.(?:png|webp|jpe?g|gif)$", re.IGNORECASE)
+
+
+def canonical_character_key(raw: object) -> str:
+    """Return the one canonical key for a character reference.
+
+    Strips directory parts and a trailing image extension, NFC-normalises,
+    casefolds and collapses whitespace: `Elara.png`, `elara` and ` ELARA `
+    all map to `elara`. Used for vocab scoping and mode memory; card files
+    on disk are resolved separately by `_resolve_character_card_path`.
+    """
+    text = unicodedata.normalize("NFC", str(raw or ""))
+    text = text.replace("\\", "/").rsplit("/", 1)[-1]
+    text = " ".join(text.split())
+    text = _CHARACTER_IMAGE_EXT_RE.sub("", text).strip()
+    return unicodedata.normalize("NFC", " ".join(text.casefold().split()))
 
 
 def _expand_persona_macros(text: str, display_name: str) -> str:
@@ -217,6 +238,33 @@ def discover_group_characters(group_id: str) -> list[dict]:
     return [{"id": m["name"], "name": m["name"]} for m in members]
 
 
+def _resolve_character_card_path(char_id: str) -> Path | None:
+    """Find the card PNG in CHARACTERS_DIR for any form of character reference.
+
+    Accepts the raw ST avatar (`Elara.png`), a stem in any case (`Elara`) or
+    the canonical key (`elara`). Tries the exact-case `<stem>.png` first, then
+    matches stems case-insensitively via `canonical_character_key`. Only
+    files directly inside CHARACTERS_DIR are ever returned.
+    """
+    key = canonical_character_key(char_id)
+    if not key or key in (".", ".."):
+        return None
+    base = config.CHARACTERS_DIR
+    stem = _CHARACTER_IMAGE_EXT_RE.sub("", str(char_id or "").strip())
+    exact = _safe_child(base, stem, ".png")
+    if exact is not None and exact.is_file():
+        return exact
+    if not base.is_dir():
+        return None
+    for f in sorted(base.glob("*.png")):
+        if canonical_character_key(f.stem) == key:
+            candidate = _safe_child(base, f.name)
+            if candidate is not None and candidate.is_file():
+                return candidate
+    return None
+
+
+
 def load_character_card(char_id: str) -> dict:
     """Extract chara_card_v2 JSON from a character PNG's tEXt chunk.
 
@@ -229,14 +277,13 @@ def load_character_card(char_id: str) -> dict:
     import struct
     import base64
 
-    card_path = _safe_child(config.CHARACTERS_DIR, char_id, ".png")
+    card_path = _resolve_character_card_path(char_id)
     if card_path is None:
-        return {}
-    if not card_path.exists():
         # Disambiguate: a UUID-ish id with no PNG → could be a group id
         # the bridge sent before the addressee picker shipped.
+        key = canonical_character_key(char_id)
         try:
-            if char_id and char_id in ChatReader.get_group_id_set():
+            if key and key in {canonical_character_key(g) for g in ChatReader.get_group_id_set()}:
                 return {"error": "group_id_not_a_character", "group_id": char_id}
         except Exception:  # pragma: no cover — defensive: never let group probe break card load
             pass
