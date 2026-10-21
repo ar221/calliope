@@ -301,7 +301,10 @@ def test_health_payload_unprivileged_is_minimal(mod):
 def test_health_payload_privileged_is_full(mod):
     payload = mod.DictationHandler._health_payload(FakeHandler(), privileged=True)
     assert payload["status"] == "ok"
-    assert "providers" in payload
+    assert payload["formatter_provider"] == "omniroute"
+    assert payload["formatter_models"]
+    assert "providers" not in payload
+    assert "formatter_models_by_provider" not in payload
     assert "mode_count" in payload
 
 

@@ -187,12 +187,11 @@ Environment-variable overrides (set in `~/.config/systemd/user/dictation-server.
 - TLS cert/key live under `~/.local/share/dictation-server/`; Tailscale/mkcert flows should write `cert.pem` and `key.pem` there. See [`docs/tailscale.md`](docs/tailscale.md).
 - `WHISPER_BIN`, `WHISPER_SERVER_BIN`, `WHISPER_MODEL` — override binary
   and model paths.
-- `DICTATION_FORMATTER_PROVIDER` — retained as an API compatibility field;
-  all values normalize to the sole formatter transport, `omniroute`.
-  `DICTATION_OMNIROUTE_URL`, `DICTATION_OMNIROUTE_RP_CHAIN`,
+- `DICTATION_OMNIROUTE_URL`, `DICTATION_OMNIROUTE_RP_CHAIN`,
   `DICTATION_OMNIROUTE_CLEAN_CHAIN`, and `DICTATION_OMNIROUTE_SELECTABLE_MODELS`
-  configure its endpoint and catalog-qualified model IDs. Authentication uses
-  `OMNIROUTE_API_KEY` from the process environment or the user's fish key file.
+  configure the OmniRoute formatter gateway (the only formatter route) and its
+  catalog-qualified model IDs. Authentication uses `OMNIROUTE_API_KEY` from
+  the process environment or the user's fish key file.
 - `DICTATION_ST_DATA_ROOT` — SillyTavern `data/default-user` directory;
   relocates the whole ST data tree in one shot. `DICTATION_CHARACTERS_DIR`,
   `DICTATION_ST_CHATS_DIR`, `DICTATION_ST_GROUPS_DIR`, and

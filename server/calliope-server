@@ -132,9 +132,6 @@ from calliope_server.config import (  # noqa: E402
     _parse_model_chain,  # noqa: F401 — re-export for tests/back-compat
     _safe_child,  # noqa: F401 — moved to config (neutral home); re-export for tests/back-compat
     OMNIROUTE_RP_CHAIN,
-    OMNIROUTE_CLEAN_CHAIN,  # noqa: F401 — re-export for tests/back-compat
-    _VALID_PROVIDERS,
-    DEFAULT_FORMATTER_PROVIDER,
     DEFAULT_MODEL,
     TRANSCRIPT_CONTEXT_LIMIT,  # noqa: F401 — re-export for tests/back-compat
     PERSONAS_DIR,  # noqa: F401 — re-export for tests/back-compat
@@ -154,7 +151,6 @@ from calliope_server.config import (  # noqa: E402
     WHISPER_PROMPT_TOKEN_CAP,  # noqa: F401 — re-export for tests/back-compat
     STATE_FRESH_SECONDS,  # noqa: F401 — re-export for tests/back-compat
     STATE_STALE_SECONDS,  # noqa: F401 — re-export for tests/back-compat
-    DISFLUENCY_CLEAN_MODEL,  # noqa: F401 — re-export for tests/back-compat
     DISFLUENCY_CLEAN_TIMEOUT,  # noqa: F401 — re-export for tests/back-compat
     DISFLUENCY_CLEAN_MAX_WORDS,  # noqa: F401 — re-export for tests/back-compat
     DISFLUENCY_CLEAN_MIN_WORDS,  # noqa: F401 — re-export for tests/back-compat
@@ -293,7 +289,6 @@ from calliope_server.formatter import (  # noqa: E402
     GRAMMAR_CLEAN_SYSTEM,  # noqa: F401 — re-export for tests/back-compat
     DISFLUENCY_CLEAN_SYSTEM,  # noqa: F401 — re-export for tests/back-compat
     build_transcript_context,  # noqa: F401 — re-export for tests/back-compat
-    normalize_formatter_provider,
     reset_model_attribution,  # noqa: F401 — re-export for tests/back-compat
     record_model_attribution,  # noqa: F401 — re-export for tests/back-compat
     get_model_attribution,
@@ -339,7 +334,7 @@ from calliope_server.formatter import (  # noqa: E402
     mode_has_formatter_step,
     save_mode_formatter,
     selectable_models,
-    resolve_formatter_target,  # noqa: F401 — re-export for tests
+    resolve_formatter_model,  # noqa: F401 — re-export for tests
     _normalize_vocab_entry,
     load_vocab,
     _invalidate_vocab_cache,
@@ -352,7 +347,6 @@ from calliope_server.formatter import (  # noqa: E402
     PURE_COMMAND_INTENTS,  # noqa: F401 — re-export for tests/back-compat
     _voice_macros_cache,  # noqa: F401 — re-export for tests/back-compat
     voice_macros_lock,  # noqa: F401 — re-export for tests/back-compat
-    COMMAND_RE,  # noqa: F401 — re-export for tests/back-compat
     OOC_PREFIX_RE,
     _build_voice_macros_regex,  # noqa: F401 — re-export for tests/back-compat
     _ensure_voice_macros_compiled,  # noqa: F401 — re-export for tests/back-compat
@@ -1412,18 +1406,14 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
     def _health_payload(self, privileged: bool) -> dict:
         """Full health payload for loopback/tokened callers, bare otherwise."""
         if not privileged:
-            # 2026-07 audit: no provider list, mode count, or cert expiry for
+            # 2026-07 audit: no model list, mode count, or cert expiry for
             # unauthenticated non-loopback probes.
             return {"status": "ok"}
         days = cert_days_remaining()
         payload = {
             "status": "ok",
-            "providers": sorted(_VALID_PROVIDERS),
-            "default_provider": DEFAULT_FORMATTER_PROVIDER,
-            "formatter_models": selectable_models(DEFAULT_FORMATTER_PROVIDER),
-            "formatter_models_by_provider": {
-                p: selectable_models(p) for p in sorted(_VALID_PROVIDERS)
-            },
+            "formatter_provider": "omniroute",
+            "formatter_models": selectable_models(),
             "mode_count": len(load_modes()),
         }
         if days is not None:
@@ -1469,11 +1459,9 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/personas":
             self.send_json({"personas": discover_personas()})
         elif path == "/formatter-models":
-            models = selectable_models("omniroute")
             self.send_json({
                 "provider": "omniroute",
-                "models": models,
-                "by_provider": {"omniroute": models},
+                "models": selectable_models(),
             })
         elif path == "/characters":
             # POL-6 — `?group=<groupId>` filters to that group's members.
@@ -1828,10 +1816,9 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 "modes": updated,
             })
         elif path == "/modes/formatter":
-            # Per-mode LLM assignment. Body:
-            #   {mode: <mode_id>, model: <model|"">, provider: <provider|"">}
-            # Empty model clears the pin and the mode reverts to its
-            # provider's fallback chain.
+            # Per-mode LLM assignment. Body: {mode: <mode_id>, model: <model|"">}
+            # Empty model clears the pin and the mode reverts to the OmniRoute
+            # fallback chain. A legacy `provider` key is ignored.
             try:
                 body = self.read_json_body()
             except Exception:
@@ -1842,7 +1829,6 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 updated = save_mode_formatter(
                     str(body.get("mode", "")).strip(),
                     str(body.get("model", "")).strip(),
-                    str(body.get("provider", "")).strip(),
                 )
             except ValueError as e:
                 self.send_error_json(str(e), code="bad_mode_formatter", status=400)
@@ -2182,13 +2168,12 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             rp_int = 2
         mode = resolve_mode(rp=rp_int, mode_id=mode_id)
-        provider = normalize_formatter_provider(
-            data.get("provider") or params.get("provider", [""])[0] or DEFAULT_FORMATTER_PROVIDER
-        )
+        # Clients may still send a legacy `provider` field; OmniRoute is the
+        # only formatter route, so it is ignored.
         formatter_model = str(data.get("formatter_model") or "").strip()
-        if formatter_model and formatter_model not in selectable_models(provider):
+        if formatter_model and formatter_model not in selectable_models():
             self.send_error_json(
-                f"Model '{formatter_model}' is not selectable for provider '{provider}'",
+                f"Model '{formatter_model}' is not selectable on OmniRoute",
                 code="bad_formatter_model", status=400,
             )
             return
@@ -2225,7 +2210,6 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 "raw": text,
                 "cleaned": "",
                 "mode": mode.get("id"),
-                "provider": provider,
                 "formatting_skipped": True,
                 "formatting_reason": (
                     f"mode '{mode.get('id')}' has no formatter step — nothing to reformat"
@@ -2276,7 +2260,6 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             scene_continuity=scene_continuity,
             use_rules=use_rules,
             prose_format=prose_format,
-            provider=provider,
             formatter_model=formatter_model,
         )
 
@@ -2327,9 +2310,6 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             "cleaned": cleaned_text,
             "repair_trace": repair_trace,
             "mode": mode.get("id"),
-            # A per-mode pin can route to a different provider than the client
-            # asked for, so report the one that actually produced the text.
-            "provider": attribution["provider"] or provider,
             "transcript_count": transcript_count,
             "formatting_skipped": formatting_skipped,
             "formatting_reason": formatting_reason,
@@ -2363,13 +2343,11 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         except ValueError:
             rp_int = 0
         mode = resolve_mode(rp=rp_int, mode_id=mode_id)
-        provider = normalize_formatter_provider(
-            params.get("provider", [DEFAULT_FORMATTER_PROVIDER])[0]
-        )
+        # A legacy `provider` query param is ignored: OmniRoute is the only route.
         formatter_model = params.get("formatter_model", [""])[0].strip()
-        if formatter_model and formatter_model not in selectable_models(provider):
+        if formatter_model and formatter_model not in selectable_models():
             self.send_error_json(
-                f"Model '{formatter_model}' is not selectable for provider '{provider}'",
+                f"Model '{formatter_model}' is not selectable on OmniRoute",
                 code="bad_formatter_model", status=400,
             )
             return
@@ -2562,7 +2540,6 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 scene_continuity=scene_continuity,
                 use_rules=use_rules,
                 prose_format=prose_format,
-                provider=provider,
                 formatter_model=formatter_model,
                 request_id=request_id,
                 timing=timing,
@@ -2597,7 +2574,6 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                     "text": output_text,
                     "has_repair_trace": repair_trace.get("has_changes", False),
                     "mode": mode.get("id", ""),
-                    "provider": attribution["provider"] or provider,
                     "formatting_skipped": formatting_skipped,
                     "formatting_reason": formatting_reason,
                     "model": attribution["model"],
@@ -2652,7 +2628,6 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 "cleaned": cleaned_text,
                 "repair_trace": repair_trace,
                 "mode": mode.get("id"),
-                "provider": attribution["provider"] or provider,
                 "transcript_count": transcript_count,
                 "formatting_skipped": formatting_skipped,
                 "formatting_reason": formatting_reason,

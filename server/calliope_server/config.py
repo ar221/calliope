@@ -202,8 +202,6 @@ OMNIROUTE_SELECTABLE_MODELS = _parse_model_chain(
     ],
 )
 
-_VALID_PROVIDERS = {"omniroute"}
-DEFAULT_FORMATTER_PROVIDER = "omniroute"
 DEFAULT_MODEL = "large-v3-turbo"
 TRANSCRIPT_CONTEXT_LIMIT = 3000  # max chars of transcript to include in RP+ prompt
 PERSONAS_DIR = Path(os.environ.get("DICTATION_PERSONAS_DIR", Path.home() / "STWork/personas"))
@@ -253,7 +251,6 @@ WHISPER_PROMPT_TOKEN_CAP = 200  # approx; we truncate by word count
 STATE_FRESH_SECONDS = 60    # < this = fresh, banner shows "Following ST"
 STATE_STALE_SECONDS = 120   # between fresh and this = stale, banner warns
 # > STATE_STALE_SECONDS = dead, server UI reverts to manual
-DISFLUENCY_CLEAN_MODEL = "codex/gpt-5.6-sol-low"
 DISFLUENCY_CLEAN_TIMEOUT = 3.0  # seconds; falls through to raw on timeout
 DISFLUENCY_CLEAN_MAX_WORDS = 500  # skip cleanup if input exceeds this
 DISFLUENCY_CLEAN_MIN_WORDS = 12  # skip cleanup below this — LLM round-trip

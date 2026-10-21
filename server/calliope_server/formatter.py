@@ -240,11 +240,6 @@ DISFLUENCY_CLEAN_SYSTEM = (
 )
 
 
-def normalize_formatter_provider(provider: str | None) -> str:
-    """The provider field remains in the client API; OmniRoute is its sole route."""
-    return "omniroute"
-
-
 # ─── Model attribution ─────────────────────────────────────
 # The formatter chain can fall through several models per request. We record
 # which model actually produced the final text in a thread-local slot so the
@@ -256,19 +251,17 @@ _attribution = threading.local()
 
 def reset_model_attribution() -> None:
     """Clear the per-request attribution slot at the start of a pipeline run."""
-    _attribution.provider = ""
     _attribution.model = ""
     _attribution.fallback = False
     _attribution.tier = 0
 
 
-def record_model_attribution(provider: str, model: str, *, tier: int) -> None:
+def record_model_attribution(model: str, *, tier: int) -> None:
     """Record the model that produced the final formatted text.
 
     tier is the 0-based index into the model chain; tier > 0 means one or more
     earlier models were skipped (fallback occurred).
     """
-    _attribution.provider = provider
     _attribution.model = model
     _attribution.tier = tier
     _attribution.fallback = tier > 0
@@ -277,57 +270,50 @@ def record_model_attribution(provider: str, model: str, *, tier: int) -> None:
 def get_model_attribution() -> dict:
     """Return the last-recorded attribution for this thread (safe defaults)."""
     return {
-        "provider": getattr(_attribution, "provider", ""),
         "model": getattr(_attribution, "model", ""),
         "fallback": getattr(_attribution, "fallback", False),
         "tier": getattr(_attribution, "tier", 0),
     }
 
 
-def formatter_base_url(provider: str) -> str:
-    normalize_formatter_provider(provider)
+def formatter_base_url() -> str:
     base = config.OMNIROUTE_PROXY_URL.strip().rstrip("/")
     return base[:-3] if base.endswith("/v1") else base
 
 
-def formatter_health_url(provider: str) -> str:
-    return f"{formatter_base_url(provider)}/v1/models"
+def formatter_health_url() -> str:
+    return f"{formatter_base_url()}/v1/models"
 
 
-def formatter_request_url(provider: str, endpoint_override: str = "") -> str:
-    return f"{formatter_base_url(provider)}/v1/chat/completions"
+def formatter_request_url() -> str:
+    return f"{formatter_base_url()}/v1/chat/completions"
 
 
-def provider_chain(provider: str, *, cleanup: bool = False) -> list[str]:
+def default_model_chain(*, cleanup: bool = False) -> list[str]:
     """The configured OmniRoute fallback chain."""
-    normalize_formatter_provider(provider)
     chain = config.OMNIROUTE_CLEAN_CHAIN if cleanup else config.OMNIROUTE_RP_CHAIN
     return [m for m in chain if m]
 
 
-def selectable_models(provider: str) -> list[str]:
+def selectable_models() -> list[str]:
     """Catalog-qualified OmniRoute model IDs clients may pin explicitly."""
-    normalize_formatter_provider(provider)
     return list(config.OMNIROUTE_SELECTABLE_MODELS)
 
 
-def formatter_model_chain(provider: str, *, cleanup: bool = False,
-                          model_override: str = "") -> list[str]:
+def formatter_model_chain(*, cleanup: bool = False, model_override: str = "") -> list[str]:
     """Ordered fallback chain, or one allow-listed explicitly-pinned model.
 
-    An empty list means the caller asked for a model this provider will not
-    serve; callers surface that rather than silently substituting another.
+    An empty list means the caller asked for a model OmniRoute will not serve
+    here; callers surface that rather than silently substituting another.
     """
-    provider = normalize_formatter_provider(provider)
     if model_override:
-        if model_override not in selectable_models(provider):
+        if model_override not in selectable_models():
             return []
         return [model_override]
-    return provider_chain(provider, cleanup=cleanup)
+    return default_model_chain(cleanup=cleanup)
 
 
 def formatter_payload(
-    provider: str,
     *,
     system_prompt: str,
     user_content: str,
@@ -335,7 +321,6 @@ def formatter_payload(
     max_tokens: int,
     temperature: float | None,
 ) -> dict:
-    normalize_formatter_provider(provider)
     messages = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
@@ -447,37 +432,38 @@ def _attempt_timeout(deadline: float, per_attempt: float) -> float:
     return min(per_attempt, max(0.0, deadline - time.monotonic()))
 
 
-# provider -> (expires_at_monotonic, healthy, reason)
-_probe_cache: dict[str, tuple[float, bool, str]] = {}
+# (expires_at_monotonic, healthy, reason) for the single OmniRoute gateway.
+_probe_cache: tuple[float, bool, str] | None = None
 _probe_lock = threading.Lock()
 
 
 def reset_probe_cache() -> None:
-    """Drop cached liveness verdicts (config reload / tests)."""
+    """Drop the cached liveness verdict (config reload / tests)."""
+    global _probe_cache
     with _probe_lock:
-        _probe_cache.clear()
+        _probe_cache = None
 
 
-def probe_formatter(provider: str, timeout: float | None = None) -> tuple[bool, str]:
+def probe_formatter(timeout: float | None = None) -> tuple[bool, str]:
     """Authenticated OmniRoute liveness check, cached for a few seconds.
 
     `/v1/models` rebuilds a large catalog and can exceed 3s cold, so the probe
     budget is configurable and its verdict cached. A missing API key fails
     closed before any network request.
     """
-    provider = normalize_formatter_provider(provider)
+    global _probe_cache
     if not config.OMNIROUTE_API_KEY:
         return False, "OMNIROUTE_API_KEY is required"
     if timeout is None:
         timeout = config.FORMATTER_PROBE_TIMEOUT_SECONDS
     now = time.monotonic()
     with _probe_lock:
-        cached = _probe_cache.get(provider)
+        cached = _probe_cache
         if cached is not None and now < cached[0]:
             return cached[1], cached[2]
     try:
         req = urllib.request.Request(
-            formatter_health_url(provider),
+            formatter_health_url(),
             headers={"Authorization": f"Bearer {config.OMNIROUTE_API_KEY}"},
             method="GET",
         )
@@ -496,11 +482,11 @@ def probe_formatter(provider: str, timeout: float | None = None) -> tuple[bool, 
         # A failing probe burns its whole timeout, so `now + ttl` was already in
         # the past whenever timeout > ttl — the failure verdict expired on
         # arrival and every request re-paid the full probe with the proxy down.
-        _probe_cache[provider] = (time.monotonic() + ttl, healthy, reason)
+        _probe_cache = (time.monotonic() + ttl, healthy, reason)
     return healthy, reason
 
 
-def disfluency_clean(text: str, provider: str = config.DEFAULT_FORMATTER_PROVIDER) -> tuple[str, bool, str]:
+def disfluency_clean(text: str) -> tuple[str, bool, str]:
     """Run a cheap-model cleanup pass to remove stutters/fillers/restarts.
 
     Returns (cleaned_text, was_cleaned, reason_if_skipped).
@@ -516,22 +502,20 @@ def disfluency_clean(text: str, provider: str = config.DEFAULT_FORMATTER_PROVIDE
     if word_count > config.DISFLUENCY_CLEAN_MAX_WORDS:
         return text, False, f"input {word_count} words exceeds cap {config.DISFLUENCY_CLEAN_MAX_WORDS}"
 
-    provider = normalize_formatter_provider(provider)
     # The configurable budget accommodates a cold `/v1/models` catalog build.
-    healthy, _reason = probe_formatter(provider)
+    healthy, _reason = probe_formatter()
     if not healthy:
-        log.info("disfluency_clean: %s formatter unreachable — passing through raw", provider)
-        return text, False, f"cleanup gateway unreachable ({provider})"
+        log.info("disfluency_clean: OmniRoute unreachable — passing through raw")
+        return text, False, "cleanup gateway unreachable (omniroute)"
 
-    request_url = formatter_request_url(provider)
-    chain = formatter_model_chain(provider, cleanup=True)
+    request_url = formatter_request_url()
+    chain = formatter_model_chain(cleanup=True)
     last_reason = "cleanup failed"
 
     for idx, model in enumerate(chain):
         has_next = idx + 1 < len(chain)
         payload = json.dumps(
             formatter_payload(
-                provider,
                 system_prompt=DISFLUENCY_CLEAN_SYSTEM,
                 user_content=text,
                 model=model,
@@ -572,7 +556,7 @@ def disfluency_clean(text: str, provider: str = config.DEFAULT_FORMATTER_PROVIDE
                     f"({len(cleaned.split())} words vs {word_count}) — falling back to raw"
                 )
                 return text, False, "cleanup output too short, possible truncation"
-            record_model_attribution(provider, model, tier=idx)
+            record_model_attribution(model, tier=idx)
             return cleaned, True, ""
         except Exception as e:
             msg = str(e)
@@ -861,7 +845,7 @@ class _ThinkingTagFilter:
     """State machine that suppresses bytes between <thinking>...</thinking>
     in a token-streamed payload.
 
-    Pyrite preset emits substantial thinking blocks at the start of the
+    Reasoning models can emit substantial thinking blocks at the start of the
     response. Without filtering, the SSE delta consumer would flash the
     raw chain-of-thought into #send_textarea before the final
     `dictation-result` event overwrote it. We keep a tiny char-by-char
@@ -952,7 +936,7 @@ _FORMATTER_LEADIN_RE = re.compile(
 def strip_formatter_preamble(output: str) -> str:
     """Drop model meta-commentary before the actual rewritten dictation.
 
-    Pyrite-style formatters sometimes emit chain-of-thought as normal text
+    Formatters sometimes emit chain-of-thought as normal text
     instead of inside <thinking> tags, e.g. a paragraph analyzing the scene and
     ending with "Let's go." before the real RP prose. Prompts tell it not to,
     but the final paste path must be defensive: if the first paragraph looks
@@ -991,12 +975,12 @@ def strip_formatter_preamble(output: str) -> str:
     return text
 
 
-def _parse_sse_delta(provider: str, line_data: str) -> tuple[str, bool]:
-    """Parse one SSE `data:` line; return (delta_text, is_done).
+def _parse_sse_delta(line_data: str) -> tuple[str, bool]:
+    """Parse one OpenAI-shape SSE `data:` line; return (delta_text, is_done).
 
-    Handles both OpenAI shape (`{"choices":[{"delta":{"content":"..."}}]}`)
-    and Anthropic shape (`{"type":"content_block_delta","delta":{"text":"..."}}`,
-    `{"type":"message_stop"}`). Unrecognized event payloads return ("", False).
+    `{"choices":[{"delta":{"content":"..."}}]}` chunks and the `[DONE]`
+    sentinel are the only shapes `/v1/chat/completions` streams; anything else
+    returns ("", False).
     """
     if not line_data:
         return "", False
@@ -1008,21 +992,6 @@ def _parse_sse_delta(provider: str, line_data: str) -> tuple[str, bool]:
         return "", False
     if not isinstance(obj, dict):
         return "", False
-    # Anthropic shape
-    t = obj.get("type")
-    if t == "content_block_delta":
-        delta = obj.get("delta") or {}
-        if isinstance(delta, dict):
-            text = delta.get("text") or ""
-            if isinstance(text, str):
-                return text, False
-        return "", False
-    if t in ("message_stop", "message_delta"):
-        # message_delta carries stop_reason; treat message_stop as done.
-        return "", t == "message_stop"
-    if t in ("content_block_start", "content_block_stop", "message_start", "ping"):
-        return "", False
-    # OpenAI shape
     choices = obj.get("choices")
     if isinstance(choices, list) and choices:
         ch0 = choices[0] or {}
@@ -1040,7 +1009,7 @@ def _parse_sse_delta(provider: str, line_data: str) -> tuple[str, bool]:
     return "", False
 
 
-def _stream_formatter(url: str, payload: bytes, provider: str,
+def _stream_formatter(url: str, payload: bytes,
                        on_delta, timeout: float,
                        deadline: float | None = None) -> tuple[str, str]:
     """POST `payload` with stream=True; parse SSE deltas; call `on_delta(text)`
@@ -1087,7 +1056,7 @@ def _stream_formatter(url: str, payload: bytes, provider: str,
                     continue
                 if line.startswith("data:"):
                     data_str = line[len("data:"):].strip()
-                    delta, done = _parse_sse_delta(provider, data_str)
+                    delta, done = _parse_sse_delta(data_str)
                     if delta:
                         visible = tag_filter.feed(delta)
                         if visible:
@@ -1118,11 +1087,9 @@ def format_rp(text: str, mode: int = 1, context: str = "",
                scene_continuity: str = "",
                scene_contract: dict | None = None,
                system_prompt_override: str = "",
-               endpoint_override: str = "",
                skip_persona_character: bool = False,
                user_content_override: str = "",
                temperature: float | None = None,
-               provider: str = config.DEFAULT_FORMATTER_PROVIDER,
                request_id: str = "",
                model_override: str = "") -> tuple[str, bool, str]:
     """Format text through authenticated OmniRoute.
@@ -1145,8 +1112,7 @@ def format_rp(text: str, mode: int = 1, context: str = "",
     Returns (formatted_text, formatting_skipped, reason).
     On skip/failure, formatted_text is the raw input and reason explains why.
     """
-    provider = normalize_formatter_provider(provider)
-    healthy, _reason = probe_formatter(provider)
+    healthy, _reason = probe_formatter()
     if not healthy:
         log.warning("OmniRoute formatter not reachable — returning raw text")
         return text, True, "RP gateway offline (OmniRoute not reachable)"
@@ -1155,10 +1121,6 @@ def format_rp(text: str, mode: int = 1, context: str = "",
         system_prompt = system_prompt_override
     else:
         system_prompt = RP_SYSTEM_ENHANCE if mode == 2 else RP_SYSTEM_FORMAT
-    if endpoint_override:
-        endpoint = endpoint_override
-    else:
-        endpoint = "/v1/pyrite/messages" if mode == 2 else "/v1/messages"
 
     # Apply format override (prose vs asterisks)
     if mode == 2 and prose_format:
@@ -1225,13 +1187,11 @@ def format_rp(text: str, mode: int = 1, context: str = "",
 
         user_content += f"[YOUR DICTATED INPUT — rewrite ONLY this, in the persona's voice, addressing the character above:]\n{text}"
 
-    request_url = formatter_request_url(provider, endpoint)
+    request_url = formatter_request_url()
     # Ordered OmniRoute model chain; explicit picks remain single-model.
-    chain = formatter_model_chain(provider, model_override=model_override)
+    chain = formatter_model_chain(model_override=model_override)
     if not chain:
-        return text, True, (
-            f"pinned formatter model is not selectable for provider '{provider}'"
-        )
+        return text, True, "pinned formatter model is not selectable on OmniRoute"
     last_reason = "RP formatting failed"
     # Retry bound across tiers. A per-tier timeout now skips to the next model,
     # so without this a 3-tier chain could stack three full timeouts onto one
@@ -1246,7 +1206,6 @@ def format_rp(text: str, mode: int = 1, context: str = "",
             last_reason = "RP formatting exhausted its time budget"
             break
         payload_obj = formatter_payload(
-            provider,
             system_prompt=system_prompt,
             user_content=user_content,
             model=model,
@@ -1273,7 +1232,7 @@ def format_rp(text: str, mode: int = 1, context: str = "",
                 })
 
             full_text, stream_err = _stream_formatter(
-                request_url, payload, provider, _emit,
+                request_url, payload, _emit,
                 timeout=attempt_timeout,
                 deadline=deadline,
             )
@@ -1300,7 +1259,7 @@ def format_rp(text: str, mode: int = 1, context: str = "",
                 return text, True, f"RP streaming truncated: {stream_err}"
             if full_text:
                 events.broadcast_event("dictation-token", {"requestId": request_id, "delta": "", "done": True})
-                record_model_attribution(provider, model, tier=idx)
+                record_model_attribution(model, tier=idx)
                 return full_text, False, ""
             # Clean stream that produced no visible text (thinking-only output).
             # Advance like the non-streaming path does on an empty response.
@@ -1332,7 +1291,7 @@ def format_rp(text: str, mode: int = 1, context: str = "",
                 return text, True, f"RP formatting failed: {err_msg}"
             formatted = strip_formatter_preamble(formatter_response_text(data))
             if formatted:
-                record_model_attribution(provider, model, tier=idx)
+                record_model_attribution(model, tier=idx)
                 return formatted, False, ""
             last_reason = "RP gateway returned empty response"
             if has_next:
@@ -1360,7 +1319,6 @@ DEFAULT_MODES: list[dict] = [
         "pipeline": ["whisper", "hallucination_filter", "command_dispatch"],
         "system_prompt": "",
         "temperature": 0.0,
-        "preset": "default",
         "use_persona": False,
         "use_character": False,
         "use_chat_context": False,
@@ -1374,7 +1332,6 @@ DEFAULT_MODES: list[dict] = [
         "pipeline": ["whisper", "hallucination_filter", "command_dispatch", "vocab_correct", "grammar_clean"],
         "system_prompt": GRAMMAR_CLEAN_SYSTEM,
         "temperature": 0.2,
-        "preset": "default",
         "use_persona": False,
         "use_character": False,
         "use_chat_context": False,
@@ -1388,7 +1345,6 @@ DEFAULT_MODES: list[dict] = [
         "pipeline": ["whisper", "hallucination_filter", "command_dispatch", "vocab_correct", "rp_format"],
         "system_prompt": "",  # empty → use built-in RP_SYSTEM_FORMAT
         "temperature": 0.4,
-        "preset": "default",
         "use_persona": False,
         "use_character": False,
         "use_chat_context": False,
@@ -1403,7 +1359,6 @@ DEFAULT_MODES: list[dict] = [
         "pipeline": ["whisper", "hallucination_filter", "command_dispatch", "vocab_correct", "rp_enhance"],
         "system_prompt": "",  # empty → use built-in RP_SYSTEM_ENHANCE
         "temperature": 0.45,
-        "preset": "pyrite",
         "use_persona": True,
         "use_character": True,
         "use_chat_context": True,
@@ -1417,7 +1372,6 @@ DEFAULT_MODES: list[dict] = [
         "pipeline": ["whisper", "hallucination_filter", "command_dispatch", "vocab_correct", "disfluency_clean", "persona_pov"],
         "system_prompt": "",  # built dynamically from persona + character
         "temperature": 0.4,
-        "preset": "pyrite",
         "use_persona": True,
         "use_character": True,
         "use_chat_context": True,
@@ -1437,7 +1391,6 @@ DEFAULT_MODES: list[dict] = [
             + FORMATTER_OUTPUT_CONTRACT
         ),
         "temperature": 0.4,
-        "preset": "pyrite",
         "use_persona": True,
         "use_character": True,
         "use_chat_context": True,
@@ -1457,7 +1410,6 @@ DEFAULT_MODES: list[dict] = [
             + FORMATTER_OUTPUT_CONTRACT
         ),
         "temperature": 0.4,
-        "preset": "pyrite",
         "use_persona": True,
         "use_character": True,
         "use_chat_context": True,
@@ -1475,7 +1427,6 @@ DEFAULT_MODES: list[dict] = [
         "pipeline": ["whisper", "hallucination_filter", "command_dispatch"],
         "system_prompt": "",
         "temperature": 0.0,
-        "preset": "default",
         "use_persona": False,
         "use_character": False,
         "use_chat_context": False,
@@ -1530,8 +1481,16 @@ def _ensure_default_vocab() -> None:
     log.info(f"Seeded empty vocab at {config.VOCAB_FILE}")
 
 
+# Keys earlier versions persisted into modes files. OmniRoute is the only
+# formatter route now, so they carry no meaning; drop them on load so a later
+# save does not write them back.
+_RETIRED_MODE_KEYS = ("preset", "formatter_provider")
+
+
 def _normalize_mode(entry: dict) -> dict:
     """Fill in missing fields on a mode dict with sane defaults."""
+    for key in _RETIRED_MODE_KEYS:
+        entry.pop(key, None)
     defaults = {
         "id": "",
         "label": entry.get("id", "Mode"),
@@ -1540,17 +1499,13 @@ def _normalize_mode(entry: dict) -> dict:
         "pipeline": ["whisper"],
         "system_prompt": "",
         "temperature": 0.0,
-        "preset": "default",
         "use_persona": False,
         "use_character": False,
         "use_chat_context": False,
         "use_rules": False,
-        # Optional per-mode LLM pin. Empty = use the provider's fallback chain.
+        # Optional per-mode LLM pin. Empty = use the OmniRoute fallback chain.
         # A request-level formatter_model still wins over this.
         "formatter_model": "",
-        # Kept in the persisted/API shape for client compatibility; non-empty
-        # values normalize to the sole supported provider, OmniRoute.
-        "formatter_provider": "",
     }
     for k, v in defaults.items():
         entry.setdefault(k, v)
@@ -1645,18 +1600,15 @@ def mode_has_formatter_step(mode: dict) -> bool:
     return any(step in FORMATTER_PIPELINE_STEPS for step in mode.get("pipeline", []))
 
 
-def resolve_formatter_target(mode: dict, provider: str,
-                             formatter_model: str) -> tuple[str, str]:
-    """Resolve the direct model choice for the sole OmniRoute provider.
+def resolve_formatter_model(mode: dict, formatter_model: str) -> str:
+    """Resolve the explicit model choice, if any.
 
-    A request-level picker wins over a per-mode pin; otherwise the normal
+    A request-level picker wins over a per-mode pin; empty means the normal
     OmniRoute fallback chain applies.
     """
-    provider = normalize_formatter_provider(provider)
     if formatter_model:
-        return provider, formatter_model
-    mode_model = str(mode.get("formatter_model") or "").strip()
-    return provider, mode_model
+        return formatter_model
+    return str(mode.get("formatter_model") or "").strip()
 
 
 def mode_public_view(mode: dict) -> dict:
@@ -1666,13 +1618,11 @@ def mode_public_view(mode: dict) -> dict:
         "label": mode.get("label", mode.get("id", "")),
         "icon": mode.get("icon", "mic"),
         "whisper_model": mode.get("whisper_model", config.DEFAULT_MODEL),
-        "preset": mode.get("preset", "default"),
         "use_persona": bool(mode.get("use_persona", False)),
         "use_character": bool(mode.get("use_character", False)),
         "use_chat_context": bool(mode.get("use_chat_context", False)),
         "pipeline": list(mode.get("pipeline", [])),
         "formatter_model": mode.get("formatter_model", ""),
-        "formatter_provider": mode.get("formatter_provider", ""),
     }
 
 
@@ -1739,27 +1689,23 @@ def _invalidate_modes_cache() -> None:
         _modes_cache["mtime"] = 0.0
 
 
-def save_mode_formatter(mode_id: str, model: str, provider: str = "") -> dict:
-    """Persist (or clear) a mode's pinned formatter model/provider.
+def save_mode_formatter(mode_id: str, model: str) -> dict:
+    """Persist (or clear) a mode's pinned formatter model.
 
-    Empty `model` clears the pin and the mode reverts to its provider's
-    fallback chain. Raises ValueError for an unknown mode or a model the
-    target provider will not serve, so a typo cannot silently route a mode to
-    the wrong LLM — the failure mode this whole feature exists to remove.
+    Empty `model` clears the pin and the mode reverts to the OmniRoute
+    fallback chain. Raises ValueError for an unknown mode or a model that is
+    not selectable, so a typo cannot silently route a mode to the wrong LLM —
+    the failure mode this whole feature exists to remove.
 
     Returns the updated public view of the mode.
     """
     mode_id = (mode_id or "").strip()
     model = (model or "").strip()
-    provider = (provider or "").strip()
     if not mode_id:
         raise ValueError("mode id is required")
 
-    target_provider = "omniroute" if provider or model else ""
-    if model and model not in selectable_models("omniroute"):
-        raise ValueError(
-            f"model '{model}' is not selectable for provider 'omniroute'"
-        )
+    if model and model not in selectable_models():
+        raise ValueError(f"model '{model}' is not selectable on OmniRoute")
 
     with modes_lock:
         modes = [dict(m) for m in load_modes()]
@@ -1771,7 +1717,6 @@ def save_mode_formatter(mode_id: str, model: str, provider: str = "") -> dict:
                 f"mode '{mode_id}' has no formatter step, so a model pin would never apply"
             )
         found["formatter_model"] = model
-        found["formatter_provider"] = target_provider if model else ""
         try:
             _atomic_write(config.MODES_FILE, _serialize_config(modes))
         except Exception as e:
@@ -1903,17 +1848,6 @@ _voice_macros_cache: dict = {
     "mtime": 0.0,
 }
 voice_macros_lock = threading.Lock()
-
-# Module-level seed regex (the spec's "always-available" grammar). Used
-# when no voice_macros.yaml file is present and the user hasn't customised
-# the sentinel.
-COMMAND_RE = re.compile(
-    r"^\s*(?:computer|hey computer)[\s,:.]+"
-    r"(send|swipe(?:\s+(?:left|right|next|prev))?|regenerate|"
-    r"delete that|delete last|new paragraph|scene break|stop|cancel|"
-    r"scratch that|clear|append|replace|undo)\b",
-    re.IGNORECASE,
-)
 
 # Backwards-compat: SillyTavern's OOC convention. Detected separately in
 # `_handle_transcribe` so it can flip the mode override to grammar_clean.
@@ -2050,14 +1984,14 @@ def command_dispatch(text: str) -> tuple[str, dict | None]:
         Empty string for pure-command utterances. Falls through to the
         rest of the pipeline as content for `append` / `replace` etc.
 
-    Sentinel + grammar are user-customisable via config.VOICE_MACROS_FILE; the
-    module-level `COMMAND_RE` constant remains the seed/fallback when
-    no override exists (see Agent 3 §3).
+    Sentinel + grammar are user-customisable via config.VOICE_MACROS_FILE;
+    `load_voice_macros` always compiles the effective regex (defaults when no
+    override exists, see Agent 3 §3).
     """
     if not text:
         return text, None
     cfg = load_voice_macros()
-    rx: re.Pattern = cfg.get("regex") or COMMAND_RE
+    rx: re.Pattern = cfg["regex"]
     m = rx.match(text)
     if not m:
         return text, None
@@ -2415,7 +2349,6 @@ def run_pipeline(text: str, mode: dict,
                  scene_contract: dict | None = None,
                  use_rules: bool = False,
                  prose_format: bool = False,
-                 provider: str = config.DEFAULT_FORMATTER_PROVIDER,
                  formatter_model: str = "",
                  request_id: str = "",
                  timing: dict | None = None) -> tuple[str, bool, str, str]:
@@ -2475,8 +2408,8 @@ def run_pipeline(text: str, mode: dict,
 
     out = text
     # Per-mode LLM pin (if any) resolves here, before any step runs, so every
-    # formatter step in this pipeline targets the same provider and model.
-    provider, formatter_model = resolve_formatter_target(mode, provider, formatter_model)
+    # formatter step in this pipeline targets the same model.
+    formatter_model = resolve_formatter_model(mode, formatter_model)
     if scene_contract is None:
         scene_contract = build_scene_contract(
             snapshot_state(),
@@ -2542,7 +2475,7 @@ def run_pipeline(text: str, mode: dict,
             continue
 
         if step == "disfluency_clean":
-            cleaned, was_cleaned, reason = disfluency_clean(out, provider=provider)
+            cleaned, was_cleaned, reason = disfluency_clean(out)
             if was_cleaned and cleaned != out:
                 cleaned_text = cleaned
                 out = cleaned
@@ -2558,11 +2491,9 @@ def run_pipeline(text: str, mode: dict,
                 out,
                 mode=1,
                 system_prompt_override=system,
-                endpoint_override="/v1/messages",
                 skip_persona_character=True,
                 user_content_override=user_content,
                 temperature=mode.get("temperature"),
-                provider=provider,
                 model_override=formatter_model,
             )
             if skipped:
@@ -2584,9 +2515,7 @@ def run_pipeline(text: str, mode: dict,
                 scene_continuity=scene_continuity,
                 scene_contract=scene_contract,
                 system_prompt_override=system,
-                endpoint_override="/v1/messages",
                 temperature=mode.get("temperature"),
-                provider=provider,
                 model_override=formatter_model,
             )
             if skipped:
@@ -2598,7 +2527,6 @@ def run_pipeline(text: str, mode: dict,
 
         if step == "rp_enhance":
             system = mode.get("system_prompt") or ""
-            endpoint = "/v1/pyrite/messages" if mode.get("preset") == "pyrite" else "/v1/messages"
             out, skipped, reason = format_rp(
                 out, mode=2, context=context,
                 persona_id=persona_id if mode.get("use_persona") else "",
@@ -2609,9 +2537,7 @@ def run_pipeline(text: str, mode: dict,
                 scene_continuity=scene_continuity,
                 scene_contract=scene_contract,
                 system_prompt_override=system,
-                endpoint_override=endpoint,
                 temperature=mode.get("temperature"),
-                provider=provider,
                 request_id=request_id,  # MVP-13 — stream deltas via SSE
                 model_override=formatter_model,
             )
@@ -2639,7 +2565,6 @@ def run_pipeline(text: str, mode: dict,
                     scene_continuity=scene_continuity,
                     scene_contract=scene_contract,
                     temperature=mode.get("temperature"),
-                    provider=provider,
                     request_id=request_id,  # MVP-13
                     model_override=formatter_model,
                 )
@@ -2659,15 +2584,12 @@ def run_pipeline(text: str, mode: dict,
                 persona, character, chat_context, scene_continuity, scene_contract,
             )
             user_content = f"The dictated line:\n{out}"
-            endpoint = "/v1/pyrite/messages" if mode.get("preset") == "pyrite" else "/v1/messages"
             out, skipped, reason = format_rp(
                 out, mode=2,
                 system_prompt_override=system_prompt,
-                endpoint_override=endpoint,
                 skip_persona_character=True,
                 user_content_override=user_content,
                 temperature=mode.get("temperature"),
-                provider=provider,
                 request_id=request_id,  # MVP-13
                 model_override=formatter_model,
             )

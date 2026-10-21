@@ -1678,10 +1678,9 @@ let audioChunks = [];
 let recording = false;
 let rpMode = 0;                // derived legacy numeric mode (kept for any lingering callers)
 let currentMode = '';          // active mode id (e.g. 'rp_enhance')
-let currentProvider = 'omniroute';
 let currentFormatterModel = '';
 let lastUsedMode = '';         // mode id used for last transcription
-let availableModes = [];       // [{id, label, icon, whisper_model, preset, use_persona, use_character, use_chat_context, pipeline}, ...]
+let availableModes = [];       // [{id, label, icon, whisper_model, use_persona, use_character, use_chat_context, pipeline}, ...]
 let durationInterval = null;
 let recordStart = 0;
 let lastRawText = '';          // raw whisper output (before RP formatting)
@@ -1791,14 +1790,6 @@ function iconSvg(name) {
   return `<svg class="chip-icon" viewBox="0 0 24 24" aria-hidden="true">${paths}</svg>`;
 }
 
-function normalizeProvider(provider) {
-  return 'omniroute';
-}
-
-function setProvider(provider, opts) {
-  currentProvider = 'omniroute';
-}
-
 function formatterModelLabel(model) {
   const labels = {
     'cc/claude-sonnet-5': 'Sonnet 5',
@@ -1816,7 +1807,6 @@ function formatterModelLabel(model) {
 
 function setFormatterModel(model, opts) {
   opts = opts || {};
-  currentProvider = 'omniroute';
   currentFormatterModel = String(model || '');
   if (formatterModelSelect) formatterModelSelect.value = currentFormatterModel;
   if (opts.persist !== false) {
@@ -1901,8 +1891,6 @@ async function loadModes() {
   }
 
   renderModeChips();
-
-  setProvider('omniroute', { persist: false });
 
   // Resolve initial mode: embed config → localStorage → rp_enhance → first.
   const stored = localStorage.getItem('dictation.mode') || '';
@@ -2650,7 +2638,6 @@ async function sendAudio() {
   const context = getContext();
   const mode = getMode(currentMode);
   const params = new URLSearchParams({ model });
-  params.set('provider', currentProvider);
   if (currentFormatterModel) params.set('formatter_model', currentFormatterModel);
   params.set('language', transcriptionLanguage);
   if (currentMode) params.set('mode', currentMode);
@@ -2749,7 +2736,6 @@ async function regenerate() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         text: lastRawText,
-        provider: currentProvider,
         formatter_model: currentFormatterModel,
         mode: regenMode,
         context: context,
@@ -3159,7 +3145,6 @@ async function regenLogEntry(id, btn) {
       body: JSON.stringify({
         text: entry.text,
         entry_id: id,
-        provider: currentProvider,
         formatter_model: currentFormatterModel,
         mode: regenMode,
         context: context,
@@ -3936,7 +3921,7 @@ async function _refreshPrivacyModal() {
     const hr = await fetch('/health', { cache: 'no-store' });
     if (hr.ok) {
       const hj = await hr.json();
-      const cleanupTarget = (hj.providers || []).join(' / ') + ' (loopback)';
+      const cleanupTarget = (hj.formatter_provider || 'omniroute') + ' (loopback)';
       const ch = document.getElementById('privacyCleanupHost');
       if (ch) ch.textContent = cleanupTarget;
     }

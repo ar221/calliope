@@ -15,7 +15,6 @@ Environment=WHISPER_IDLE_SHUTDOWN_DISABLED=1
 # matches the server's built-in default; if you relocate ST, change this AND
 # the ReadOnlyPaths= sandbox line below to match.
 Environment=DICTATION_ST_DATA_ROOT=/mnt/hdd/AI/SillyTavern/data/default-user
-Environment=DICTATION_FORMATTER_PROVIDER=omniroute
 Environment=DICTATION_OMNIROUTE_URL=http://127.0.0.1:20128/v1
 Environment=DICTATION_OMNIROUTE_RP_CHAIN=codex/gpt-5.6-sol-high,cc/claude-sonnet-5,claude/claude-opus-4-8
 Environment=DICTATION_OMNIROUTE_CLEAN_CHAIN=codex/gpt-5.6-sol-low,claude/claude-sonnet-4-6

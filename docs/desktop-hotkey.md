@@ -26,7 +26,7 @@ Mod+Ctrl+Shift+M  hotkey-overlay-title="Dictation RP+ Toggle" { spawn "bash" "-c
 - `Mod+Ctrl+M` — `rp_format` mode (asterisks for actions, quotes for
   dialogue).
 - `Mod+Ctrl+Shift+M` — `rp_enhance` (`+` modifier sends through the
-  pyrite-preset enhancer, persona + character + chat-context aware).
+  OmniRoute enhancer, persona + character + chat-context aware).
 
 Reload niri (`niri msg action reload-config` or restart your session) and
 the bindings are live. The `hotkey-overlay-title` strings appear in

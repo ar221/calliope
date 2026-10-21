@@ -32,8 +32,8 @@ Current server flags:
 
 ### Formatter routing
 
-- `DICTATION_FORMATTER_PROVIDER` — compatibility field; every value normalizes
-  to the sole supported formatter provider, `omniroute`.
+OmniRoute is the only formatter route; there is no provider setting.
+
 - `DICTATION_OMNIROUTE_URL` — OmniRoute base URL, default `http://127.0.0.1:20128/v1`.
 - `OMNIROUTE_API_KEY` — required gateway credential. Calliope reads it from the
   process environment, or imports only that variable from
@@ -86,13 +86,15 @@ when the OmniRoute catalog changes; no source edit is required.
 ### Per-mode LLM assignment
 
 A mode can pin the model that formats it, instead of every mode sharing one
-global picker value. Two optional fields per mode in `modes.yaml`:
+global picker value. One optional field per mode in `modes.yaml`:
 
 ```yaml
 - id: rp_enhance
   formatter_model: codex/gpt-5.6-luna  # empty = use OmniRoute fallback chain
-  formatter_provider: omniroute         # compatibility/API attribution field
 ```
+
+Older modes files may still carry `formatter_provider:` or `preset:` keys;
+they are ignored on load and dropped on the next save.
 
 Precedence, highest first:
 
@@ -103,12 +105,11 @@ Precedence, highest first:
    "Auto fallback chain" to let per-mode assignments apply. The extension labels
    it "Global model override (every mode)" and marks a shadowed mode pin as
    inactive.
-2. The mode's `formatter_model`. The provider field is retained for persisted
-   data and API compatibility but normalizes to `omniroute`.
+2. The mode's `formatter_model`.
 3. The OmniRoute fallback chain.
 
 Set it from the SillyTavern extension ("Model assigned to a mode"), or via
-`POST /modes/formatter` with `{"mode": "...", "model": "...", "provider": "omniroute"}`.
+`POST /modes/formatter` with `{"mode": "...", "model": "..."}`.
 An empty `model` clears the pin. The server rejects an unknown mode, a model
 outside the OmniRoute allow-list, and a mode with no formatter step.
 

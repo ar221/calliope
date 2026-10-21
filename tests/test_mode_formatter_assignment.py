@@ -1,7 +1,7 @@
-"""Per-mode LLM assignment + per-provider fallback chains.
+"""Per-mode LLM assignment + OmniRoute fallback chains.
 
 Covers:
-- OmniRoute is the sole formatter provider with tiered fallback chains,
+- OmniRoute tiered fallback chains,
 - explicit model pins are allow-listed catalog-qualified OmniRoute IDs,
 - per-mode pins are honoured by run_pipeline,
 - a request-level model still wins over a mode's pin,
@@ -24,7 +24,6 @@ SRC = pathlib.Path(__file__).resolve().parents[1] / "server" / "calliope-server"
 
 def _load_server(tmp_path, monkeypatch):
     monkeypatch.setenv("CALLIOPE_DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("DICTATION_FORMATTER_PROVIDER", "omniroute")
     monkeypatch.setenv("OMNIROUTE_API_KEY", "test-key")
     name = f"calliope_server_modefmt_{uuid.uuid4().hex}"
     loader = SourceFileLoader(name, str(SRC))
@@ -73,17 +72,17 @@ def _script(monkeypatch, mod, script: dict[str, bytes], calls: list):
     monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
 
 
-# ── sole-provider model chains ────────────────────────────────────
+# ── OmniRoute model chains ────────────────────────────────────────
 
-def test_provider_field_resolves_to_the_only_formatter_transport(tmp_path, monkeypatch):
+def test_auto_chain_is_the_rp_chain(tmp_path, monkeypatch):
     mod = _load_server(tmp_path, monkeypatch)
-    assert mod.normalize_formatter_provider("omniroute") == "omniroute"
-    assert mod.formatter_model_chain("omniroute") == mod.config.OMNIROUTE_RP_CHAIN
+    assert mod.formatter_model_chain() == mod.config.OMNIROUTE_RP_CHAIN
+    assert mod.formatter_model_chain(cleanup=True) == mod.config.OMNIROUTE_CLEAN_CHAIN
 
 
 def test_selectable_models_include_openrouter_and_xai_lanes(tmp_path, monkeypatch):
     mod = _load_server(tmp_path, monkeypatch)
-    models = mod.selectable_models("omniroute")
+    models = mod.selectable_models()
     for model in (
         "openrouter/google/gemini-3.5-flash",
         "openrouter/google/gemini-3.6-flash",
@@ -91,17 +90,17 @@ def test_selectable_models_include_openrouter_and_xai_lanes(tmp_path, monkeypatc
         "xao/grok-4.6",
     ):
         assert model in models
-        assert mod.formatter_model_chain("omniroute", model_override=model) == [model]
+        assert mod.formatter_model_chain(model_override=model) == [model]
 
 
 def test_selectable_models_require_gateway_qualified_ids(tmp_path, monkeypatch):
     mod = _load_server(tmp_path, monkeypatch)
-    assert "codex/gpt-5.6-luna" in mod.selectable_models("omniroute")
-    assert "gpt-5.5" not in mod.selectable_models("omniroute")
+    assert "codex/gpt-5.6-luna" in mod.selectable_models()
+    assert "gpt-5.5" not in mod.selectable_models()
     assert mod.formatter_model_chain(
-        "omniroute", model_override="codex/gpt-5.6-luna"
+        model_override="codex/gpt-5.6-luna"
     ) == ["codex/gpt-5.6-luna"]
-    assert mod.formatter_model_chain("omniroute", model_override="gpt-5.5") == []
+    assert mod.formatter_model_chain(model_override="gpt-5.5") == []
 
 
 def test_default_chain_uses_catalog_qualified_ids(tmp_path, monkeypatch):
@@ -121,37 +120,40 @@ def test_default_chain_uses_catalog_qualified_ids(tmp_path, monkeypatch):
 def test_mode_pin_is_used_when_request_has_no_model(tmp_path, monkeypatch):
     mod = _load_server(tmp_path, monkeypatch)
     mode = {"id": "rp_enhance", "formatter_model": "claude/claude-opus-4-8"}
-    assert mod.resolve_formatter_target(mode, "omniroute", "") == (
-        "omniroute", "claude/claude-opus-4-8",
-    )
+    assert mod.resolve_formatter_model(mode, "") == "claude/claude-opus-4-8"
 
 
 def test_request_model_beats_mode_pin(tmp_path, monkeypatch):
     """The picker is a direct user choice, so it outranks stored config."""
     mod = _load_server(tmp_path, monkeypatch)
     mode = {"id": "rp_enhance", "formatter_model": "claude/claude-opus-4-8"}
-    assert mod.resolve_formatter_target(mode, "omniroute", "codex/gpt-5.6-sol-high") == (
-        "omniroute", "codex/gpt-5.6-sol-high",
-    )
+    assert mod.resolve_formatter_model(mode, "codex/gpt-5.6-sol-high") == "codex/gpt-5.6-sol-high"
 
 
-def test_mode_provider_field_normalizes_to_omniroute(tmp_path, monkeypatch):
+def test_unpinned_mode_uses_the_chain(tmp_path, monkeypatch):
     mod = _load_server(tmp_path, monkeypatch)
-    mode = {
-        "id": "rp_enhance",
-        "formatter_model": "codex/gpt-5.6-luna",
-        "formatter_provider": "omniroute",
-    }
-    assert mod.resolve_formatter_target(mode, "omniroute", "") == (
-        "omniroute", "codex/gpt-5.6-luna",
-    )
+    assert mod.resolve_formatter_model({"id": "rp_enhance"}, "") == ""
 
 
-def test_unpinned_mode_leaves_provider_and_chain_alone(tmp_path, monkeypatch):
+def test_retired_mode_keys_are_ignored_and_not_rewritten(tmp_path, monkeypatch):
+    """Modes files from earlier versions may carry `formatter_provider` and
+    `preset`. They load fine, are dropped, and a save does not write them back."""
     mod = _load_server(tmp_path, monkeypatch)
-    assert mod.resolve_formatter_target({"id": "rp_enhance"}, "omniroute", "") == (
-        "omniroute", "",
-    )
+    legacy = [dict(m) for m in mod.DEFAULT_MODES]
+    for m in legacy:
+        m["preset"] = "default"
+        m["formatter_provider"] = "omniroute"
+    mod.config.MODES_FILE.write_bytes(mod._serialize_config(legacy))
+    mod._invalidate_modes_cache()
+
+    mode = mod.get_mode("rp_format")
+    assert "preset" not in mode
+    assert "formatter_provider" not in mode
+
+    mod.save_mode_formatter("rp_format", "claude/claude-opus-4-8")
+    raw = mod.config.MODES_FILE.read_text()
+    assert "formatter_provider" not in raw
+    assert "preset" not in raw
 
 
 def test_run_pipeline_routes_a_pinned_mode_through_omniroute(tmp_path, monkeypatch):
@@ -165,30 +167,26 @@ def test_run_pipeline_routes_a_pinned_mode_through_omniroute(tmp_path, monkeypat
         "id": "rp_enhance",
         "pipeline": ["whisper", "rp_enhance"],
         "formatter_model": "codex/gpt-5.6-luna",
-        "formatter_provider": "omniroute",
     })
     out, skipped, reason, _cleaned = mod.run_pipeline(
-        "she walks in and i say hello", mode, provider="omniroute",
+        "she walks in and i say hello", mode,
     )
     assert skipped is False, reason
     assert out == "routed to the pinned OmniRoute model"
     assert calls == ["codex/gpt-5.6-luna"]
-    assert mod.get_model_attribution()["provider"] == "omniroute"
+    assert mod.get_model_attribution()["model"] == "codex/gpt-5.6-luna"
 
 
 # ── persistence ───────────────────────────────────────────────────
 
 def test_save_mode_formatter_persists_and_survives_reload(tmp_path, monkeypatch):
     mod = _load_server(tmp_path, monkeypatch)
-    view = mod.save_mode_formatter("rp_format", "claude/claude-opus-4-8", "omniroute")
+    view = mod.save_mode_formatter("rp_format", "claude/claude-opus-4-8")
     assert view["formatter_model"] == "claude/claude-opus-4-8"
-    assert view["formatter_provider"] == "omniroute"
 
     mod._invalidate_modes_cache()
     reloaded = mod.get_mode("rp_format")
     assert reloaded["formatter_model"] == "claude/claude-opus-4-8"
-    assert reloaded["formatter_provider"] == "omniroute"
-
 
 
 def test_plain_mode_does_not_report_a_previous_runs_model(tmp_path, monkeypatch):
@@ -205,24 +203,22 @@ def test_plain_mode_does_not_report_a_previous_runs_model(tmp_path, monkeypatch)
     }, calls)
 
     enhance = mod._normalize_mode({"id": "rp_enhance", "pipeline": ["whisper", "rp_enhance"]})
-    mod.run_pipeline("she walks in and i say hello", enhance, provider="omniroute")
+    mod.run_pipeline("she walks in and i say hello", enhance)
     assert mod.get_model_attribution()["model"] == "codex/gpt-5.6-sol-high"
 
     # Same thread, now a mode with no formatter step.
     plain = mod._normalize_mode({"id": "plain", "pipeline": ["whisper"]})
-    out, skipped, _reason, _cleaned = mod.run_pipeline("untouched", plain, provider="omniroute")
+    out, skipped, _reason, _cleaned = mod.run_pipeline("untouched", plain)
     assert out == "untouched"
     assert skipped is False
     assert mod.get_model_attribution()["model"] == "", "stale model leaked into a plain run"
-    assert mod.get_model_attribution()["provider"] == ""
 
 
 def test_save_mode_formatter_clears_the_pin(tmp_path, monkeypatch):
     mod = _load_server(tmp_path, monkeypatch)
-    mod.save_mode_formatter("rp_format", "claude/claude-opus-4-8", "omniroute")
-    view = mod.save_mode_formatter("rp_format", "", "")
+    mod.save_mode_formatter("rp_format", "claude/claude-opus-4-8")
+    view = mod.save_mode_formatter("rp_format", "")
     assert view["formatter_model"] == ""
-    assert view["formatter_provider"] == ""
     mod._invalidate_modes_cache()
     assert mod.get_mode("rp_format")["formatter_model"] == ""
 
@@ -231,14 +227,14 @@ def test_save_mode_formatter_rejects_bad_input(tmp_path, monkeypatch):
     """A typo must not silently route a mode to the wrong LLM."""
     mod = _load_server(tmp_path, monkeypatch)
     with pytest.raises(ValueError, match="unknown mode"):
-        mod.save_mode_formatter("rp_fromat", "claude/claude-opus-4-8", "omniroute")
+        mod.save_mode_formatter("rp_fromat", "claude/claude-opus-4-8")
     with pytest.raises(ValueError, match="not selectable"):
-        mod.save_mode_formatter("rp_format", "totally/made-up", "omniroute")
+        mod.save_mode_formatter("rp_format", "totally/made-up")
     with pytest.raises(ValueError, match="not selectable"):
-        mod.save_mode_formatter("rp_format", "gpt-5.5", "omniroute")
+        mod.save_mode_formatter("rp_format", "gpt-5.5")
     # 'plain' has no formatter step, so a pin could never apply.
     with pytest.raises(ValueError, match="no formatter step"):
-        mod.save_mode_formatter("plain", "claude/claude-opus-4-8", "omniroute")
+        mod.save_mode_formatter("plain", "claude/claude-opus-4-8")
 
 
 def test_save_mode_formatter_does_not_deadlock(tmp_path, monkeypatch):
@@ -251,7 +247,7 @@ def test_save_mode_formatter_does_not_deadlock(tmp_path, monkeypatch):
     done = threading.Event()
 
     def run():
-        mod.save_mode_formatter("rp_format", "codex/gpt-5.6-sol-high", "omniroute")
+        mod.save_mode_formatter("rp_format", "codex/gpt-5.6-sol-high")
         done.set()
 
     t = threading.Thread(target=run, daemon=True)
@@ -269,9 +265,8 @@ def test_extension_exposes_a_per_mode_model_control():
     assert "/modes/formatter" in source
     assert "function reflectModeModel()" in source
     assert "function populateModeModelOptions()" in source
-    # Option values retain provider in the existing API shape, but only the
-    # OmniRoute group is rendered.
-    assert "`omniroute|${model}`" in source
+    # Option values are bare model IDs; there is no provider grouping.
+    assert "omniroute|" not in source
     assert "for (const [provider, models]" not in source
     assert "'cc/claude-sonnet-5': 'Sonnet 5'" in source
 
@@ -296,9 +291,9 @@ def test_extension_discloses_that_the_global_override_beats_mode_pins():
 
 def test_modes_endpoint_exposes_the_pin(tmp_path, monkeypatch):
     mod = _load_server(tmp_path, monkeypatch)
-    mod.save_mode_formatter("rp_enhance", "claude/claude-opus-4-8", "omniroute")
+    mod.save_mode_formatter("rp_enhance", "claude/claude-opus-4-8")
     view = mod.mode_public_view(mod.get_mode("rp_enhance"))
     assert view["formatter_model"] == "claude/claude-opus-4-8"
-    assert view["formatter_provider"] == "omniroute"
+    assert "formatter_provider" not in view
     # Prompt internals still must not leak.
     assert "system_prompt" not in view

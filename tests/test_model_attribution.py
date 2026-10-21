@@ -16,7 +16,6 @@ SRC = pathlib.Path(__file__).resolve().parents[1] / "server" / "calliope-server"
 
 def _load_server(tmp_path, monkeypatch):
     monkeypatch.setenv("CALLIOPE_DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("DICTATION_FORMATTER_PROVIDER", "omniroute")
     monkeypatch.setenv("OMNIROUTE_API_KEY", "test-key")
     monkeypatch.setenv(
         "DICTATION_OMNIROUTE_RP_CHAIN",
@@ -66,20 +65,19 @@ def test_attribution_defaults_empty(tmp_path, monkeypatch):
     mod = _load_server(tmp_path, monkeypatch)
     mod.reset_model_attribution()
     attr = mod.get_model_attribution()
-    assert attr == {"provider": "", "model": "", "fallback": False, "tier": 0}
+    assert attr == {"model": "", "fallback": False, "tier": 0}
 
 
 def test_attribution_records_primary_model(tmp_path, monkeypatch):
     mod = _load_server(tmp_path, monkeypatch)
     _install(monkeypatch, mod, {"claude/claude-opus-4-8": _ok_body("prose")})
     mod.reset_model_attribution()
-    out, skipped, _ = mod.format_rp("hello there friend", provider="omniroute")
+    out, skipped, _ = mod.format_rp("hello there friend")
     assert skipped is False
     attr = mod.get_model_attribution()
     assert attr["model"] == "claude/claude-opus-4-8"
     assert attr["tier"] == 0
     assert attr["fallback"] is False
-    assert attr["provider"] == "omniroute"
 
 
 def test_attribution_records_fallback_tier(tmp_path, monkeypatch):
@@ -93,7 +91,7 @@ def test_attribution_records_fallback_tier(tmp_path, monkeypatch):
         },
     )
     mod.reset_model_attribution()
-    out, skipped, _ = mod.format_rp("hello there friend", provider="omniroute")
+    out, skipped, _ = mod.format_rp("hello there friend")
     assert skipped is False
     attr = mod.get_model_attribution()
     assert attr["model"] == "codex/gpt-5.5"
@@ -109,7 +107,7 @@ def test_attribution_empty_on_total_failure(tmp_path, monkeypatch):
         {"claude/claude-opus-4-8": _err_body("internal explosion")},
     )
     mod.reset_model_attribution()
-    out, skipped, _ = mod.format_rp("hello there friend", provider="omniroute")
+    out, skipped, _ = mod.format_rp("hello there friend")
     assert skipped is True
     attr = mod.get_model_attribution()
     # Hard failure never records a winning model.
@@ -121,7 +119,7 @@ def test_run_pipeline_resets_stale_attribution(tmp_path, monkeypatch):
     prior run recorded on this thread. vocab_correct is a pure pre-processor,
     so the slot stays empty after the run."""
     mod = _load_server(tmp_path, monkeypatch)
-    mod.record_model_attribution("omniroute", "stale/model", tier=2)
+    mod.record_model_attribution("stale/model", tier=2)
     mode = {"id": "vocab_only", "pipeline": ["whisper", "vocab_correct"]}
-    mod.run_pipeline("just some words", mode, provider="omniroute")
+    mod.run_pipeline("just some words", mode)
     assert mod.get_model_attribution()["model"] == ""

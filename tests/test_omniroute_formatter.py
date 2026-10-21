@@ -1,7 +1,7 @@
-"""OmniRoute formatter provider + model-chain fallback coverage.
+"""OmniRoute formatter model-chain fallback coverage.
 
 Verifies:
-- provider normalization + authenticated OpenAI-shape routing for OmniRoute,
+- authenticated OpenAI-shape routing for OmniRoute,
 - URL/model/payload builders use catalog-qualified model IDs,
 - the model chain skips credential/routing errors and falls through,
 - a hard (non-skippable) error stops the chain and returns raw text,
@@ -23,7 +23,6 @@ SRC = pathlib.Path(__file__).resolve().parents[1] / "server" / "calliope-server"
 
 def _load_server(tmp_path, monkeypatch):
     monkeypatch.setenv("CALLIOPE_DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("DICTATION_FORMATTER_PROVIDER", "omniroute")
     monkeypatch.setenv("OMNIROUTE_API_KEY", "test-key")
     monkeypatch.setenv(
         "DICTATION_OMNIROUTE_RP_CHAIN",
@@ -83,14 +82,11 @@ def _install_scripted_urlopen(monkeypatch, mod, script: dict[str, bytes], calls:
     monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
 
 
-# ── provider abstraction ──────────────────────────────────────────
+# ── routing ───────────────────────────────────────────────────────
 
-def test_omniroute_is_the_only_authenticated_provider(tmp_path, monkeypatch):
+def test_requests_target_openai_chat_completions(tmp_path, monkeypatch):
     mod = _load_server(tmp_path, monkeypatch)
-    assert mod.DEFAULT_FORMATTER_PROVIDER == "omniroute"
-    assert mod.normalize_formatter_provider("omniroute") == "omniroute"
-    assert mod.normalize_formatter_provider("legacy-provider") == "omniroute"
-    assert mod.formatter_request_url("omniroute").endswith("/v1/chat/completions")
+    assert mod.formatter_request_url().endswith("/v1/chat/completions")
 
 def test_omniroute_requests_require_bearer_auth(tmp_path, monkeypatch):
     mod = _load_server(tmp_path, monkeypatch)
@@ -101,7 +97,7 @@ def test_omniroute_requests_require_bearer_auth(tmp_path, monkeypatch):
         return _FakeResp(_ok_body("formatted"))
 
     monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
-    out, skipped, reason = mod.format_rp("raw text here", provider="omniroute")
+    out, skipped, reason = mod.format_rp("raw text here")
     assert skipped is False, reason
     assert out == "formatted"
     assert requests
@@ -116,7 +112,7 @@ def test_missing_omniroute_key_fails_closed_before_network(tmp_path, monkeypatch
         "urlopen",
         lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("network should not run")),
     )
-    out, skipped, reason = mod.format_rp("raw text here", provider="omniroute")
+    out, skipped, reason = mod.format_rp("raw text here")
     assert out == "raw text here"
     assert skipped is True
     assert "not reachable" in reason
@@ -124,14 +120,14 @@ def test_missing_omniroute_key_fails_closed_before_network(tmp_path, monkeypatch
 
 def test_omniroute_model_chain(tmp_path, monkeypatch):
     mod = _load_server(tmp_path, monkeypatch)
-    chain = mod.formatter_model_chain("omniroute")
+    chain = mod.formatter_model_chain()
     assert chain[0] == "codex/gpt-5.6-sol-high"
     assert chain == [
         "codex/gpt-5.6-sol-high",
         "cc/claude-sonnet-5",
         "claude/claude-opus-4-8",
     ]
-    clean = mod.formatter_model_chain("omniroute", cleanup=True)
+    clean = mod.formatter_model_chain(cleanup=True)
     assert clean == ["codex/gpt-5.6-sol-low", "claude/claude-sonnet-4-6"]
 
 
@@ -143,23 +139,19 @@ def test_selectable_model_override_is_single_omniroute_lane(tmp_path, monkeypatc
         ["claude/claude-opus-4-8", "codex/gpt-5.6-sol-high"],
     )
     assert mod.formatter_model_chain(
-        "omniroute", model_override="claude/claude-opus-4-8"
+        model_override="claude/claude-opus-4-8"
     ) == ["claude/claude-opus-4-8"]
     assert mod.formatter_model_chain(
-        "omniroute", model_override="codex/gpt-5.6-sol-high"
+        model_override="codex/gpt-5.6-sol-high"
     ) == ["codex/gpt-5.6-sol-high"]
     assert mod.formatter_model_chain(
-        "omniroute", model_override="untrusted/arbitrary-model"
+        model_override="untrusted/arbitrary-model"
     ) == []
-    assert mod.formatter_model_chain(
-        "legacy-provider", model_override="claude/claude-opus-4-8"
-    ) == ["claude/claude-opus-4-8"]
 
 
 def test_omniroute_payload_is_openai_messages(tmp_path, monkeypatch):
     mod = _load_server(tmp_path, monkeypatch)
     payload = mod.formatter_payload(
-        "omniroute",
         system_prompt="SYS",
         user_content="hello",
         model="codex/gpt-5.6-sol-high",
@@ -186,7 +178,7 @@ def test_chain_skips_credential_error_to_next_tier(tmp_path, monkeypatch):
         },
         calls,
     )
-    out, skipped, reason = mod.format_rp("raw text here", provider="omniroute")
+    out, skipped, reason = mod.format_rp("raw text here")
     assert out == "polished prose"
     assert skipped is False
     assert calls == ["codex/gpt-5.6-sol-high", "cc/claude-sonnet-5"]
@@ -205,7 +197,7 @@ def test_chain_falls_through_to_last_tier(tmp_path, monkeypatch):
         },
         calls,
     )
-    out, skipped, _ = mod.format_rp("raw text here", provider="omniroute")
+    out, skipped, _ = mod.format_rp("raw text here")
     assert out == "opus output"
     assert skipped is False
     assert calls == [
@@ -229,7 +221,7 @@ def test_hard_error_stops_chain(tmp_path, monkeypatch):
         },
         calls,
     )
-    out, skipped, reason = mod.format_rp("raw text here", provider="omniroute")
+    out, skipped, reason = mod.format_rp("raw text here")
     assert skipped is True
     assert out == "raw text here"
     assert calls == ["codex/gpt-5.6-sol-high"]
@@ -250,7 +242,7 @@ def test_disfluency_clean_uses_cleanup_chain(tmp_path, monkeypatch):
         calls,
     )
     text = "so um like this is the uh the sentence i want cleaned up you know"
-    out, cleaned, _ = mod.disfluency_clean(text, provider="omniroute")
+    out, cleaned, _ = mod.disfluency_clean(text)
     assert cleaned is True
     assert "cleaned up sentence" in out
     assert calls == ["codex/gpt-5.6-sol-low", "claude/claude-sonnet-4-6"]
@@ -278,7 +270,7 @@ def test_timeout_on_first_tier_falls_through_instead_of_returning_raw(tmp_path, 
 
     monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
 
-    out, skipped, reason = mod.format_rp("raw text here", provider="omniroute")
+    out, skipped, reason = mod.format_rp("raw text here")
     assert skipped is False, reason
     assert out == "sonnet rescued the regenerate"
     assert calls == ["codex/gpt-5.6-sol-high", "cc/claude-sonnet-5"]
@@ -317,7 +309,7 @@ def test_chain_budget_stops_retrying_once_exhausted(tmp_path, monkeypatch):
 
     monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
 
-    out, skipped, reason = mod.format_rp("raw text here", provider="omniroute")
+    out, skipped, reason = mod.format_rp("raw text here")
     assert skipped is True
     assert out == "raw text here"
     # Tier 0 uses 5s of the 6s budget; tier 1 is clamped to the 1s remainder;
@@ -342,7 +334,6 @@ def test_explicit_model_override_reports_timeout_without_silent_fallback(tmp_pat
 
     out, skipped, reason = mod.format_rp(
         "raw text here",
-        provider="omniroute",
         model_override="claude/claude-opus-4-8",
     )
     assert skipped is True
@@ -385,13 +376,13 @@ def test_streaming_timeout_after_partial_tokens_is_not_reported_as_success(tmp_p
     )
     monkeypatch.setattr(
         fmt, "_stream_formatter",
-        lambda url, payload, provider, on_delta, timeout=None, deadline=None: (
+        lambda url, payload, on_delta, timeout=None, deadline=None: (
             "half a rewri", "timed out"
         ),
     )
 
     out, skipped, reason = mod.format_rp(
-        "raw text here", provider="omniroute", request_id="req-1"
+        "raw text here", request_id="req-1"
     )
     assert skipped is True
     assert out == "raw text here"
@@ -409,7 +400,7 @@ def test_streaming_timeout_with_no_tokens_falls_through_to_next_tier(tmp_path, m
     monkeypatch.setattr(fmt.events, "broadcast_event", lambda name, data: None)
     seen: list[str] = []
 
-    def fake_stream(url, payload, provider, on_delta, timeout=None, deadline=None):
+    def fake_stream(url, payload, on_delta, timeout=None, deadline=None):
         model = json.loads(payload.decode()).get("model", "")
         seen.append(model)
         if model == "codex/gpt-5.6-sol-high":
@@ -419,7 +410,7 @@ def test_streaming_timeout_with_no_tokens_falls_through_to_next_tier(tmp_path, m
     monkeypatch.setattr(fmt, "_stream_formatter", fake_stream)
 
     out, skipped, reason = mod.format_rp(
-        "raw text here", provider="omniroute", request_id="req-2"
+        "raw text here", request_id="req-2"
     )
     assert skipped is False, reason
     assert out == "streamed sonnet output"
@@ -450,7 +441,7 @@ def test_probe_tolerates_cold_health_endpoint_latency(tmp_path, monkeypatch):
 
     monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
 
-    out, skipped, reason = mod.format_rp("raw text here", provider="omniroute")
+    out, skipped, reason = mod.format_rp("raw text here")
     assert skipped is False, reason
     assert out == "formatted output"
     assert probes and probes[0] >= 3.0, f"probe used too short a timeout: {probes}"
@@ -473,7 +464,7 @@ def test_probe_result_is_cached_across_calls(tmp_path, monkeypatch):
     monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
 
     for _ in range(3):
-        assert mod.format_rp("raw text here", provider="omniroute")[1] is False
+        assert mod.format_rp("raw text here")[1] is False
     assert probes["n"] == 1, f"expected one cached probe, got {probes['n']}"
 
 
@@ -500,10 +491,10 @@ def test_probe_failure_is_retried_quickly(tmp_path, monkeypatch):
 
     monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
 
-    assert mod.format_rp("raw text here", provider="omniroute")[1] is True
+    assert mod.format_rp("raw text here")[1] is True
     state["up"] = True
     clock["t"] += mod.config.FORMATTER_PROBE_FAIL_TTL_SECONDS + 0.1
-    assert mod.format_rp("raw text here", provider="omniroute")[1] is False
+    assert mod.format_rp("raw text here")[1] is False
 
 
 def test_failed_probe_verdict_is_cached_even_though_the_probe_burns_its_timeout(
@@ -535,16 +526,16 @@ def test_failed_probe_verdict_is_cached_even_though_the_probe_burns_its_timeout(
 
     monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
 
-    assert mod.format_rp("raw text here", provider="omniroute")[1] is True
+    assert mod.format_rp("raw text here")[1] is True
     assert probes["n"] == 1
 
     # Immediately afterwards the cached failure must still be honoured.
-    assert mod.format_rp("raw text here", provider="omniroute")[1] is True
+    assert mod.format_rp("raw text here")[1] is True
     assert probes["n"] == 1, "failed verdict expired on arrival — cache is useless"
 
     # Once the failure TTL really elapses, probing resumes.
     clock["t"] += 3.1
-    assert mod.format_rp("raw text here", provider="omniroute")[1] is True
+    assert mod.format_rp("raw text here")[1] is True
     assert probes["n"] == 2
 
 
@@ -594,7 +585,7 @@ def test_stream_deadline_stops_consuming_a_trickling_stream(tmp_path, monkeypatc
     monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
 
     text, err = fmt._stream_formatter(
-        "http://stub/v1/chat/completions", b"{}", "omniroute",
+        "http://stub/v1/chat/completions", b"{}",
         lambda d: None, timeout=18.0, deadline=clock["t"] + 5.0,
     )
     assert text == ""

@@ -933,7 +933,6 @@ async function reformatCurrentText(modeId) {
         body: JSON.stringify({
             text: source,
             mode: String(modeId || '').trim(),
-            provider: 'omniroute',
             formatter_model: cfg.formatterModel || '',
             context: ctx.lastAi || '',
             persona: cfg.reformatPersona || ctx.personaId || '',
@@ -2385,7 +2384,6 @@ async function submitDesktopRecording(capture) {
         params.set('mode', modeId);
         params.set('context', cfg.pushContext ? (ctx.lastAi || '') : '');
         params.set('persona', cfg.reformatPersona || ctx.personaId || '');
-        params.set('provider', 'omniroute');
         if (cfg.formatterModel) params.set('formatter_model', cfg.formatterModel);
         params.set('character', character);
         params.set('language', language);
@@ -4033,14 +4031,14 @@ async function buildDiagnosticsHtml() {
         if (state.ok) return 'valid';
         return tokenStatusLabel();
     })();
-    const formatter = audit?.summary?.llm || health.data?.formatter || health.data?.provider || 'see /audit/network';
-    const defaultProvider = health.data?.default_provider || '';
+    const formatterProvider = health.data?.formatter_provider || '';
+    const formatter = audit?.summary?.llm || formatterProvider || 'see /audit/network';
     // Last-used model attribution (from the most recent dictation-result).
     const lastModel = lastDoneModel ? shortModelLabel(lastDoneModel) : '';
-    const modelState = lastModel ? (lastModelFallback ? 'fallback' : 'primary') : (defaultProvider || 'unknown');
+    const modelState = lastModel ? (lastModelFallback ? 'fallback' : 'primary') : (formatterProvider || 'unknown');
     const modelDetail = lastModel
-        ? `last: ${lastModel}${lastModelFallback ? ' (chain fell through)' : ''}${defaultProvider ? ` · default provider ${defaultProvider}` : ''}`
-        : (defaultProvider ? `default provider ${defaultProvider} · no dictation yet this session` : 'no attribution yet');
+        ? `last: ${lastModel}${lastModelFallback ? ' (chain fell through)' : ''}`
+        : (formatterProvider ? `${formatterProvider} fallback chain · no dictation yet this session` : 'no attribution yet');
     const whisper = health.data?.whisper || health.data?.whisper_server || health.data?.model || health.data?.asr || 'not reported by /health';
     const certDays = (typeof health.data?.cert_expires_days === 'number') ? health.data.cert_expires_days : null;
     const certSeverity = certDays == null ? 'warn' : (certDays < 7 ? 'bad' : (certDays < 30 ? 'warn' : 'ok'));
@@ -4875,17 +4873,15 @@ function buildSettingsPanel() {
         'xao/grok-4.6': 'Grok 4.6',
     };
     const modelLabel = (model) => modelLabels[model] || model;
-    let modelsByProvider = {};
+    let formatterModels = [];
 
     const loadFormatterModels = () => fetch(
         `${s.serverUrl.replace(/\/+$/, '')}/formatter-models`,
         { headers: { ...authHeaders() }, cache: 'no-store', mode: 'cors' },
     ).then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
         .then(data => {
-            modelsByProvider = (data && typeof data.by_provider === 'object' && data.by_provider)
-                ? data.by_provider
-                : { omniroute: Array.isArray(data?.models) ? data.models : [] };
-            return Array.isArray(data?.models) ? data.models : [];
+            formatterModels = Array.isArray(data?.models) ? data.models : [];
+            return formatterModels;
         });
 
     if (modelEl) {
@@ -4917,10 +4913,9 @@ function buildSettingsPanel() {
     function populateModeModelOptions() {
         if (!modeModelEl) return;
         modeModelEl.innerHTML = '<option value="">Auto fallback chain</option>';
-        const models = modelsByProvider.omniroute || [];
-        for (const model of models) {
+        for (const model of formatterModels) {
             const opt = document.createElement('option');
-            opt.value = `omniroute|${model}`;
+            opt.value = model;
             opt.textContent = modelLabel(model);
             modeModelEl.appendChild(opt);
         }
@@ -4934,8 +4929,7 @@ function buildSettingsPanel() {
         const disabled = !modeId || !mode;
         modeModelEl.disabled = disabled;
         const model = String(mode?.formatter_model || '');
-        const provider = String(mode?.formatter_provider || '') || 'omniroute';
-        modeModelEl.value = model ? `${provider}|${model}` : '';
+        modeModelEl.value = model;
 
         // The global override is sticky and sent on every request, so while it
         // is set every per-mode assignment is dead. Say so instead of letting
@@ -4950,10 +4944,10 @@ function buildSettingsPanel() {
                     + 'Set it to “Auto fallback chain” to use per-mode assignments.';
             } else if (model) {
                 modeModelHintEl.textContent =
-                    `“${mode.label || modeId}” formats with ${modelLabel(model)} (${provider}).`;
+                    `“${mode.label || modeId}” formats with ${modelLabel(model)}.`;
             } else {
                 modeModelHintEl.textContent =
-                    `“${mode.label || modeId}” uses the provider's fallback chain.`;
+                    `“${mode.label || modeId}” uses the OmniRoute fallback chain.`;
             }
         }
         if (overrideHintEl) {
@@ -4971,7 +4965,7 @@ function buildSettingsPanel() {
                 reflectModeModel();
                 return;
             }
-            const [provider, model] = String(modeModelEl.value || '').split('|');
+            const model = String(modeModelEl.value || '');
             modeModelEl.disabled = true;
             try {
                 const res = await fetch(`${s.serverUrl.replace(/\/+$/, '')}/modes/formatter`, {
@@ -4981,8 +4975,7 @@ function buildSettingsPanel() {
                     headers: { 'Content-Type': 'application/json', ...authHeaders() },
                     body: JSON.stringify({
                         mode: modeId,
-                        model: model || '',
-                        provider: model ? (provider || '') : '',
+                        model,
                     }),
                 });
                 let data = null;
