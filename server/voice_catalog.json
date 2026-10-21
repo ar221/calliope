@@ -225,27 +225,27 @@
   },
   "ef_dora": {
     "gender": "feminine",
-    "accent": "european",
+    "accent": "spanish",
     "tone": ["warm", "natural", "expressive"],
     "age": "adult",
     "energy": "medium",
-    "notes": "European-accented feminine voice"
+    "notes": "Spanish-accented feminine voice; Hispanophone characters or Spanish-speaking settings"
   },
   "em_alex": {
     "gender": "masculine",
-    "accent": "european",
+    "accent": "spanish",
     "tone": ["natural", "clear", "neutral"],
     "age": "adult",
     "energy": "medium",
-    "notes": "European-accented masculine voice"
+    "notes": "Spanish-accented masculine voice"
   },
   "em_santa": {
     "gender": "masculine",
-    "accent": "european",
+    "accent": "spanish",
     "tone": ["warm", "deep", "jolly"],
     "age": "mature",
     "energy": "medium",
-    "notes": "European-accented warm masculine voice"
+    "notes": "Spanish-accented warm masculine voice; paternal or jovial characters"
   },
   "ff_siwis": {
     "gender": "feminine",

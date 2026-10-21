@@ -18,6 +18,7 @@ import time
 import urllib.error
 import urllib.request
 import wave
+from collections import Counter
 from pathlib import Path
 
 from . import config
@@ -422,7 +423,63 @@ _SUGGEST_KEYWORD_TONES: dict[str, list[str]] = {
     "composed":     ["calm", "smooth"],    "deep":          ["deep"],
     "gruff":        ["deep", "raspy"],     "raspy":         ["raspy"],
     "wise":         ["calm", "authoritative"],
+    "motherly":     ["warm", "gentle"],    "fatherly":      ["warm", "deep"],
+    "paternal":     ["warm", "deep"],      "jolly":         ["jolly", "warm"],
+    "grumpy":       ["deep", "cold"],      "brooding":      ["dark", "calm"],
+    "regal":        ["elegant", "authoritative", "formal"],
+    "royal":        ["elegant", "formal"], "noble":         ["elegant", "formal"],
+    "queen":        ["elegant", "authoritative"],
+    "king":         ["authoritative", "deep"],
+    "princess":     ["elegant", "bright"], "knight":        ["authoritative", "clear"],
+    "soldier":      ["authoritative", "clear"],
+    "military":     ["authoritative", "formal"],
+    "commander":    ["authoritative", "deep"],
+    "scholar":      ["professional", "clear"],
+    "professor":    ["professional", "authoritative"],
+    "intellectual": ["professional", "clear"],
+    "bard":         ["narrative", "expressive"],
+    "storyteller":  ["narrative", "expressive"],
+    "robot":        ["neutral", "cold"],   "monotone":      ["neutral"],
+    "angelic":      ["ethereal", "soft"],  "demon":         ["dark", "cold"],
+    "nervous":      ["soft"],              "anxious":       ["soft"],
+    "confident":    ["authoritative", "smooth"],
+    "sassy":        ["playful", "bright"], "cheeky":        ["playful"],
+    "smug":         ["smooth", "playful"], "melanchol":     ["calm", "soft"],
+    "somber":       ["calm", "soft"],      "sad":           ["soft"],
 }
+
+# Accent detection word sets, checked in order — first hit wins (matches the
+# historical if/elif precedence). Tokens, not substrings: "uk." and "spain,"
+# now count. Bare "us" is deliberately absent: the pronoun ("let us") would
+# lock every cast to American.
+_SUGGEST_ACCENT_WORDS: dict[str, frozenset[str]] = {
+    "british":    frozenset({"british", "britain", "london", "uk"}),
+    "american":   frozenset({"american", "america", "usa"}),
+    "french":     frozenset({"french", "france", "paris", "parisian"}),
+    "italian":    frozenset({"italian", "italy"}),
+    "japanese":   frozenset({"japanese", "japan"}),
+    "chinese":    frozenset({"chinese", "china", "mandarin"}),
+    "spanish":    frozenset({"spanish", "spain", "español", "espanol", "mexican",
+                             "mexico", "hispanic", "latina", "latino"}),
+    "portuguese": frozenset({"portuguese", "portugal", "brazilian", "brazil"}),
+    "hindi":      frozenset({"hindi", "indian", "india"}),
+}
+
+_SUGGEST_AGE_YOUNG = frozenset({"young", "youthful", "teen", "teenager", "teenage", "girlish", "boyish"})
+_SUGGEST_AGE_MATURE = frozenset({"elderly", "older", "elder", "aged", "mature", "veteran",
+                                 "grandmother", "grandma", "grandfather", "grandpa"})
+_SUGGEST_ENERGY_HIGH = frozenset({"energetic", "hyper", "hyperactive", "bubbly", "lively",
+                                  "exuberant", "boisterous", "peppy", "spirited", "excitable"})
+_SUGGEST_ENERGY_LOW = frozenset({"calm", "quiet", "serene", "tired", "lazy", "weary",
+                                 "reserved", "subdued", "mellow", "soothing"})
+
+# Allowed continuations for stem-prefix keyword matches ("" = exact already
+# handled, kept for uniformity). Blocks compound-word false positives:
+# "gentleman" must not match "gentle", while "gently"/"coldest"/"demonic" do.
+_SUGGEST_STEM_SUFFIXES = frozenset({
+    "", "s", "es", "d", "ed", "ing", "ly", "ness", "ful", "ish",
+    "ic", "ical", "y", "er", "est", "ier", "iest", "ous", "ian", "al",
+})
 
 
 def _load_voice_catalog() -> dict:
@@ -452,9 +509,13 @@ def _suggest_voices(
         return []
 
     text = " ".join(filter(None, [name, description, personality] + list(recent_messages)[-8:])).lower()
+    # Word tokens, not raw substrings: "woman," and "uk." count, "scolded"
+    # no longer triggers "cold". Accents in words (ñ, é) stay intact.
+    token_counts = Counter(re.findall(r"[a-zà-ÿ]+", text))
+    tokens = set(token_counts)
 
-    fem = sum(text.count(w) for w in (" she ", " her ", " woman ", " girl ", " female ", " lady "))
-    masc = sum(text.count(w) for w in (" he ", " him ", " his ", " man ", " boy ", " male ", " gentleman "))
+    fem = sum(token_counts[w] for w in ("she", "her", "hers", "woman", "girl", "female", "lady"))
+    masc = sum(token_counts[w] for w in ("he", "him", "his", "man", "boy", "male", "gentleman"))
     gender_pref: str | None = None
     if fem > masc * 1.5:
         gender_pref = "feminine"
@@ -463,22 +524,35 @@ def _suggest_voices(
 
     desired_tones: set[str] = set()
     for keyword, tones in _SUGGEST_KEYWORD_TONES.items():
-        if keyword in text:
+        # Exact token hit, or stem + morphological suffix for stems >= 4 chars:
+        # "deeply" -> deep, "aristocratic" -> aristocrat, "melancholic" ->
+        # melanchol — but never arbitrary continuations ("gentleman" != gentle).
+        if keyword in tokens or (
+            len(keyword) >= 4
+            and any(
+                t.startswith(keyword) and t[len(keyword):] in _SUGGEST_STEM_SUFFIXES
+                for t in tokens
+            )
+        ):
             desired_tones.update(tones)
 
     accent_pref: str | None = None
-    if any(w in text for w in ("british", "london", " uk ")):
-        accent_pref = "british"
-    elif any(w in text for w in ("american", " us ")):
-        accent_pref = "american"
-    elif "french" in text or "paris" in text:
-        accent_pref = "french"
-    elif "italian" in text or "italy" in text:
-        accent_pref = "italian"
-    elif "japanese" in text or "japan" in text:
-        accent_pref = "japanese"
-    elif "chinese" in text or "mandarin" in text:
-        accent_pref = "chinese"
+    for accent, words in _SUGGEST_ACCENT_WORDS.items():
+        if tokens & words:
+            accent_pref = accent
+            break
+
+    age_pref: str | None = None
+    if tokens & _SUGGEST_AGE_YOUNG:
+        age_pref = "young adult"
+    elif tokens & _SUGGEST_AGE_MATURE:
+        age_pref = "mature"
+
+    energy_pref: str | None = None
+    if tokens & _SUGGEST_ENERGY_HIGH:
+        energy_pref = "high"
+    elif tokens & _SUGGEST_ENERGY_LOW:
+        energy_pref = "low"
 
     used_voices: set[str] = set(existing_voices.values())
     if narrator:
@@ -502,11 +576,33 @@ def _suggest_voices(
             score += len(matched) * 1.5
             reason_parts.extend(sorted(matched)[:2])
 
-        if accent_pref and meta.get("accent") == accent_pref:
-            score += 2.0
-            reason_parts.append(meta["accent"])
-        elif not accent_pref and meta.get("accent") in ("american", "british"):
+        if accent_pref:
+            # An explicit nationality mention is close to a hard constraint:
+            # the ±6.0 swing outweighs typical tone/age/energy stacks on the
+            # wrong accent pack (only a near-perfect 3-tone+age+energy fit ties).
+            if meta.get("accent") == accent_pref:
+                score += 4.0
+                reason_parts.append(meta["accent"])
+            else:
+                score -= 2.0
+        elif meta.get("accent") in ("american", "british"):
             score += 0.3
+
+        if age_pref:
+            voice_age = meta.get("age", "adult")
+            if voice_age == age_pref:
+                score += 1.2
+                reason_parts.append(voice_age)
+            elif {voice_age, age_pref} == {"young adult", "mature"}:
+                score -= 0.8
+
+        if energy_pref:
+            voice_energy = meta.get("energy", "medium")
+            if voice_energy == energy_pref:
+                score += 0.8
+                reason_parts.append(f"{voice_energy} energy")
+            elif {voice_energy, energy_pref} == {"high", "low"}:
+                score -= 0.4
 
         if voice_id in used_voices:
             score -= 1.5
