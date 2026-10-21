@@ -17,6 +17,7 @@ SRC = pathlib.Path(__file__).resolve().parents[1] / "server" / "calliope-server"
 def _load_server(tmp_path, monkeypatch):
     monkeypatch.setenv("CALLIOPE_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("DICTATION_FORMATTER_PROVIDER", "omniroute")
+    monkeypatch.setenv("OMNIROUTE_API_KEY", "test-key")
     monkeypatch.setenv(
         "DICTATION_OMNIROUTE_RP_CHAIN",
         "claude/claude-opus-4-8, codex/gpt-5.5, claude/claude-sonnet-4-6",

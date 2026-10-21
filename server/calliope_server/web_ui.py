@@ -1801,10 +1801,15 @@ function setProvider(provider, opts) {
 
 function formatterModelLabel(model) {
   const labels = {
-    'no-think/antigravity/claude-sonnet-5': 'Sonnet 5',
-    'no-think/cc/claude-opus-4-8': 'Opus 4.8',
-    'no-think/cc/claude-opus-4-6': 'Opus 4.6',
+    'cc/claude-sonnet-5': 'Sonnet 5',
+    'claude/claude-opus-4-8': 'Opus 4.8',
+    'claude/claude-sonnet-4-6': 'Sonnet 4.6',
     'codex/gpt-5.6-sol-high': 'GPT 5.6 High',
+    'codex/gpt-5.6-luna': 'GPT 5.6 Luna',
+    'openrouter/google/gemini-3.5-flash': 'Gemini 3.5 Flash',
+    'openrouter/google/gemini-3.6-flash': 'Gemini 3.6 Flash',
+    'openrouter/moonshotai/kimi-k3': 'Kimi K3',
+    'xao/grok-4.6': 'Grok 4.6',
   };
   return labels[model] || model;
 }

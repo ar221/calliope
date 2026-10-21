@@ -23,21 +23,20 @@ optional Kokoro TTS read-back proxy. The canonical source is
 │  bind 127.0.0.1:8384 (default) · self-signed cert (90d) · bearer-token auth     │
 │                                                                                  │
 │  ┌──────────────┐    ┌─────────────────┐    ┌────────────────────────────────┐  │
-│  │ DictationHdlr│───▶│ run_pipeline()  │───▶│  formatter_request(provider)   │  │
-│  │ /transcribe  │    │  vocab_correct  │    │   ↳ Claude shape (:42069)      │  │
-│  │ /reformat    │    │  disfluency     │    │   ↳ OpenAI shape (:10531)      │  │
-│  │ /events SSE  │    │  rp_format      │    └────────────────────────────────┘  │
-│  │ /audit/net   │    │  rp_enhance     │                                        │
-│  │ /personas    │    │  persona_pov    │    ┌────────────────────────────────┐  │
-│  │ /characters  │    └─────────────────┘    │  whisper_server_request()      │  │
-│  │ /chat-context│             │             │   POST http://127.0.0.1:9001   │  │
-│  │ /state       │             ▼             │     /inference (multipart)     │  │
+│  │ DictationHdlr│───▶│ run_pipeline()  │───▶│ OmniRoute :20128               │  │
+│  │ /transcribe  │    │ vocab_correct   │    │ authenticated chat completions │  │
+│  │ /reformat    │    │ disfluency/RP   │    │ catalog-qualified model IDs    │  │
+│  │ /events SSE  │    │ persona shaping │    └────────────────────────────────┘  │
+│  │ /audit/net   │    └─────────────────┘                                        │
+│  │ /personas    │             │             ┌────────────────────────────────┐  │
+│  │ /characters  │             │             │ whisper_server_request()       │  │
+│  │ /chat-context│             │             │  POST http://127.0.0.1:9001    │  │
+│  │ /state       │             ▼             │    /inference (multipart)      │  │
 │  └──────────────┘    ┌─────────────────┐    └────────────────────────────────┘  │
-│                      │  ChatReader     │                                        │
-│                      │  (read-only,    │    ┌────────────────────────────────┐  │
-│                      │   ST disk)      │    │ session_transcript: list[dict] │  │
-│                      └─────────────────┘    │   in-RAM only · DELETE wipes   │  │
-│                                              └────────────────────────────────┘  │
+│                      │ ChatReader      │                                         │
+│                      │ (read-only, ST) │    ┌────────────────────────────────┐  │
+│                      └─────────────────┘    │ session transcript: RAM only   │  │
+│                                             └────────────────────────────────┘  │
 └──────┬─────────────────────────────────────────────────┬─────────────────────────┘
        │                                                 │
        │ SSE: dictation-result · dictation-state ·       │ subprocess (cold-spare)
@@ -52,11 +51,8 @@ optional Kokoro TTS read-back proxy. The canonical source is
 │  EventSource → /events         │         └────────────────────────────┘
 └────────────────────────────────┘
                                             ┌────────────────────────────┐
-                                            │  LLM proxy (one of):       │
-                                            │  · claude-code-proxy :42069│
-                                            │    pyrite preset · → claude│
-                                            │  · OpenAI shape :10531     │
-                                            │    grammar / disfluency    │
+                                            │ OmniRoute :20128           │
+                                            │ model-chain routing        │
                                             └────────────────────────────┘
 ```
 
@@ -148,19 +144,14 @@ Calliope sends multipart audio to `/inference`. Hallucination filter
 (MVP-12) runs over the result; word-confidences (MVP-9) surface in the
 phone UI for low-confidence highlighting.
 
-### LLM proxy (one of two shapes)
+### OmniRoute formatter gateway
 
-- **Claude shape** at `http://localhost:42069` — `claude-code-proxy`
-  (upstream `horselock/claude-code-proxy`, MIT). Used for `rp_enhance`
-  and `persona_pov` via the pyrite preset (`/v1/pyrite/messages`).
-  The proxy itself relays to `claude.ai` over OAuth — that's the cloud
-  hop disclosed in PRIVACY.md.
-- **OpenAI shape** at `http://127.0.0.1:10531/v1` — used for
-  `grammar_clean` and `disfluency_clean`. Whether this is local depends
-  on what proxy the user has installed there.
-
-Both routes go through `formatter_request(provider, ...)` which maintains
-the outbound-call ring buffer that `/audit/network` exposes.
+All cloud text formatting uses authenticated OmniRoute at
+`http://127.0.0.1:20128/v1`. Calliope sends OpenAI-shape chat completions with
+catalog-qualified provider/model IDs, retains explicit user model choices as
+single-model requests, and uses separate RP and cleanup fallback chains for
+automatic selection. The outbound-call ring buffer exposed by `/audit/network`
+continues to record non-loopback destinations. Audio never enters this route.
 
 ### Kokoro TTS read-back (optional)
 

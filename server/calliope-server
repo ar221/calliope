@@ -2,8 +2,7 @@
 """Remote dictation server — whisper.cpp over HTTP with a web UI.
 
 Phone records audio in the browser, POSTs it to this server,
-which runs whisper-cli (GPU-accelerated) and returns text.
-Optionally formats as RP via claude-code-proxy.
+which runs whisper-cli (GPU-accelerated) and can format text through OmniRoute.
 
 Usage:
     dictation-server [--port PORT] [--host HOST] [--no-ssl]
@@ -128,12 +127,8 @@ from calliope_server.config import (  # noqa: E402
     KEY_FILE,
     TOKEN_FILE,
     WHISPER_BIN,
-    CLAUDE_PROXY_URL,
-    CLAUDE_RP_MODEL,  # noqa: F401 — re-export for tests/back-compat
-    OPENAI_PROXY_URL,
-    OPENAI_RP_MODEL,  # noqa: F401 — re-export for tests/back-compat
-    OPENAI_CLEAN_MODEL,  # noqa: F401 — re-export for tests/back-compat
     OMNIROUTE_PROXY_URL,
+    OMNIROUTE_API_KEY,
     _parse_model_chain,  # noqa: F401 — re-export for tests/back-compat
     _safe_child,  # noqa: F401 — moved to config (neutral home); re-export for tests/back-compat
     OMNIROUTE_RP_CHAIN,
@@ -303,7 +298,6 @@ from calliope_server.formatter import (  # noqa: E402
     reset_model_attribution,  # noqa: F401 — re-export for tests/back-compat
     record_model_attribution,  # noqa: F401 — re-export for tests/back-compat
     get_model_attribution,
-    _is_openai_shape,  # noqa: F401 — re-export for tests/back-compat
     formatter_base_url,  # noqa: F401 — re-export for tests/back-compat
     formatter_health_url,  # noqa: F401 — re-export for tests/back-compat
     formatter_request_url,  # noqa: F401 — re-export for tests/back-compat
@@ -1477,17 +1471,11 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/personas":
             self.send_json({"personas": discover_personas()})
         elif path == "/formatter-models":
-            # `?provider=` picks a lane; default keeps the historical omniroute
-            # response shape so existing clients are unaffected.
-            fm_provider = normalize_formatter_provider(
-                query.get("provider", [""])[0] or "omniroute"
-            )
+            models = selectable_models("omniroute")
             self.send_json({
-                "provider": fm_provider,
-                "models": selectable_models(fm_provider),
-                "by_provider": {
-                    p: selectable_models(p) for p in sorted(_VALID_PROVIDERS)
-                },
+                "provider": "omniroute",
+                "models": models,
+                "by_provider": {"omniroute": models},
             })
         elif path == "/characters":
             # POL-6 — `?group=<groupId>` filters to that group's members.
@@ -3063,8 +3051,7 @@ def main():
         f"Config format: {'YAML' if _HAVE_YAML else 'JSON (PyYAML unavailable)'} | "
         f"modes: {len(initial_modes)} ({', '.join(m.get('id','') for m in initial_modes)}) | "
         f"vocab entries: {len(load_vocab())} | "
-        f"formatters: claude={CLAUDE_PROXY_URL}, openai={OPENAI_PROXY_URL}, "
-        f"omniroute={OMNIROUTE_PROXY_URL}, default={DEFAULT_FORMATTER_PROVIDER} | "
+        f"formatter: omniroute={OMNIROUTE_PROXY_URL}, authenticated={bool(OMNIROUTE_API_KEY)} | "
         f"omni-rp-chain=[{', '.join(OMNIROUTE_RP_CHAIN)}]"
     )
 

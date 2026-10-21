@@ -1,9 +1,9 @@
 """Formatter / pipeline layer.
 
 Owns the dictation post-processing pipeline: mode definitions + hot-reloadable
-modes/vocab/voice-macros/char-modes config, prompt construction, the provider
-clients (claude proxy, openai proxy, omniroute chain walker), per-request model
-attribution (thread-local), hallucination filtering, disfluency cleanup, the
+modes/vocab/voice-macros/char-modes config, prompt construction, the authenticated
+OmniRoute client + model chain, per-request model attribution (thread-local),
+hallucination filtering, disfluency cleanup, the
 voice-command grammar, vocab correction + word-confidence spans, ST state /
 scene-contract helpers, and `run_pipeline` itself.
 
@@ -124,7 +124,7 @@ FORMATTER_OUTPUT_CONTRACT = (
 )
 
 
-# ─── RP formatting via claude-code-proxy ──────────────────
+# ─── RP formatting via OmniRoute ──────────────────────────
 RP_SYSTEM_FORMAT = (
     "You are a text formatter. Convert the following raw dictated speech into "
     "SillyTavern/markdown roleplay format:\n"
@@ -241,8 +241,8 @@ DISFLUENCY_CLEAN_SYSTEM = (
 
 
 def normalize_formatter_provider(provider: str | None) -> str:
-    provider = (provider or config.DEFAULT_FORMATTER_PROVIDER).strip().lower()
-    return provider if provider in config._VALID_PROVIDERS else config.DEFAULT_FORMATTER_PROVIDER
+    """The provider field remains in the client API; OmniRoute is its sole route."""
+    return "omniroute"
 
 
 # ─── Model attribution ─────────────────────────────────────
@@ -284,70 +284,36 @@ def get_model_attribution() -> dict:
     }
 
 
-def _is_openai_shape(provider: str) -> bool:
-    """OmniRoute and the OpenAI proxy both speak /v1/chat/completions."""
-    return normalize_formatter_provider(provider) in {"openai", "omniroute"}
-
-
 def formatter_base_url(provider: str) -> str:
-    provider = normalize_formatter_provider(provider)
-    if provider == "omniroute":
-        base = config.OMNIROUTE_PROXY_URL
-    elif provider == "openai":
-        base = config.OPENAI_PROXY_URL
-    else:
-        base = config.CLAUDE_PROXY_URL
-    base = base.strip().rstrip("/")
-    if _is_openai_shape(provider) and base.endswith("/v1"):
-        base = base[:-3]
-    return base
+    normalize_formatter_provider(provider)
+    base = config.OMNIROUTE_PROXY_URL.strip().rstrip("/")
+    return base[:-3] if base.endswith("/v1") else base
 
 
 def formatter_health_url(provider: str) -> str:
-    base = formatter_base_url(provider)
-    if _is_openai_shape(provider):
-        return f"{base}/v1/models"
-    return f"{base}/health"
+    return f"{formatter_base_url(provider)}/v1/models"
 
 
 def formatter_request_url(provider: str, endpoint_override: str = "") -> str:
-    provider = normalize_formatter_provider(provider)
-    base = formatter_base_url(provider)
-    if _is_openai_shape(provider):
-        return f"{base}/v1/chat/completions"
-    endpoint = endpoint_override or "/v1/messages"
-    return f"{base}{endpoint}"
+    return f"{formatter_base_url(provider)}/v1/chat/completions"
 
 
 def provider_chain(provider: str, *, cleanup: bool = False) -> list[str]:
-    """The configured fallback chain for `provider`."""
-    provider = normalize_formatter_provider(provider)
-    if provider == "omniroute":
-        chain = config.OMNIROUTE_CLEAN_CHAIN if cleanup else config.OMNIROUTE_RP_CHAIN
-    elif provider == "openai":
-        chain = config.OPENAI_CLEAN_CHAIN if cleanup else config.OPENAI_RP_CHAIN
-    else:
-        # The Claude-shape proxy fronts a single model.
-        chain = [config.DISFLUENCY_CLEAN_MODEL if cleanup else config.CLAUDE_RP_MODEL]
+    """The configured OmniRoute fallback chain."""
+    normalize_formatter_provider(provider)
+    chain = config.OMNIROUTE_CLEAN_CHAIN if cleanup else config.OMNIROUTE_RP_CHAIN
     return [m for m in chain if m]
 
 
 def selectable_models(provider: str) -> list[str]:
-    """Models a client may pin explicitly for `provider`.
-
-    Allow-listed so a request cannot turn Calliope into an arbitrary relay.
-    """
-    provider = normalize_formatter_provider(provider)
-    if provider == "omniroute":
-        return list(config.OMNIROUTE_SELECTABLE_MODELS)
-    if provider == "openai":
-        return list(config.OPENAI_SELECTABLE_MODELS)
-    return [config.CLAUDE_RP_MODEL]
+    """Catalog-qualified OmniRoute model IDs clients may pin explicitly."""
+    normalize_formatter_provider(provider)
+    return list(config.OMNIROUTE_SELECTABLE_MODELS)
 
 
 def formatter_model(provider: str, *, cleanup: bool = False) -> str:
     chain = provider_chain(provider, cleanup=cleanup)
-    return chain[0] if chain else config.CLAUDE_RP_MODEL
+    return chain[0] if chain else ""
 
 
 def formatter_model_chain(provider: str, *, cleanup: bool = False,
@@ -374,26 +340,17 @@ def formatter_payload(
     max_tokens: int,
     temperature: float | None,
 ) -> dict:
-    provider = normalize_formatter_provider(provider)
-    if _is_openai_shape(provider):
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": user_content})
-        payload = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "stream": False,
-        }
-    else:
-        payload = {
-            "model": model,
-            "max_tokens": max_tokens,
-            "stream": False,
-            "system": [{"type": "text", "text": system_prompt}],
-            "messages": [{"role": "user", "content": user_content}],
-        }
+    normalize_formatter_provider(provider)
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_content})
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
     if temperature is not None:
         payload["temperature"] = float(temperature)
     return payload
@@ -507,16 +464,15 @@ def reset_probe_cache() -> None:
 
 
 def probe_formatter(provider: str, timeout: float | None = None) -> tuple[bool, str]:
-    """Liveness check for the formatter proxy, cached for a few seconds.
+    """Authenticated OmniRoute liveness check, cached for a few seconds.
 
-    The health URL for OpenAI-shape providers is /v1/models, which on OmniRoute
-    rebuilds a ~2300-entry catalog. That answers in milliseconds warm but has
-    been measured over 3s cold, so the previous hard-coded 2s timeout reported a
-    perfectly healthy proxy as offline on the first call after an idle period —
-    and format_rp then returned raw, unformatted text without trying a single
-    model. Caching also stops one dictation from paying for several probes.
+    `/v1/models` rebuilds a large catalog and can exceed 3s cold, so the probe
+    budget is configurable and its verdict cached. A missing API key fails
+    closed before any network request.
     """
     provider = normalize_formatter_provider(provider)
+    if not config.OMNIROUTE_API_KEY:
+        return False, "OMNIROUTE_API_KEY is required"
     if timeout is None:
         timeout = config.FORMATTER_PROBE_TIMEOUT_SECONDS
     now = time.monotonic()
@@ -525,7 +481,11 @@ def probe_formatter(provider: str, timeout: float | None = None) -> tuple[bool, 
         if cached is not None and now < cached[0]:
             return cached[1], cached[2]
     try:
-        req = urllib.request.Request(formatter_health_url(provider), method="GET")
+        req = urllib.request.Request(
+            formatter_health_url(provider),
+            headers={"Authorization": f"Bearer {config.OMNIROUTE_API_KEY}"},
+            method="GET",
+        )
         # Close the response: the old call leaked the socket every probe.
         with urllib.request.urlopen(req, timeout=timeout):
             pass
@@ -549,7 +509,7 @@ def disfluency_clean(text: str, provider: str = config.DEFAULT_FORMATTER_PROVIDE
     """Run a cheap-model cleanup pass to remove stutters/fillers/restarts.
 
     Returns (cleaned_text, was_cleaned, reason_if_skipped).
-    Falls through to the original text on timeout, proxy failure, or oversized input.
+    Falls through to the original text on timeout, gateway failure, or oversized input.
     `was_cleaned` is True when the cleanup actually ran; False on skip/failure.
     """
     if not text or not text.strip():
@@ -562,12 +522,11 @@ def disfluency_clean(text: str, provider: str = config.DEFAULT_FORMATTER_PROVIDE
         return text, False, f"input {word_count} words exceeds cap {config.DISFLUENCY_CLEAN_MAX_WORDS}"
 
     provider = normalize_formatter_provider(provider)
-    # No hard-coded timeout: a cold /v1/models catalog build exceeds 2s and the
-    # config default governs, otherwise this silently skips a healthy proxy.
+    # The configurable budget accommodates a cold `/v1/models` catalog build.
     healthy, _reason = probe_formatter(provider)
     if not healthy:
         log.info("disfluency_clean: %s formatter unreachable — passing through raw", provider)
-        return text, False, f"cleanup proxy unreachable ({provider})"
+        return text, False, f"cleanup gateway unreachable ({provider})"
 
     request_url = formatter_request_url(provider)
     chain = formatter_model_chain(provider, cleanup=True)
@@ -589,7 +548,10 @@ def disfluency_clean(text: str, provider: str = config.DEFAULT_FORMATTER_PROVIDE
             req = urllib.request.Request(
                 request_url,
                 data=payload,
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {config.OMNIROUTE_API_KEY}",
+                },
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=config.DISFLUENCY_CLEAN_TIMEOUT) as resp:
@@ -1104,6 +1066,7 @@ def _stream_formatter(url: str, payload: bytes, provider: str,
         headers={
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
+            "Authorization": f"Bearer {config.OMNIROUTE_API_KEY}",
         },
         method="POST",
     )
@@ -1167,18 +1130,17 @@ def format_rp(text: str, mode: int = 1, context: str = "",
                provider: str = config.DEFAULT_FORMATTER_PROVIDER,
                request_id: str = "",
                model_override: str = "") -> tuple[str, bool, str]:
-    """Format text via the selected formatter proxy. Backwards-compatible legacy interface.
+    """Format text through authenticated OmniRoute.
 
-    mode=1 format, mode=2 enhance.
-    system_prompt_override / endpoint_override let pipeline steps reuse the same
-    proxy-call plumbing with a custom prompt + endpoint (preset: default | pyrite).
+    mode=1 formats; mode=2 enhances. Prompt overrides let pipeline steps reuse
+    the request path while keeping the existing public call contract.
     skip_persona_character skips the persona/character injection blocks so the
     caller (persona_pov step) can build its own framing.
     user_content_override bypasses the default user-content assembly entirely.
     scene_continuity is compact visual/spatial state from ST extensions.
     scene_contract is request-scoped MVP-26 guidance; it is never persisted.
 
-    request_id: when non-empty, request `stream: true` from the proxy and emit
+    request_id: when non-empty, request `stream: true` and emit
     `dictation-token` SSE events with {requestId, delta, done} as tokens
     arrive. The final canonical text still returns via the function's normal
     return tuple — caller emits `dictation-result` with that text and the
@@ -1191,8 +1153,8 @@ def format_rp(text: str, mode: int = 1, context: str = "",
     provider = normalize_formatter_provider(provider)
     healthy, _reason = probe_formatter(provider)
     if not healthy:
-        log.warning("%s formatter proxy not reachable — returning raw text", provider)
-        return text, True, f"RP proxy offline ({provider} formatter not reachable)"
+        log.warning("OmniRoute formatter not reachable — returning raw text")
+        return text, True, "RP gateway offline (OmniRoute not reachable)"
 
     if system_prompt_override:
         system_prompt = system_prompt_override
@@ -1269,8 +1231,7 @@ def format_rp(text: str, mode: int = 1, context: str = "",
         user_content += f"[YOUR DICTATED INPUT — rewrite ONLY this, in the persona's voice, addressing the character above:]\n{text}"
 
     request_url = formatter_request_url(provider, endpoint)
-    # Ordered model chain. Single-element for claude/openai; multi-tier for
-    # omniroute so a transiently un-credentialed model skips to the next.
+    # Ordered OmniRoute model chain; explicit picks remain single-model.
     chain = formatter_model_chain(provider, model_override=model_override)
     if not chain:
         return text, True, (
@@ -1349,17 +1310,20 @@ def format_rp(text: str, mode: int = 1, context: str = "",
             # Clean stream that produced no visible text (thinking-only output).
             # Advance like the non-streaming path does on an empty response.
             if has_next:
-                last_reason = "RP proxy returned empty stream"
+                last_reason = "RP gateway returned empty stream"
                 continue
             events.broadcast_event("dictation-token", {"requestId": request_id, "delta": "", "done": True})
-            return text, True, "RP proxy returned empty stream"
+            return text, True, "RP gateway returned empty stream"
 
         # Non-streaming path.
         try:
             req = urllib.request.Request(
                 request_url,
                 data=payload,
-                headers={"Content-Type": "application/json"},
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {config.OMNIROUTE_API_KEY}",
+                },
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=attempt_timeout) as resp:
@@ -1375,7 +1339,7 @@ def format_rp(text: str, mode: int = 1, context: str = "",
             if formatted:
                 record_model_attribution(provider, model, tier=idx)
                 return formatted, False, ""
-            last_reason = "RP proxy returned empty response"
+            last_reason = "RP gateway returned empty response"
             if has_next:
                 continue
             return text, True, last_reason
@@ -1589,9 +1553,8 @@ def _normalize_mode(entry: dict) -> dict:
         # Optional per-mode LLM pin. Empty = use the provider's fallback chain.
         # A request-level formatter_model still wins over this.
         "formatter_model": "",
-        # Optional per-mode provider pin. Needed because both clients hardcode
-        # provider=omniroute, so without it a mode could only ever pin an
-        # OmniRoute model.
+        # Kept in the persisted/API shape for client compatibility; non-empty
+        # values normalize to the sole supported provider, OmniRoute.
         "formatter_provider": "",
     }
     for k, v in defaults.items():
@@ -1689,27 +1652,15 @@ def mode_has_formatter_step(mode: dict) -> bool:
 
 def resolve_formatter_target(mode: dict, provider: str,
                              formatter_model: str) -> tuple[str, str]:
-    """Decide which provider and pinned model a pipeline run should use.
+    """Resolve the direct model choice for the sole OmniRoute provider.
 
-    Precedence:
-      1. A request-level `formatter_model` is a direct user choice (the model
-         picker) and wins, evaluated against the request's provider.
-      2. Otherwise the mode may pin its own model, and optionally its own
-         provider. The mode's provider overrides the request's because both
-         clients send a hardcoded `provider=omniroute` rather than a user
-         choice — without this, per-mode assignment could only name OmniRoute
-         models.
-      3. Otherwise the request provider's normal fallback chain.
+    A request-level picker wins over a per-mode pin; otherwise the normal
+    OmniRoute fallback chain applies.
     """
     provider = normalize_formatter_provider(provider)
     if formatter_model:
         return provider, formatter_model
     mode_model = str(mode.get("formatter_model") or "").strip()
-    if not mode_model:
-        return provider, ""
-    mode_provider = str(mode.get("formatter_provider") or "").strip()
-    if mode_provider:
-        provider = normalize_formatter_provider(mode_provider)
     return provider, mode_model
 
 
@@ -1809,13 +1760,11 @@ def save_mode_formatter(mode_id: str, model: str, provider: str = "") -> dict:
     if not mode_id:
         raise ValueError("mode id is required")
 
-    target_provider = normalize_formatter_provider(provider) if provider else ""
-    if model:
-        check_provider = target_provider or config.DEFAULT_FORMATTER_PROVIDER
-        if model not in selectable_models(check_provider):
-            raise ValueError(
-                f"model '{model}' is not selectable for provider '{check_provider}'"
-            )
+    target_provider = "omniroute" if provider or model else ""
+    if model and model not in selectable_models("omniroute"):
+        raise ValueError(
+            f"model '{model}' is not selectable for provider 'omniroute'"
+        )
 
     with modes_lock:
         modes = [dict(m) for m in load_modes()]

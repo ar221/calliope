@@ -325,12 +325,12 @@ Update phone bookmarks + ST extension settings to the new port.
 asterisks, no enhanced phrasing — even when you've selected
 `rp_enhance` mode.
 
-**Cause:** the configured formatter proxy is not running, is returning errors /
-empty responses, or every model in the chain failed — so the pipeline falls back
-to the previous stage's output and reports `formatting_skipped` with a reason.
+**Cause:** OmniRoute is unavailable or unauthenticated, returned an error or
+empty response, or every model in the chain failed. The pipeline falls back to
+the previous stage's output and reports `formatting_skipped` with a reason.
 Check `formatting_reason` first; it names the actual failure:
 
-- `RP proxy offline (... not reachable)` — the liveness probe failed. Probe
+- `RP gateway offline (... not reachable)` — the liveness probe failed. Probe
   timeout is `DICTATION_FORMATTER_PROBE_TIMEOUT` (default 6s) and the verdict is
   cached for `DICTATION_FORMATTER_PROBE_TTL` (default 30s). A cold OmniRoute
   `/v1/models` catalog build can take over 3s, which is why the probe budget is
@@ -348,31 +348,18 @@ Check `formatting_reason` first; it names the actual failure:
 **Fix:**
 
 ```bash
-# 1. Is the proxy reachable?
-curl -s http://localhost:42069/health
-# Expected: {"status":"ok"} or similar; 4xx/5xx/connection-refused = down.
+# 1. Confirm the authenticated OmniRoute catalog is reachable. Load the key
+# through your normal private shell setup; never paste it into logs.
+curl -sf http://127.0.0.1:20128/v1/models \
+  -H "Authorization: Bearer $OMNIROUTE_API_KEY" >/dev/null
 
-# 2. Start it if needed (path varies by your install)
-cd ~/STWork/claude-code-proxy-1.2.0
-./run.sh
-# Or via systemd if you've wrapped it: systemctl --user start claude-code-proxy
-
-# 3. If 401: re-auth
-# Visit http://localhost:42069/auth/login in a browser, complete OAuth.
-
-# 4. Confirm Calliope sees it
+# 2. Confirm Calliope sees the route after deployment/restart.
 journalctl --user -u dictation-server -f
-# Trigger a transcribe; look for `formatter_request` log lines.
-# `formatter_request → 200` = good; `connection refused` / `timeout` = proxy down.
+# Trigger a transcribe; formatter_request → 200 is the expected path.
 
-# 5. Fallback while the proxy is down: switch mode to `plain` or `command` via
-#    the phone UI mode selector — those are the only modes with no LLM step.
-#    `rp_format` is a lighter formatter, but it still calls the LLM, so it
-#    fails the same way while the proxy is unreachable.
+# 3. While OmniRoute is unavailable, switch to `plain` or `command`; those are
+# the only modes with no LLM step. `rp_format` still requires OmniRoute.
 ```
-
-Same drill for the OpenAI-shape proxy at `127.0.0.1:10531`, used for
-`grammar_clean` / `disfluency_clean`.
 
 ---
 

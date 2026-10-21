@@ -77,20 +77,6 @@ SOFTWARE.
 - **Role:** Pretrained Whisper acoustic model used for transcription. Downloaded
   by the user, not bundled.
 
----
-
-## LLM post-processing (optional)
-
-### claude-code-proxy
-
-- **License:** MIT (`horselock/claude-code-proxy`)
-- **URL:** https://github.com/horselock/claude-code-proxy
-- **Role:** Optional local OAuth bridge at `localhost:42069` used by the
-  `rp_enhance` mode for Anthropic-shape requests with the upstream "pyrite"
-  preset. Not bundled; user installs separately. The pyrite preset itself
-  ships with the upstream proxy and remains under that project's MIT license.
-
----
 
 ## Python dependencies (all optional)
 
@@ -163,6 +149,3 @@ SOFTWARE.
 - Static-linking only happens transitively inside `whisper-cli` /
   `whisper-server` (ggml). Both upstream projects are MIT, so the
   redistribution chain stays clean.
-- The pyrite preset and its persona content remain the property of the
-  `horselock/claude-code-proxy` upstream — Calliope consumes whatever is
-  served at the configured proxy URL and does not redistribute the preset.

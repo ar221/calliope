@@ -69,22 +69,14 @@ exclusion). The token is a credential.
 
 ## What may leave your machine (only if you opt in)
 
-### Transcribed text — not audio — to a configured LLM proxy
+### Transcribed text — not audio — to OmniRoute
 
 When you select a `grammar_clean`, `rp_format`, `rp_enhance`, or
-`persona_pov` mode, the transcribed *text* (not audio) is sent to whichever
-LLM proxy you have configured. The default Calliope ships with two proxies
-defined:
-
-- `http://localhost:42069` — `claude-code-proxy` (the pyrite preset path).
-  This is a local proxy. It in turn relays to **`claude.ai`** —
-  Anthropic's privacy policy applies for that hop. Configure with
-  `CLAUDE_RP_PROVIDER=claude` and `CLAUDE_RP_MODEL=...`.
-- `http://127.0.0.1:10531/v1` — an OpenAI-compatible proxy. Whether this
-  endpoint is local or relays to a cloud is determined by the user-installed
-  proxy at that port, not by Calliope. If you point it at a fully local
-  model (`llama.cpp`, `ollama`, `text-generation-webui`), nothing leaves the
-  box. If you point it at a cloud-relay proxy, the text travels there.
+`persona_pov` mode, the transcribed *text* (not audio) is sent to the local
+OmniRoute gateway at `http://127.0.0.1:20128`. The request is authenticated
+with `OMNIROUTE_API_KEY`, and OmniRoute relays it to the provider named by the
+catalog-qualified model ID. That upstream provider's privacy policy applies to
+the text hop. Calliope has no direct-provider or unauthenticated fallback.
 
 The `plain` mode bypasses all LLM providers entirely. Pick `plain` if you
 want hard certainty that no text leaves your machine.
@@ -93,16 +85,15 @@ want hard certainty that no text leaves your machine.
 
 The server's outbound calls are observable:
 
-- **At startup:** the log line declares which providers are reachable and
-  where they sit (`Calliope: rp_enhance via claude-code-proxy at
-  localhost:42069 → claude.ai`).
+- **At startup:** the log line declares the OmniRoute endpoint, whether a key
+  was loaded, and the configured RP model chain without exposing the key.
 - **At runtime:** `GET /audit/network` returns a ring buffer of the last 50
   outbound non-loopback connection events with timestamp, host, port, and
   byte count (MVP-22). The phone PWA exposes this behind the privacy badge
   in the header (MVP-23). External destinations (anything outside
   `127.0.0.0/8` and your configured LAN CIDR) are flagged.
-- The startup banner pins the configured proxy URLs so a misconfigured
-  upstream can't silently re-route.
+- The startup banner pins the configured OmniRoute URL so a misconfigured
+  upstream cannot silently re-route.
 
 ### No model auto-download
 

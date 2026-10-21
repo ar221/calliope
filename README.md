@@ -152,16 +152,9 @@ install as PWA, then test recording.
                                         │  ├── shell ──▶ [whisper-server :9001]
                                         │  │                   (whisper.cpp / GPU)
                                         │  │
-                                        │  ├── HTTP  ──▶ [OmniRoute proxy :20128]  (default)
-                                        │  │                   model-chain fallback across
-                                        │  │                   Claude Code / Codex / Kimi /
-                                        │  │                   Grok / NanoGPT subscriptions
-                                        │  │
-                                        │  ├── HTTPS ──▶ [claude-code-proxy :42069]  (alt provider)
-                                        │  │                   (rp_enhance / pyrite)
-                                        │  │
-                                        │  ├── HTTP  ──▶ [OpenAI-compatible proxy :10531]  (alt provider)
-                                        │  │                   (grammar / disfluency)
+                                        │  ├── HTTP  ──▶ [OmniRoute :20128]
+                                        │  │                   authenticated model-chain fallback
+                                        │  │                   across Claude Code / Codex routes
                                         │  │
                                         │  └── reads ──▶ [SillyTavern data/]
                                         │                  (characters, chats, groups)
@@ -194,13 +187,12 @@ Environment-variable overrides (set in `~/.config/systemd/user/dictation-server.
 - TLS cert/key live under `~/.local/share/dictation-server/`; Tailscale/mkcert flows should write `cert.pem` and `key.pem` there. See [`docs/tailscale.md`](docs/tailscale.md).
 - `WHISPER_BIN`, `WHISPER_SERVER_BIN`, `WHISPER_MODEL` — override binary
   and model paths.
-- `DICTATION_FORMATTER_PROVIDER` — `claude`, `openai`, or `omniroute`
-  (default). OmniRoute is a local OpenAI-shape aggregator that fronts
-  several model subscriptions behind one endpoint and walks a fallback
-  chain (`DICTATION_OMNIROUTE_RP_CHAIN`, `DICTATION_OMNIROUTE_CLEAN_CHAIN`)
-  so one un-credentialed model doesn't block dictation. `DICTATION_CLAUDE_RP_MODEL`
-  / `DICTATION_RP_MODEL`, `DICTATION_OPENAI_RP_MODEL`, `DICTATION_OPENAI_CLEAN_MODEL`
-  configure the other two providers.
+- `DICTATION_FORMATTER_PROVIDER` — retained as an API compatibility field;
+  all values normalize to the sole formatter transport, `omniroute`.
+  `DICTATION_OMNIROUTE_URL`, `DICTATION_OMNIROUTE_RP_CHAIN`,
+  `DICTATION_OMNIROUTE_CLEAN_CHAIN`, and `DICTATION_OMNIROUTE_SELECTABLE_MODELS`
+  configure its endpoint and catalog-qualified model IDs. Authentication uses
+  `OMNIROUTE_API_KEY` from the process environment or the user's fish key file.
 - `DICTATION_ST_DATA_ROOT` — SillyTavern `data/default-user` directory;
   relocates the whole ST data tree in one shot. `DICTATION_CHARACTERS_DIR`,
   `DICTATION_ST_CHATS_DIR`, `DICTATION_ST_GROUPS_DIR`, and
@@ -218,10 +210,9 @@ See [PRIVACY.md](PRIVACY.md). Short version:
 
 - Audio is captured locally, transcribed locally, deleted immediately.
 - Transcripts live in RAM only — server restart wipes them.
-- `plain` mode is fully local. RP modes pass *text* (not audio) to whichever
-  LLM proxy you've configured; if that proxy talks to a cloud model
-  (Anthropic via `claude-code-proxy`), the text travels there. The set of
-  active providers is shown at startup and at `GET /audit/network`.
+- `plain` mode is fully local. RP/formatter modes pass *text* (not audio) to
+  authenticated OmniRoute; the chosen gateway model is shown to clients and
+  outbound destinations remain visible at `GET /audit/network`.
 - No telemetry, no auto-update, no model auto-download at runtime, no
   third-party JS in the phone UI.
 
@@ -229,7 +220,7 @@ See [PRIVACY.md](PRIVACY.md). Short version:
 
 MIT. See [LICENSE](LICENSE). Third-party components listed in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) (whisper.cpp, ggml,
-claude-code-proxy, Monaspace, Literata, system tools).
+Monaspace, Literata, system tools).
 
 ## Support
 

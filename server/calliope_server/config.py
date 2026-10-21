@@ -8,6 +8,7 @@ overrides — re-reads the environment fresh.
 """
 
 import os
+import subprocess
 from pathlib import Path
 
 try:
@@ -133,31 +134,33 @@ CERT_FILE = DATA_DIR / "cert.pem"
 KEY_FILE = DATA_DIR / "key.pem"
 TOKEN_FILE = DATA_DIR / "token"
 WHISPER_BIN = os.environ.get("WHISPER_BIN", "whisper-cli")
-CLAUDE_PROXY_URL = os.environ.get(
-    "DICTATION_CLAUDE_PROXY_URL",
-    os.environ.get("DICTATION_PROXY_URL", "http://localhost:42069"),
-)
-CLAUDE_RP_MODEL = os.environ.get(
-    "DICTATION_CLAUDE_RP_MODEL",
-    # was claude-sonnet-4-20250514; deprecated 2026-04-14, retires 2026-06-15
-    os.environ.get("DICTATION_RP_MODEL", "claude-sonnet-4-6"),
-)
-OPENAI_PROXY_URL = os.environ.get("DICTATION_OPENAI_PROXY_URL", "http://127.0.0.1:10531/v1")
-# Catalog-verified against the live proxy 2026-08-27: gpt-5.5 is current,
-# gpt-5.4 and gpt-5.4-mini still serve, gpt-5.2 returns HTTP 500.
-OPENAI_RP_MODEL = os.environ.get("DICTATION_OPENAI_RP_MODEL", "gpt-5.5")
-OPENAI_CLEAN_MODEL = os.environ.get("DICTATION_OPENAI_CLEAN_MODEL", "gpt-5.4-mini")
 
-# ─── OmniRoute provider (OpenAI-compatible aggregator) ─────
-# Local aggregator that fronts the user's paid subs (Claude Code, Codex,
-# Kimi Code, Super Grok, Nous Portal, NanoGPT) behind one OpenAI-shape
-# endpoint. Speaks /v1/chat/completions, so it reuses the "openai" wire
-# format. Distinct provider id keeps routing/audit legible and lets it
-# carry a tiered *fallback chain* instead of a single model: a model that
-# is transiently un-credentialed ("No credentials for provider: X") or
-# errors is skipped and the next tier is tried, so a single expired sub
-# never blocks dictation.
+
+def _load_omniroute_api_key() -> str:
+    """Load only OMNIROUTE_API_KEY from the established fish secret file."""
+    if value := os.environ.get("OMNIROUTE_API_KEY", ""):
+        return value
+    key_file = Path.home() / ".config/fish/conf.d/api-keys.fish"
+    fish = Path("/usr/bin/fish")
+    if not key_file.is_file() or not fish.is_file():
+        return ""
+    command = (
+        f"source {str(key_file)!r}; "
+        "set -q OMNIROUTE_API_KEY; and printf '%s' $OMNIROUTE_API_KEY"
+    )
+    try:
+        result = subprocess.run(
+            [str(fish), "-c", command], check=False,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return ""
+    return result.stdout.decode("utf-8", errors="ignore")
+
+
+# OmniRoute is the only cloud formatter transport. Audio remains local.
 OMNIROUTE_PROXY_URL = os.environ.get("DICTATION_OMNIROUTE_URL", "http://127.0.0.1:20128/v1")
+OMNIROUTE_API_KEY = _load_omniroute_api_key()
 
 
 def _parse_model_chain(raw: str, default: list[str]) -> list[str]:
@@ -166,77 +169,41 @@ def _parse_model_chain(raw: str, default: list[str]) -> list[str]:
     return items or list(default)
 
 
-def _chain_from(primary: str, *fallbacks: str) -> list[str]:
-    """Primary model first, then fallbacks, de-duplicated in order.
 
-    Keeps an operator's pinned single-model env var authoritative while still
-    giving that lane somewhere to go when the pinned model fails.
-    """
-    ordered: list[str] = []
-    for model in (primary, *fallbacks):
-        if model and model not in ordered:
-            ordered.append(model)
-    return ordered
-
-
-# RP/enhance chain (creative-quality first). Live-verified against the
-# OmniRoute catalog and completion endpoint 2026-08-27. Prefer the newest
-# Default RP lane: current GPT-5.6 Sol, then Sonnet 5, then Opus 4.8.
-# Sonnet 4.6 remains an explicit picker option but never wins regeneration
-# implicitly — the operator asked to retire it from the automatic RP chain.
-#
-# `no-think/cc/claude-sonnet-5` replaces the former
-# `no-think/antigravity/claude-sonnet-5`: the antigravity lane only carries
-# sonnet-4-6, so that id was absent from the live catalog and only worked
-# because the proxy resolved it loosely.
+# RP/enhance chain (creative-quality first), using catalog-qualified IDs.
 OMNIROUTE_RP_CHAIN = _parse_model_chain(
     os.environ.get("DICTATION_OMNIROUTE_RP_CHAIN", ""),
     [
         "codex/gpt-5.6-sol-high",
-        "no-think/cc/claude-sonnet-5",
-        "no-think/cc/claude-opus-4-8",
+        "cc/claude-sonnet-5",
+        "claude/claude-opus-4-8",
     ],
 )
 # Cleanup/grammar chain (cheaper + faster first).
 OMNIROUTE_CLEAN_CHAIN = _parse_model_chain(
     os.environ.get("DICTATION_OMNIROUTE_CLEAN_CHAIN", ""),
-    ["codex/gpt-5.6-sol-low", "no-think/cc/claude-sonnet-4-6"],
+    ["codex/gpt-5.6-sol-low", "claude/claude-sonnet-4-6"],
 )
 
-# The OpenAI-shape proxy lane gets a chain too. It used to be a single pinned
-# model, so one 500 or an expired credential meant raw unformatted text with
-# nowhere to fall back to.
-OPENAI_RP_CHAIN = _parse_model_chain(
-    os.environ.get("DICTATION_OPENAI_RP_CHAIN", ""),
-    _chain_from(OPENAI_RP_MODEL, "gpt-5.5", "gpt-5.4"),
-)
-OPENAI_CLEAN_CHAIN = _parse_model_chain(
-    os.environ.get("DICTATION_OPENAI_CLEAN_CHAIN", ""),
-    _chain_from(OPENAI_CLEAN_MODEL, "gpt-5.4-mini", "gpt-5.4"),
-)
-
-# User-selectable RP formatter models, per provider. The phone UI and
-# SillyTavern extension expose these as explicit quality lanes; an empty
-# selection keeps the normal fallback chain above. Selected models are
-# allow-listed so a request cannot turn Calliope into an arbitrary model relay.
+# Explicit quality choices exposed to the phone and SillyTavern clients.
 OMNIROUTE_SELECTABLE_MODELS = _parse_model_chain(
     os.environ.get("DICTATION_OMNIROUTE_SELECTABLE_MODELS", ""),
     [
-        "no-think/cc/claude-sonnet-5",
-        "no-think/cc/claude-opus-4-8",
-        "no-think/cc/claude-opus-4-6",
+        "cc/claude-sonnet-5",
+        "claude/claude-opus-4-8",
+        "claude/claude-sonnet-4-6",
         "codex/gpt-5.6-sol-high",
+        "codex/gpt-5.6-luna",
+        # Nous inference is not an OmniRoute provider; Gemini/Kimi ride OpenRouter.
+        "openrouter/google/gemini-3.5-flash",
+        "openrouter/google/gemini-3.6-flash",
+        "openrouter/moonshotai/kimi-k3",
+        "xao/grok-4.6",
     ],
 )
-OPENAI_SELECTABLE_MODELS = _parse_model_chain(
-    os.environ.get("DICTATION_OPENAI_SELECTABLE_MODELS", ""),
-    _chain_from("gpt-5.5", "gpt-5.4", "gpt-5.4-mini"),
-)
 
-_VALID_PROVIDERS = {"claude", "openai", "omniroute"}
-DEFAULT_FORMATTER_PROVIDER = os.environ.get("DICTATION_FORMATTER_PROVIDER", "omniroute").strip().lower()
-if DEFAULT_FORMATTER_PROVIDER not in _VALID_PROVIDERS:
-    DEFAULT_FORMATTER_PROVIDER = "omniroute"
+_VALID_PROVIDERS = {"omniroute"}
+DEFAULT_FORMATTER_PROVIDER = "omniroute"
 DEFAULT_MODEL = "large-v3-turbo"
 TRANSCRIPT_CONTEXT_LIMIT = 3000  # max chars of transcript to include in RP+ prompt
 PERSONAS_DIR = Path(os.environ.get("DICTATION_PERSONAS_DIR", Path.home() / "STWork/personas"))
@@ -286,9 +253,7 @@ WHISPER_PROMPT_TOKEN_CAP = 200  # approx; we truncate by word count
 STATE_FRESH_SECONDS = 60    # < this = fresh, banner shows "Following ST"
 STATE_STALE_SECONDS = 120   # between fresh and this = stale, banner warns
 # > STATE_STALE_SECONDS = dead, server UI reverts to manual
-DISFLUENCY_CLEAN_MODEL = os.environ.get(
-    "DICTATION_CLEANUP_MODEL", "claude-haiku-4-5-20251001"
-)
+DISFLUENCY_CLEAN_MODEL = "codex/gpt-5.6-sol-low"
 DISFLUENCY_CLEAN_TIMEOUT = 3.0  # seconds; falls through to raw on timeout
 DISFLUENCY_CLEAN_MAX_WORDS = 500  # skip cleanup if input exceeds this
 DISFLUENCY_CLEAN_MIN_WORDS = 12  # skip cleanup below this — LLM round-trip

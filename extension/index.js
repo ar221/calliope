@@ -4864,17 +4864,17 @@ function buildSettingsPanel() {
     const reformatGoEl = host.querySelector('#dictation_bridge_reformat_go');
 
     const modelLabels = {
-        'no-think/cc/claude-sonnet-5': 'Sonnet 5',
-        'no-think/cc/claude-opus-4-8': 'Opus 4.8',
-        'no-think/cc/claude-opus-4-6': 'Opus 4.6',
+        'cc/claude-sonnet-5': 'Sonnet 5',
+        'claude/claude-opus-4-8': 'Opus 4.8',
+        'claude/claude-sonnet-4-6': 'Sonnet 4.6',
         'codex/gpt-5.6-sol-high': 'GPT 5.6 High',
-        'gpt-5.5': 'GPT 5.5',
-        'gpt-5.4': 'GPT 5.4',
-        'gpt-5.4-mini': 'GPT 5.4 mini',
+        'codex/gpt-5.6-luna': 'GPT 5.6 Luna',
+        'openrouter/google/gemini-3.5-flash': 'Gemini 3.5 Flash',
+        'openrouter/google/gemini-3.6-flash': 'Gemini 3.6 Flash',
+        'openrouter/moonshotai/kimi-k3': 'Kimi K3',
+        'xao/grok-4.6': 'Grok 4.6',
     };
     const modelLabel = (model) => modelLabels[model] || model;
-    // provider -> [model]; populated from /formatter-models so the per-mode
-    // picker can offer non-OmniRoute lanes too.
     let modelsByProvider = {};
 
     const loadFormatterModels = () => fetch(
@@ -4913,23 +4913,16 @@ function buildSettingsPanel() {
         });
     }
 
-    // ─── Per-mode LLM assignment (POST /modes/formatter) ────────────────────
-    // Option values are "provider|model" because a model only means something
-    // paired with its provider lane.
+    // ─── Per-mode OmniRoute model assignment ───────────────────────────────
     function populateModeModelOptions() {
         if (!modeModelEl) return;
         modeModelEl.innerHTML = '<option value="">Auto fallback chain</option>';
-        for (const [provider, models] of Object.entries(modelsByProvider)) {
-            if (!Array.isArray(models) || !models.length) continue;
-            const group = document.createElement('optgroup');
-            group.label = provider;
-            for (const model of models) {
-                const opt = document.createElement('option');
-                opt.value = `${provider}|${model}`;
-                opt.textContent = modelLabel(model);
-                group.appendChild(opt);
-            }
-            modeModelEl.appendChild(group);
+        const models = modelsByProvider.omniroute || [];
+        for (const model of models) {
+            const opt = document.createElement('option');
+            opt.value = `omniroute|${model}`;
+            opt.textContent = modelLabel(model);
+            modeModelEl.appendChild(opt);
         }
         reflectModeModel();
     }
