@@ -140,10 +140,10 @@ or in Calliope's environment for the proxy side:
 | `KOKORO_PORT` | `9002` | unit | Loopback bind port. |
 | `KOKORO_MODEL` | `…/models/onnx/model_fp16.onnx` | unit | ONNX model path. |
 | `KOKORO_VOICES` | `…/models/voices-v1.0.bin` | unit | Voices file path. |
-| `KOKORO_LANG` | `en-us` | unit | Default language tag. |
+| `KOKORO_LANG` | `en-us` | unit | Language for voices whose ID prefix isn't mapped. Mapped prefixes pick their own: `a` en-us, `b` en-gb, `e` es, `f` fr-fr, `h` hi, `i` it, `j` ja, `p` pt-br, `z` cmn. A language the phonemizer can't load falls back to en-us (logged once). |
 | `KOKORO_SERVER_URL` | `http://127.0.0.1:9002` | calliope | Proxy upstream URL. |
 | `KOKORO_DEFAULT_VOICE` | `af_heart` | calliope | Voice when request omits `voice`. |
-| `KOKORO_IDLE_SHUTDOWN_SECONDS` | `600` | calliope | Idle threshold before stopping the unit. |
+| `KOKORO_IDLE_SHUTDOWN_SECONDS` | `600` | calliope | Idle threshold before stopping the unit. Never fires while a synthesis (including each audiobook segment) is in flight. |
 | `KOKORO_IDLE_SHUTDOWN_DISABLED` | unset | calliope | Set to anything to keep Kokoro warm. |
 | `KOKORO_REQUEST_TIMEOUT` | `10` | calliope | Proxy request timeout. |
 | `TTS_AUDIOBOOK_MAX_MESSAGES` | `50` | calliope | Maximum messages per audiobook export. |

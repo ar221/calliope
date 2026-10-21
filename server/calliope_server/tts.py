@@ -25,16 +25,26 @@ from . import config
 
 log = logging.getLogger("dictation-server")
 
-# TTS — last-tts timestamp drives the Kokoro idle-shutdown daemon.
+# TTS — idle-shutdown state. `_last_tts_ts` (monotonic) is refreshed when
+# Kokoro is claimed or booted and at the start and end of every synthesis
+# call; `_tts_in_flight` counts synthesis calls currently talking to Kokoro.
+# Both are guarded by `_last_tts_lock`. The idle loop never stops Kokoro
+# while a synthesis is in flight or inside the idle window.
 _last_tts_ts: float = 0.0
+_tts_in_flight: int = 0
 _last_tts_lock = threading.Lock()
+# Serialises "is Kokoro up / start it" against the idle loop's "stop it".
+_kokoro_lifecycle_lock = threading.Lock()
 _kokoro_idle_thread: threading.Thread | None = None
 
 # TTS — in-memory voices cache. Refreshed on TTL miss; protects the model
-# server from a stampede of /tts/voices polls from the phone UI.
+# server from a stampede of /tts/voices polls from the phone UI. Only one
+# thread refreshes at a time (`_kokoro_voices_refresh_lock`); while it does,
+# other callers read the stale cache instead of piling onto kokoro-server.
 _kokoro_voices_cache: dict | None = None
 _kokoro_voices_cache_ts: float = 0.0
 _kokoro_voices_lock = threading.Lock()
+_kokoro_voices_refresh_lock = threading.Lock()
 
 
 # ─── TTS — Kokoro proxy helpers ──────────────────────────
@@ -54,28 +64,41 @@ def _kokoro_probe(timeout: float = config.KOKORO_PROBE_TIMEOUT) -> bool:
         return False
 
 
-def _ensure_kokoro_alive(boot_timeout: float = config.KOKORO_BOOT_TIMEOUT) -> bool:
+def _ensure_kokoro_alive(boot_timeout: float = config.KOKORO_BOOT_TIMEOUT, *,
+                         claim: bool = True) -> bool:
     """Probe kokoro-server; if dead, `systemctl --user start kokoro-server`
-    and poll up to `boot_timeout` seconds. Returns True on alive."""
-    if _kokoro_probe(timeout=config.KOKORO_PROBE_TIMEOUT):
-        return True
-    log.info("kokoro-server not responding — attempting `systemctl --user start kokoro-server`")
-    try:
-        subprocess.run(
-            ["systemctl", "--user", "start", "kokoro-server"],
-            check=False, capture_output=True, timeout=10,
-        )
-    except Exception as e:
-        log.warning(f"systemctl start kokoro-server failed: {e}")
-        return False
-    deadline = time.monotonic() + boot_timeout
-    while time.monotonic() < deadline:
+    and poll up to `boot_timeout` seconds. Returns True on alive.
+
+    `claim=True` (synthesis callers) refreshes the idle timer when Kokoro is
+    already up, so the idle loop can't stop it between this check and the
+    synthesis call. A boot always arms the timer, whatever `claim` says, so a
+    unit started for a voice listing or a failed request still gets stopped.
+    Runs under `_kokoro_lifecycle_lock`, which the idle loop holds while it
+    decides and stops.
+    """
+    with _kokoro_lifecycle_lock:
         if _kokoro_probe(timeout=config.KOKORO_PROBE_TIMEOUT):
-            log.info("kokoro-server up")
+            if claim:
+                _mark_tts_activity()
             return True
-        time.sleep(0.25)
-    log.warning("kokoro-server did not become healthy within %.1fs", boot_timeout)
-    return False
+        log.info("kokoro-server not responding — attempting `systemctl --user start kokoro-server`")
+        try:
+            subprocess.run(
+                ["systemctl", "--user", "start", "kokoro-server"],
+                check=False, capture_output=True, timeout=10,
+            )
+        except Exception as e:
+            log.warning(f"systemctl start kokoro-server failed: {e}")
+            return False
+        _mark_tts_activity()
+        deadline = time.monotonic() + boot_timeout
+        while time.monotonic() < deadline:
+            if _kokoro_probe(timeout=config.KOKORO_PROBE_TIMEOUT):
+                log.info("kokoro-server up")
+                return True
+            time.sleep(0.25)
+        log.warning("kokoro-server did not become healthy within %.1fs", boot_timeout)
+        return False
 
 
 def _mark_tts_activity() -> None:
@@ -85,33 +108,38 @@ def _mark_tts_activity() -> None:
         _last_tts_ts = time.monotonic()
 
 
-def _kokoro_idle_shutdown_loop() -> None:
-    """Background daemon: stop kokoro-server after N seconds of TTS inactivity.
+def _begin_tts_synthesis() -> None:
+    """Count a synthesis call as in flight and refresh the idle timer."""
+    global _last_tts_ts, _tts_in_flight
+    with _last_tts_lock:
+        _tts_in_flight += 1
+        _last_tts_ts = time.monotonic()
 
-    Mirrors `_idle_shutdown_loop` but for the Kokoro process. Disabled
-    entirely when config.KOKORO_IDLE_SHUTDOWN_DISABLED is set.
-    """
+
+def _end_tts_synthesis() -> None:
+    """Release an in-flight slot; the idle window restarts from now."""
+    global _last_tts_ts, _tts_in_flight
+    with _last_tts_lock:
+        _tts_in_flight = max(0, _tts_in_flight - 1)
+        _last_tts_ts = time.monotonic()
+
+
+def _kokoro_idle_tick() -> bool:
+    """One idle-loop decision. Returns True when kokoro-server was stopped."""
     global _last_tts_ts
-    if config.KOKORO_IDLE_SHUTDOWN_DISABLED:
-        log.info("Kokoro idle-shutdown disabled by env (config.KOKORO_IDLE_SHUTDOWN_DISABLED)")
-        return
-    log.info(
-        "Kokoro idle-shutdown thread started; will stop kokoro-server after %ds idle",
-        config.KOKORO_IDLE_SHUTDOWN_SECONDS,
-    )
-    while True:
-        time.sleep(config.IDLE_SHUTDOWN_CHECK_INTERVAL)
+    with _kokoro_lifecycle_lock:
         with _last_tts_lock:
             last = _last_tts_ts
-        if last <= 0:
-            continue
+            in_flight = _tts_in_flight
+        if in_flight > 0 or last <= 0:
+            return False
         idle_for = time.monotonic() - last
         if idle_for < config.KOKORO_IDLE_SHUTDOWN_SECONDS:
-            continue
+            return False
         if not _kokoro_probe(timeout=config.KOKORO_PROBE_TIMEOUT):
             with _last_tts_lock:
                 _last_tts_ts = 0.0
-            continue
+            return False
         log.info("kokoro-server idle for %.0fs — stopping to release memory", idle_for)
         try:
             subprocess.run(
@@ -122,6 +150,25 @@ def _kokoro_idle_shutdown_loop() -> None:
             log.warning(f"systemctl stop kokoro-server failed: {e}")
         with _last_tts_lock:
             _last_tts_ts = 0.0
+        return True
+
+
+def _kokoro_idle_shutdown_loop() -> None:
+    """Background daemon: stop kokoro-server after N seconds of TTS inactivity.
+
+    Mirrors `_idle_shutdown_loop` but for the Kokoro process. Disabled
+    entirely when config.KOKORO_IDLE_SHUTDOWN_DISABLED is set.
+    """
+    if config.KOKORO_IDLE_SHUTDOWN_DISABLED:
+        log.info("Kokoro idle-shutdown disabled by env (config.KOKORO_IDLE_SHUTDOWN_DISABLED)")
+        return
+    log.info(
+        "Kokoro idle-shutdown thread started; will stop kokoro-server after %ds idle",
+        config.KOKORO_IDLE_SHUTDOWN_SECONDS,
+    )
+    while True:
+        time.sleep(config.IDLE_SHUTDOWN_CHECK_INTERVAL)
+        _kokoro_idle_tick()
 
 
 def _start_kokoro_idle_shutdown_thread() -> None:
@@ -189,6 +236,9 @@ def _synthesize_via_kokoro(text: str, voice: str, speed: float = 1.0) -> tuple[b
 
     Raises RuntimeError on transport / HTTP error so the handler can map
     to a 502/503. Caller is responsible for liveness probe (`_ensure_kokoro_alive`).
+    The call counts as in flight for the idle loop, and refreshes the idle
+    timer at start and end, so a long audiobook (one call per segment) keeps
+    Kokoro alive for its whole render.
     """
     body = json.dumps({
         "text": text,
@@ -202,6 +252,7 @@ def _synthesize_via_kokoro(text: str, voice: str, speed: float = 1.0) -> tuple[b
     )
     req.add_header("Content-Type", "application/json")
     req.add_header("Content-Length", str(len(body)))
+    _begin_tts_synthesis()
     try:
         with urllib.request.urlopen(req, timeout=config.KOKORO_REQUEST_TIMEOUT) as resp:
             audio = resp.read()
@@ -214,6 +265,8 @@ def _synthesize_via_kokoro(text: str, voice: str, speed: float = 1.0) -> tuple[b
         raise RuntimeError(f"kokoro-server HTTP {e.code}: {err_body}")
     except Exception as e:
         raise RuntimeError(f"kokoro-server request failed: {e}")
+    finally:
+        _end_tts_synthesis()
     return audio, ctype
 
 
@@ -337,35 +390,86 @@ def _fetch_kokoro_voices(force: bool = False) -> dict:
 
     Shape mirrors kokoro-server's /voices: {"voices": [{id, label}, ...]}.
     Raises RuntimeError on transport failure when no cached value exists.
+    The refresh uses the short probe timeout and is single-flight: while one
+    thread refreshes, callers that hold a stale cache get it immediately and
+    cold callers wait for that refresh rather than starting their own.
     """
     global _kokoro_voices_cache, _kokoro_voices_cache_ts
-    now = time.monotonic()
     with _kokoro_voices_lock:
         cached = _kokoro_voices_cache
         ts = _kokoro_voices_cache_ts
-    if not force and cached is not None and (now - ts) < config.KOKORO_VOICES_TTL_SECONDS:
+    if not force and cached is not None and (time.monotonic() - ts) < config.KOKORO_VOICES_TTL_SECONDS:
         return cached
+    if not _kokoro_voices_refresh_lock.acquire(blocking=cached is None):
+        return cached  # another thread is refreshing; serve stale meanwhile
     try:
-        req = urllib.request.Request(config.KOKORO_SERVER_URL + "/voices", method="GET")
-        with urllib.request.urlopen(req, timeout=config.KOKORO_REQUEST_TIMEOUT) as resp:
-            raw = resp.read()
-        data = json.loads(raw)
-    except urllib.error.HTTPError as e:
-        if cached is not None:
-            return cached  # serve stale on upstream error
-        raise RuntimeError(f"kokoro-server /voices HTTP {e.code}")
-    except Exception as e:
-        if cached is not None:
-            return cached
-        raise RuntimeError(f"kokoro-server /voices failed: {e}")
-    if not isinstance(data, dict) or not isinstance(data.get("voices"), list):
-        if cached is not None:
-            return cached
-        raise RuntimeError("kokoro-server /voices: malformed response")
+        if cached is None:
+            with _kokoro_voices_lock:
+                if _kokoro_voices_cache is not None and not force:
+                    return _kokoro_voices_cache  # filled while we waited
+        try:
+            req = urllib.request.Request(config.KOKORO_SERVER_URL + "/voices", method="GET")
+            with urllib.request.urlopen(req, timeout=config.KOKORO_PROBE_TIMEOUT) as resp:
+                raw = resp.read()
+            data = json.loads(raw)
+        except urllib.error.HTTPError as e:
+            if cached is not None:
+                return cached  # serve stale on upstream error
+            raise RuntimeError(f"kokoro-server /voices HTTP {e.code}")
+        except Exception as e:
+            if cached is not None:
+                return cached
+            raise RuntimeError(f"kokoro-server /voices failed: {e}")
+        if not isinstance(data, dict) or not isinstance(data.get("voices"), list):
+            if cached is not None:
+                return cached
+            raise RuntimeError("kokoro-server /voices: malformed response")
+        with _kokoro_voices_lock:
+            _kokoro_voices_cache = data
+            _kokoro_voices_cache_ts = time.monotonic()
+        return data
+    finally:
+        _kokoro_voices_refresh_lock.release()
+
+
+def _list_kokoro_voices() -> dict | None:
+    """Voices payload for GET /tts/voices without booting Kokoro needlessly.
+
+    Any cached list (fresh or stale) is served through `_fetch_kokoro_voices`,
+    which refreshes it when Kokoro answers and falls back to the cache when it
+    doesn't — a voice listing never starts the unit once a list is known.
+    Only a cold cache boots Kokoro (`claim=False`: listing voices is not TTS
+    use, though a boot still arms the idle timer). Returns None when Kokoro is
+    unreachable and nothing is cached; raises RuntimeError on upstream failure.
+    """
     with _kokoro_voices_lock:
-        _kokoro_voices_cache = data
-        _kokoro_voices_cache_ts = now
-    return data
+        have_cache = _kokoro_voices_cache is not None
+    if not have_cache and not _ensure_kokoro_alive(claim=False):
+        return None
+    return _fetch_kokoro_voices()
+
+
+def validate_voices(ids) -> list[str]:
+    """Return the voice IDs in `ids` that kokoro-server doesn't know, sorted.
+
+    Lets /tts/audiobook reject a stale voiceMap before synthesizing the first
+    segment. An unavailable or empty voice list returns [] (kokoro-server
+    itself skips voice validation when it couldn't enumerate voices), so
+    synthesis surfaces the real upstream error instead of a false
+    "unknown voice".
+    """
+    try:
+        payload = _fetch_kokoro_voices()
+    except RuntimeError as e:
+        log.warning("voice validation skipped: %s", e)
+        return []
+    known = {
+        str(v.get("id") if isinstance(v, dict) else v)
+        for v in payload.get("voices", [])
+    }
+    if not known:
+        return []
+    return sorted({str(i) for i in ids if str(i) not in known})
 
 
 def _invalidate_kokoro_voices_cache() -> None:

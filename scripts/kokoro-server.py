@@ -23,7 +23,9 @@ Env
 - KOKORO_PORT    (default 9002)
 - KOKORO_MODEL   (default ~/.local/share/calliope-tts/models/onnx/model_fp16.onnx)
 - KOKORO_VOICES  (default ~/.local/share/calliope-tts/models/voices-v1.0.bin)
-- KOKORO_LANG    (default en-us)
+- KOKORO_LANG    (default en-us) — language for voices whose ID prefix isn't
+                  in `_VOICE_PREFIX_LANG`; mapped prefixes (b→en-gb, f→fr-fr, …)
+                  always use their own language
 
 Service unit: ../systemd/kokoro-server.service
 """
@@ -48,7 +50,51 @@ log = logging.getLogger("kokoro-server")
 
 HOST = os.environ.get("KOKORO_HOST", "127.0.0.1")
 PORT = int(os.environ.get("KOKORO_PORT", "9002"))
-LANG = os.environ.get("KOKORO_LANG", "en-us")
+DEFAULT_LANG = os.environ.get("KOKORO_LANG", "en-us")
+
+# Kokoro voice IDs are `<lang><gender>_<name>` (e.g. `bf_emma`); the first
+# letter picks the espeak-ng language used for G2P.
+_VOICE_PREFIX_LANG = {
+    "a": "en-us",
+    "b": "en-gb",
+    "e": "es",
+    "f": "fr-fr",
+    "h": "hi",
+    "i": "it",
+    "j": "ja",
+    "p": "pt-br",
+    "z": "cmn",
+}
+FALLBACK_LANG = "en-us"
+# lang -> whether the phonemizer accepted it, probed once per language.
+# Guarded by _kokoro_lock (only touched during synthesis).
+_lang_support: dict[str, bool] = {}
+
+
+def _lang_for_voice(voice: str) -> str:
+    """espeak-ng language for a Kokoro voice ID, by its one-letter prefix."""
+    prefix = voice[:1].lower() if len(voice) > 2 and voice[2:3] == "_" else ""
+    return _VOICE_PREFIX_LANG.get(prefix, DEFAULT_LANG)
+
+
+def _parse_speed(raw) -> float:
+    """`speed` from a /synthesize body. Absent/null means 1.0; 0 is not absent.
+
+    Raises ValueError for non-numbers and anything outside 0.5–2.0 (which
+    includes every non-positive speed).
+    """
+    if raw is None:
+        return 1.0
+    try:
+        speed = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError("'speed' must be a number")
+    # Kokoro accepts a wide range; clamp to a sane band to avoid
+    # pathological prosody.
+    if not (0.5 <= speed <= 2.0):
+        raise ValueError("'speed' must be between 0.5 and 2.0")
+    return speed
+
 
 _HOME = Path(os.path.expanduser("~"))
 DEFAULT_MODEL = _HOME / ".local/share/calliope-tts/models/onnx/model_fp16.onnx"
@@ -191,9 +237,32 @@ def _split_for_synth(text: str, max_chars: int = 100) -> list[str]:
     return chunks
 
 
+def _effective_lang(k, voice: str) -> str:
+    """Language to synthesize `voice` with. Each mapped language is checked
+    once against the phonemizer; one it can't handle (missing espeak-ng data
+    or G2P extras) falls back to FALLBACK_LANG, logged once. Caller holds
+    _kokoro_lock."""
+    lang = _lang_for_voice(voice)
+    if lang == FALLBACK_LANG:
+        return lang
+    supported = _lang_support.get(lang)
+    if supported is None:
+        tokenizer = getattr(k, "tokenizer", None)
+        try:
+            if tokenizer is not None:
+                tokenizer.phonemize("a", lang)
+            supported = True
+        except Exception as e:
+            supported = False
+            log.warning("language %r unavailable for G2P (%s); voices using it fall back to %s",
+                        lang, e, FALLBACK_LANG)
+        _lang_support[lang] = supported
+    return lang if supported else FALLBACK_LANG
+
+
 def _synth_one(k, chunk: str, voice: str, speed: float):
     """One model call -> mono float32 array (may be size 0). Caller holds _kokoro_lock."""
-    audio, sr = k.create(chunk, voice=voice, speed=speed, lang=LANG)
+    audio, sr = k.create(chunk, voice=voice, speed=speed, lang=_effective_lang(k, voice))
     arr = np.asarray(audio, dtype=np.float32)
     if arr.ndim > 1:
         arr = np.squeeze(arr)
@@ -335,15 +404,9 @@ class KokoroHandler(BaseHTTPRequestHandler):
             return
         voice = str(body.get("voice") or "af_heart").strip()
         try:
-            speed = float(body.get("speed") or 1.0)
-        except (TypeError, ValueError):
-            self._err("'speed' must be a number", status=400, code="bad_input")
-            return
-        # Kokoro accepts a wide range; clamp to a sane band to avoid
-        # pathological prosody.
-        if not (0.5 <= speed <= 2.0):
-            self._err("'speed' must be between 0.5 and 2.0",
-                      status=400, code="bad_input")
+            speed = _parse_speed(body.get("speed"))
+        except ValueError as e:
+            self._err(str(e), status=400, code="bad_input")
             return
         # Validate voice (after we know the catalog is loaded).
         try:
