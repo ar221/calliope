@@ -311,11 +311,6 @@ def selectable_models(provider: str) -> list[str]:
     return list(config.OMNIROUTE_SELECTABLE_MODELS)
 
 
-def formatter_model(provider: str, *, cleanup: bool = False) -> str:
-    chain = provider_chain(provider, cleanup=cleanup)
-    return chain[0] if chain else ""
-
-
 def formatter_model_chain(provider: str, *, cleanup: bool = False,
                           model_override: str = "") -> list[str]:
     """Ordered fallback chain, or one allow-listed explicitly-pinned model.

@@ -55,8 +55,8 @@ jobs:
       - uses: astral-sh/setup-uv@v3
       - name: Install ruff
         run: uv tool install ruff
-      - name: Lint calliope-server
-        run: ruff check server/calliope-server server/calliope_server
+      - name: Lint
+        run: ruff check .
 
   test-unit:
     runs-on: ubuntu-latest

@@ -133,7 +133,6 @@ from calliope_server.config import (  # noqa: E402
     _safe_child,  # noqa: F401 — moved to config (neutral home); re-export for tests/back-compat
     OMNIROUTE_RP_CHAIN,
     OMNIROUTE_CLEAN_CHAIN,  # noqa: F401 — re-export for tests/back-compat
-    OMNIROUTE_SELECTABLE_MODELS,
     _VALID_PROVIDERS,
     DEFAULT_FORMATTER_PROVIDER,
     DEFAULT_MODEL,
@@ -301,7 +300,6 @@ from calliope_server.formatter import (  # noqa: E402
     formatter_base_url,  # noqa: F401 — re-export for tests/back-compat
     formatter_health_url,  # noqa: F401 — re-export for tests/back-compat
     formatter_request_url,  # noqa: F401 — re-export for tests/back-compat
-    formatter_model,  # noqa: F401 — re-export for tests/back-compat
     formatter_model_chain,  # noqa: F401 — re-export for tests/back-compat
     formatter_payload,  # noqa: F401 — re-export for tests/back-compat
     formatter_response_text,  # noqa: F401 — re-export for tests/back-compat
