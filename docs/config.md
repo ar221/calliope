@@ -28,7 +28,8 @@ Current server flags:
 ### Bind/CORS
 
 - `DICTATION_BIND_HOST` — bind address. Use `0.0.0.0` only when phone/LAN access is required and CORS/token auth are configured.
-- `DICTATION_CORS_ORIGINS` — comma-separated allowed browser origins. Keep HTTP limited to localhost; use HTTPS for LAN/Tailscale.
+- `DICTATION_CORS_ORIGINS` — comma-separated allowed browser origins. Keep HTTP limited to localhost; use HTTPS for LAN/Tailscale. The allowlist also gates the loopback auth bypass: a request from `127.0.0.1` that carries a browser `Origin` outside this list (any other site open in your desktop browser) must present the bearer like a remote client. Local tools without an `Origin` (curl, the wizard) are still trusted on loopback. JSON endpoints require `Content-Type: application/json`.
+- `DICTATION_CONNECTION_TIMEOUT` — per-connection socket timeout in seconds (default `60`). Bounds the TLS handshake, request parsing and each body/response chunk so a stalled client cannot pin a worker thread.
 
 ### Formatter routing
 
