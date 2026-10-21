@@ -160,7 +160,10 @@ def _transcribe_whisper_server(audio_path: Path, *, prompt: str = "",
     caller can decide whether to fall back to subprocess.
     """
     fields: dict[str, str] = {
-        "response_format": "json",
+        # `json` returns {"text"} only. Per-word probabilities (the source of
+        # the low-confidence overlay and /word-alternatives) are emitted
+        # solely under `verbose_json`: segments[].words[] = {word, probability}.
+        "response_format": "verbose_json",
         "temperature": "0.0",
     }
     if prompt:
