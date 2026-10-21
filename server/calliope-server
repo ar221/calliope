@@ -2419,6 +2419,12 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                     existing["timestamp"] = datetime.now().isoformat()
                     # starred is preserved implicitly (dict mutation)
                     result_entry_id = existing.get("id")
+                elif entry_id is not None:
+                    # The requested entry was deleted while the formatter ran.
+                    # Persist nothing: popping "the newest user entry" here
+                    # would delete an unrelated message. The caller still gets
+                    # the formatted text in the response.
+                    log.info("reformat: entry %s vanished during formatting; not persisted", entry_id)
                 else:
                     # Legacy regeneration without an entry id replaces the most
                     # recent user entry only after formatting succeeds. The old

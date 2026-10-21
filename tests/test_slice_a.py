@@ -191,6 +191,47 @@ def test_failed_legacy_regen_does_not_delete_transcript_entry(tmp_path, monkeypa
     assert mod.session_transcript == original
 
 
+def test_reformat_target_deleted_during_formatting_does_not_pop_another_entry(tmp_path, monkeypatch):
+    """The lock is released for the LLM call. If the requested entry is
+    deleted meanwhile, the result must not be written over — or in place of —
+    an unrelated entry (the old code reused a stale index, then fell through
+    to 'pop the newest user entry')."""
+    mod = _load_server(tmp_path, monkeypatch)
+    sent = {}
+
+    class DummyHandler:
+        def read_json_body(self):
+            return {"text": "second", "mode": "rp_enhance", "entry_id": "b"}
+
+        def send_json(self, data, status=200):
+            sent.update(status=status, data=data)
+
+        def send_error_json(self, message, **kwargs):
+            raise AssertionError((message, kwargs))
+
+        def _build_chat_context(self, chat_source):
+            return ""
+
+    def pipeline_that_deletes_target(*args, **kwargs):
+        with mod.transcript_lock:
+            mod.session_transcript[:] = [e for e in mod.session_transcript if e["id"] != "b"]
+        return ("*Second, polished.*", False, "", "")
+
+    monkeypatch.setattr(mod, "run_pipeline", pipeline_that_deletes_target)
+    mod.session_transcript[:] = [
+        {"id": "a", "role": "user", "text": "first", "starred": True, "chat_id": ""},
+        {"id": "b", "role": "user", "text": "second", "starred": False, "chat_id": ""},
+        {"id": "c", "role": "user", "text": "third", "starred": False, "chat_id": ""},
+    ]
+    mod.DictationHandler._handle_reformat(DummyHandler(), {})
+
+    assert sent["status"] == 200
+    assert sent["data"]["text"] == "*Second, polished.*"
+    remaining = [(e["id"], e["text"]) for e in mod.session_transcript]
+    assert remaining == [("a", "first"), ("c", "third")]
+    assert sent["data"]["entry_id"] is None
+
+
 def test_reformat_into_a_mode_without_a_formatter_step_reports_skipped(tmp_path, monkeypatch):
     """'plain' has no LLM rewrite step, so a reformat into it must not claim success.
 
