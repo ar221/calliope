@@ -34,8 +34,39 @@ class RPEvalResult:
     metrics: dict = field(default_factory=dict)
 
 
+# Han/kana are written without spaces, so each character counts as a word;
+# every other script counts whitespace/punctuation-delimited letter runs.
+_CJK = "\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+_WORD_RE = re.compile(rf"[{_CJK}]|[^\W{_CJK}]+(?:'[^\W{_CJK}]+)*")
+_FIRST_PERSON_RE = re.compile(r"\b(?:i|me|my|mine|myself)\b", re.IGNORECASE)
+_THIRD_PERSON_RE = re.compile(r"\b(?:he|she|they|him|her|them|his|their)\b", re.IGNORECASE)
+_DIALOGUE_RE = re.compile(r'"[^"]*"|“[^”]*”')
+
+
 def _words(text: str) -> list[str]:
-    return re.findall(r"[A-Za-z0-9']+", text.lower())
+    return _WORD_RE.findall(text.lower())
+
+
+def _is_mixed_pov(case: "RPEvalCase") -> bool:
+    """First-person dictation narrated (partly) in third person.
+
+    Third-person pronouns for OTHER characters are normal first-person
+    prose ("I watch as she laughs"). The speaker drifts out of first person
+    when the narration names them as a subject, or when first-person input
+    comes back with no first-person narration at all. Quoted dialogue is
+    ignored either way.
+    """
+    narration = _DIALOGUE_RE.sub(" ", case.output)
+    speaker = case.speaker.strip()
+    if speaker and speaker != "persona" and re.search(
+        rf"\b{re.escape(speaker)}\s+(?:is|was|has|\w+(?:s|ed))\b", narration, re.IGNORECASE,
+    ):
+        return True
+    return bool(
+        _FIRST_PERSON_RE.search(_DIALOGUE_RE.sub(" ", case.raw))
+        and not _FIRST_PERSON_RE.search(narration)
+        and _THIRD_PERSON_RE.search(narration)
+    )
 
 
 def _contains(text: str, needle: str) -> bool:
@@ -57,7 +88,7 @@ def score_case(case: RPEvalCase) -> RPEvalResult:
     if case.addressee and re.search(rf"\b{re.escape(case.addressee)}\s*[:：]", case.output, re.I):
         flags.append("other_character_dialogue")
 
-    if case.pov == "first_person" and re.search(r"\b(he|she|they)\b.*\b(I|me|my)\b", case.output, re.I):
+    if case.pov == "first_person" and _is_mixed_pov(case):
         flags.append("mixed_pov")
 
     expansion_ratio = len(out_words) / max(1, len(raw_words))

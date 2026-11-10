@@ -12,22 +12,14 @@ in-pipeline dispatcher only.
 """
 from __future__ import annotations
 
-import importlib.util
-import pathlib
-from importlib.machinery import SourceFileLoader
-
 import pytest
 
-SRC = pathlib.Path(__file__).resolve().parents[1] / "server" / "calliope-server"
+from conftest import load_wrapper
 
 
 @pytest.fixture(scope="module")
 def mod():
-    loader = SourceFileLoader("calliope_server", str(SRC))
-    spec = importlib.util.spec_from_loader("calliope_server", loader)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_wrapper("calliope_dispatch")
 
 
 # ─── Pure-command intents: residual must be empty ────────────────────

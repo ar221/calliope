@@ -10,26 +10,18 @@ Covers:
 from __future__ import annotations
 
 import base64
-import importlib.util
 import json
 import pathlib
 import time
-from importlib.machinery import SourceFileLoader
 
 import pytest
 
-SRC = pathlib.Path(__file__).resolve().parents[1] / "server" / "calliope-server"
+from conftest import load_wrapper
 
 
 @pytest.fixture(scope="module")
 def mod():
-    loader = SourceFileLoader("calliope_server", str(SRC))
-    spec = importlib.util.spec_from_loader("calliope_server", loader)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_wrapper("calliope_group")
 
 
 def write_synthetic_character_card(
@@ -243,7 +235,7 @@ def test_build_character_context_handles_group_id(mod, group_fixture):
 
 def test_discover_group_characters(mod, group_fixture):
     chars = mod.discover_group_characters(group_fixture["group_id"])
-    assert [c["id"] for c in chars] == group_fixture["members"]
+    assert [c["id"] for c in chars] == [f"{m}.png" for m in group_fixture["members"]]
     assert [c["name"] for c in chars] == group_fixture["members"]
 
 

@@ -12,13 +12,9 @@ serves scripted per-model responses.
 """
 from __future__ import annotations
 
-import importlib.util
 import json
-import pathlib
-import uuid
-from importlib.machinery import SourceFileLoader
 
-SRC = pathlib.Path(__file__).resolve().parents[1] / "server" / "calliope-server"
+from conftest import load_wrapper
 
 
 def _load_server(tmp_path, monkeypatch):
@@ -32,13 +28,7 @@ def _load_server(tmp_path, monkeypatch):
         "DICTATION_OMNIROUTE_CLEAN_CHAIN",
         "codex/gpt-5.6-sol-low, claude/claude-sonnet-4-6",
     )
-    name = f"calliope_server_omni_{uuid.uuid4().hex}"
-    loader = SourceFileLoader(name, str(SRC))
-    spec = importlib.util.spec_from_loader(name, loader)
-    assert spec is not None
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
+    return load_wrapper("calliope_server_omni")
 
 
 class _FakeResp:
@@ -115,7 +105,7 @@ def test_missing_omniroute_key_fails_closed_before_network(tmp_path, monkeypatch
     out, skipped, reason = mod.format_rp("raw text here")
     assert out == "raw text here"
     assert skipped is True
-    assert "not reachable" in reason
+    assert "OMNIROUTE_API_KEY is required" in reason
 
 
 def test_omniroute_model_chain(tmp_path, monkeypatch):
@@ -214,9 +204,11 @@ def test_hard_error_stops_chain(tmp_path, monkeypatch):
         monkeypatch,
         mod,
         {
-            # A non-skippable error (e.g. a 500-style bad-request) should abort
-            # rather than burn the rest of the chain.
-            "codex/gpt-5.6-sol-high": _err_body("internal formatting explosion"),
+            # A validation error (HTTP 400) would fail identically on every
+            # tier, so it aborts rather than burning the rest of the chain.
+            "codex/gpt-5.6-sol-high": json.dumps({"error": {
+                "message": "bad request", "type": "invalid_request_error", "code": 400,
+            }}).encode(),
             "cc/claude-sonnet-5": _ok_body("should not reach here"),
         },
         calls,
@@ -274,18 +266,6 @@ def test_timeout_on_first_tier_falls_through_instead_of_returning_raw(tmp_path, 
     assert skipped is False, reason
     assert out == "sonnet rescued the regenerate"
     assert calls == ["codex/gpt-5.6-sol-high", "cc/claude-sonnet-5"]
-
-
-def test_timeout_markers_are_chain_skippable(tmp_path, monkeypatch):
-    mod = _load_server(tmp_path, monkeypatch)
-    for message in (
-        "timed out",
-        "The read operation timed out",
-        "<urlopen error timed out>",
-        "HTTP Error 504: Gateway Timeout",
-    ):
-        assert mod._is_chain_skippable_error(message) is True, message
-    assert mod._is_chain_skippable_error("internal formatting explosion") is False
 
 
 def test_chain_budget_stops_retrying_once_exhausted(tmp_path, monkeypatch):
@@ -349,13 +329,11 @@ def _formatter_module(mod):
     return sys.modules[mod.format_rp.__module__]
 
 
-def _stub_health_only(monkeypatch, mod):
-    """Serve the health probe; make any real POST an explicit failure."""
+def _stub_no_network(monkeypatch, mod):
+    """Make any real request an explicit failure."""
 
     def fake_urlopen(req, timeout=None):
-        if (getattr(req, "method", "GET") or "GET") == "GET":
-            return _FakeResp(b"{}")
-        raise AssertionError("test leaked a real formatter POST")
+        raise AssertionError("test leaked a real formatter request")
 
     monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
 
@@ -369,15 +347,15 @@ def test_streaming_timeout_after_partial_tokens_is_not_reported_as_success(tmp_p
     """
     mod = _load_server(tmp_path, monkeypatch)
     fmt = _formatter_module(mod)
-    _stub_health_only(monkeypatch, mod)
+    _stub_no_network(monkeypatch, mod)
     emitted: list[dict] = []
     monkeypatch.setattr(
         fmt.events, "broadcast_event", lambda name, data: emitted.append({name: data})
     )
     monkeypatch.setattr(
         fmt, "_stream_formatter",
-        lambda url, payload, on_delta, timeout=None, deadline=None: (
-            "half a rewri", "timed out"
+        lambda payload, on_delta, timeout=None, deadline=None: (
+            "half a rewri", fmt._UpstreamFailure("timed out", kind="timeout", advance=True)
         ),
     )
 
@@ -396,16 +374,16 @@ def test_streaming_timeout_after_partial_tokens_is_not_reported_as_success(tmp_p
 def test_streaming_timeout_with_no_tokens_falls_through_to_next_tier(tmp_path, monkeypatch):
     mod = _load_server(tmp_path, monkeypatch)
     fmt = _formatter_module(mod)
-    _stub_health_only(monkeypatch, mod)
+    _stub_no_network(monkeypatch, mod)
     monkeypatch.setattr(fmt.events, "broadcast_event", lambda name, data: None)
     seen: list[str] = []
 
-    def fake_stream(url, payload, on_delta, timeout=None, deadline=None):
+    def fake_stream(payload, on_delta, timeout=None, deadline=None):
         model = json.loads(payload.decode()).get("model", "")
         seen.append(model)
         if model == "codex/gpt-5.6-sol-high":
-            return "", "timed out"
-        return "streamed sonnet output", ""
+            return "", fmt._UpstreamFailure("timed out", kind="timeout", advance=True)
+        return "streamed sonnet output", None
 
     monkeypatch.setattr(fmt, "_stream_formatter", fake_stream)
 
@@ -417,128 +395,6 @@ def test_streaming_timeout_with_no_tokens_falls_through_to_next_tier(tmp_path, m
     assert seen == ["codex/gpt-5.6-sol-high", "cc/claude-sonnet-5"]
 
 
-def test_probe_tolerates_cold_health_endpoint_latency(tmp_path, monkeypatch):
-    """A 3s cold /v1/models must not be reported as an offline proxy.
-
-    Regression: format_rp probed with a hard-coded timeout=2 while OmniRoute's
-    catalog endpoint takes >3s cold, so the first regenerate after an idle
-    period returned raw text without trying a single model.
-    """
-    mod = _load_server(tmp_path, monkeypatch)
-    fmt = _formatter_module(mod)
-    fmt.reset_probe_cache()
-    assert mod.config.FORMATTER_PROBE_TIMEOUT_SECONDS >= 3.0
-
-    probes: list[float] = []
-
-    def fake_urlopen(req, timeout=None):
-        if (getattr(req, "method", "GET") or "GET") == "GET":
-            probes.append(timeout)
-            if timeout < 3.0:                      # emulate the cold catalog build
-                raise TimeoutError("timed out")
-            return _FakeResp(b'{"data":[]}')
-        return _FakeResp(_ok_body("formatted output"))
-
-    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
-
-    out, skipped, reason = mod.format_rp("raw text here")
-    assert skipped is False, reason
-    assert out == "formatted output"
-    assert probes and probes[0] >= 3.0, f"probe used too short a timeout: {probes}"
-
-
-def test_probe_result_is_cached_across_calls(tmp_path, monkeypatch):
-    """One dictation must not pay for a fresh catalog probe per formatter step."""
-    mod = _load_server(tmp_path, monkeypatch)
-    fmt = _formatter_module(mod)
-    fmt.reset_probe_cache()
-    monkeypatch.setattr(mod.config, "FORMATTER_PROBE_TTL_SECONDS", 30.0)
-    probes = {"n": 0}
-
-    def fake_urlopen(req, timeout=None):
-        if (getattr(req, "method", "GET") or "GET") == "GET":
-            probes["n"] += 1
-            return _FakeResp(b'{"data":[]}')
-        return _FakeResp(_ok_body("formatted output"))
-
-    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
-
-    for _ in range(3):
-        assert mod.format_rp("raw text here")[1] is False
-    assert probes["n"] == 1, f"expected one cached probe, got {probes['n']}"
-
-
-def test_probe_failure_is_retried_quickly(tmp_path, monkeypatch):
-    """A failed probe must not be cached for the full success TTL."""
-    mod = _load_server(tmp_path, monkeypatch)
-    fmt = _formatter_module(mod)
-    fmt.reset_probe_cache()
-    assert (
-        mod.config.FORMATTER_PROBE_FAIL_TTL_SECONDS
-        < mod.config.FORMATTER_PROBE_TTL_SECONDS
-    )
-
-    clock = {"t": 0.0}
-    monkeypatch.setattr(fmt.time, "monotonic", lambda: clock["t"])
-    state = {"up": False}
-
-    def fake_urlopen(req, timeout=None):
-        if (getattr(req, "method", "GET") or "GET") == "GET":
-            if not state["up"]:
-                raise ConnectionRefusedError("connection refused")
-            return _FakeResp(b'{"data":[]}')
-        return _FakeResp(_ok_body("formatted output"))
-
-    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
-
-    assert mod.format_rp("raw text here")[1] is True
-    state["up"] = True
-    clock["t"] += mod.config.FORMATTER_PROBE_FAIL_TTL_SECONDS + 0.1
-    assert mod.format_rp("raw text here")[1] is False
-
-
-def test_failed_probe_verdict_is_cached_even_though_the_probe_burns_its_timeout(
-    tmp_path, monkeypatch
-):
-    """A failing probe must not be re-run on every request.
-
-    Regression: expiry was computed from the time the probe STARTED. Since a
-    failing probe burns its full timeout (6s) and the failure TTL is shorter
-    (3s), the stored verdict was already expired, so a down proxy made every
-    single request pay another full probe.
-    """
-    mod = _load_server(tmp_path, monkeypatch)
-    fmt = _formatter_module(mod)
-    fmt.reset_probe_cache()
-
-    clock = {"t": 1000.0}
-    monkeypatch.setattr(fmt.time, "monotonic", lambda: clock["t"])
-    monkeypatch.setattr(mod.config, "FORMATTER_PROBE_TIMEOUT_SECONDS", 6.0)
-    monkeypatch.setattr(mod.config, "FORMATTER_PROBE_FAIL_TTL_SECONDS", 3.0)
-    probes = {"n": 0}
-
-    def fake_urlopen(req, timeout=None):
-        if (getattr(req, "method", "GET") or "GET") == "GET":
-            probes["n"] += 1
-            clock["t"] += timeout      # a timing-out probe consumes its budget
-            raise TimeoutError("timed out")
-        raise AssertionError("proxy is down; no formatter POST expected")
-
-    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
-
-    assert mod.format_rp("raw text here")[1] is True
-    assert probes["n"] == 1
-
-    # Immediately afterwards the cached failure must still be honoured.
-    assert mod.format_rp("raw text here")[1] is True
-    assert probes["n"] == 1, "failed verdict expired on arrival — cache is useless"
-
-    # Once the failure TTL really elapses, probing resumes.
-    clock["t"] += 3.1
-    assert mod.format_rp("raw text here")[1] is True
-    assert probes["n"] == 2
-
-
 def test_stream_deadline_stops_consuming_a_trickling_stream(tmp_path, monkeypatch):
     """A stream that stays alive but never finishes must not be consumed forever.
 
@@ -547,7 +403,7 @@ def test_stream_deadline_stops_consuming_a_trickling_stream(tmp_path, monkeypatc
     """
     mod = _load_server(tmp_path, monkeypatch)
     fmt = _formatter_module(mod)
-    fmt.reset_probe_cache()
+    fmt.reset_gateway_offline_cache()
     clock = {"t": 500.0}
     monkeypatch.setattr(fmt.time, "monotonic", lambda: clock["t"])
 
@@ -578,18 +434,15 @@ def test_stream_deadline_stops_consuming_a_trickling_stream(tmp_path, monkeypatc
             return False
 
     def fake_urlopen(req, timeout=None):
-        if (getattr(req, "method", "GET") or "GET") == "GET":
-            return _FakeResp(b'{"data":[]}')
         return _TricklingResp()
 
     monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
 
     text, err = fmt._stream_formatter(
-        "http://stub/v1/chat/completions", b"{}",
-        lambda d: None, timeout=18.0, deadline=clock["t"] + 5.0,
+        b"{}", lambda d: None, timeout=18.0, deadline=clock["t"] + 5.0,
     )
     assert text == ""
-    assert "time budget" in err
+    assert err is not None and err.advance and "time budget" in err.reason
     # Without the deadline check this loop would never terminate.
     assert clock["t"] <= 512.0, f"kept reading past the deadline: {clock['t']}"
 

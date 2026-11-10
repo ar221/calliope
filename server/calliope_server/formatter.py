@@ -17,13 +17,17 @@ executable `calliope-server` script (Stage 4 split).
 """
 
 import difflib
+import http.client
 import json
 import logging
+import math
 import os
 import re
+import socket
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -39,6 +43,7 @@ from .sillytavern import (
     ChatReader,
     build_character_context,
     canonical_character_key,
+    character_context_from_card,
     load_character_card,
     load_persona_full,
     load_persona_voice,
@@ -202,18 +207,33 @@ RP_SYSTEM_ENHANCE = (
 )
 
 
-def build_transcript_context() -> str:
-    """Build a truncated transcript string for inclusion in prompts."""
-    if not session_transcript:
+def build_transcript_context(chat_id: str = "") -> str:
+    """Recent session transcript for prompts, scoped to one chat.
+
+    Only entries tagged with exactly `chat_id` are included (untagged entries
+    match an empty `chat_id`), so another chat's dictation never reaches this
+    chat's prompt. Walks newest-first and stops once the character budget is
+    spent instead of serializing the whole session.
+    """
+    chat_id = str(chat_id or "")
+    limit = config.TRANSCRIPT_CONTEXT_LIMIT
+    lines: list[str] = []
+    size = 0
+    with transcript_lock:
+        for entry in reversed(session_transcript):
+            if str(entry.get("chat_id") or "") != chat_id:
+                continue
+            role_label = "Partner" if entry.get("role") == "context" else "You"
+            line = f"[{role_label}]: {entry.get('text', '')}"
+            lines.append(line)
+            size += len(line) + 1
+            if size > limit:
+                break
+    if not lines:
         return ""
-    lines = []
-    for entry in session_transcript:
-        role_label = "Partner" if entry["role"] == "context" else "You"
-        lines.append(f"[{role_label}]: {entry['text']}")
-    full = "\n".join(lines)
-    # Truncate from the beginning if too long, keeping recent entries
-    if len(full) > config.TRANSCRIPT_CONTEXT_LIMIT:
-        full = "...\n" + full[-config.TRANSCRIPT_CONTEXT_LIMIT:]
+    full = "\n".join(reversed(lines))
+    if len(full) > limit:
+        full = "...\n" + full[-limit:]
     return full
 
 
@@ -282,10 +302,6 @@ def get_model_attribution() -> dict:
 def formatter_base_url() -> str:
     base = config.OMNIROUTE_PROXY_URL.strip().rstrip("/")
     return base[:-3] if base.endswith("/v1") else base
-
-
-def formatter_health_url() -> str:
-    return f"{formatter_base_url()}/v1/models"
 
 
 def formatter_request_url() -> str:
@@ -362,7 +378,7 @@ def formatter_response_text(data: dict) -> str:
             return "\n".join(parts).strip()
 
     choices = data.get("choices")
-    if isinstance(choices, list) and choices:
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
         message = choices[0].get("message", {})
         if isinstance(message, dict):
             content = message.get("content", "")
@@ -392,37 +408,91 @@ def formatter_error_text(data: dict) -> str:
     return ""
 
 
-# Substrings that mark a model as un-usable *right now* but worth skipping to
-# the next chain tier (transient/credential/routing issues), rather than a
-# hard failure of the whole request.
-#
-# Timeouts belong here: a reasoning-tier first model that blows its per-attempt
-# budget is exactly the case the fallback chain exists for. Treating a timeout
-# as fatal aborted the whole chain on tier 0, so "OmniRoute Auto" silently
-# returned raw unformatted text instead of falling through to the next model.
-_CHAIN_SKIP_MARKERS = (
-    "no credentials",
-    "not found",
-    "does not exist",
-    "unavailable",
-    "not available",
-    "no such model",
-    "insufficient",
-    "unauthorized",
-    "forbidden",
-    "rate limit",
-    "overloaded",
-    "capacity",
-    "timed out",
-    "timeout",
-    "bad gateway",
-)
+class _UpstreamFailure(Exception):
+    """One failed completion attempt.
+
+    `advance`: another chain tier may succeed (rate limit, 5xx, timeout,
+    malformed/empty/truncated output). `offline`: the gateway itself is
+    unreachable, so no tier can succeed. `kind` is a content-free label that is
+    safe to log; `reason` may carry the gateway's error message for the client.
+    """
+
+    def __init__(self, reason: str, *, kind: str, advance: bool, offline: bool = False):
+        super().__init__(reason)
+        self.reason = reason
+        self.kind = kind
+        self.advance = advance
+        self.offline = offline
 
 
-def _is_chain_skippable_error(message: str) -> bool:
-    """True if an error should skip to the next model in the chain."""
-    m = (message or "").lower()
-    return any(marker in m for marker in _CHAIN_SKIP_MARKERS)
+# Per-model or transient HTTP statuses: another tier may succeed. 404 is a
+# model the gateway cannot route. Any other 4xx (auth, validation) would fail
+# identically on every tier, so it aborts the chain with an honest reason.
+_ADVANCE_HTTP_STATUSES = frozenset({404, 408, 409, 425, 429})
+_ABORT_ERROR_TYPES = ("auth", "permission", "invalid_request")
+_TRUNCATED_FINISH_REASONS = frozenset({"length", "content_filter"})
+
+
+def _status_advances(status: int) -> bool:
+    return status in _ADVANCE_HTTP_STATUSES or status >= 500
+
+
+def _error_body_failure(err: object, *, status: int | None = None) -> _UpstreamFailure:
+    """Classify an OpenAI-shape `error` object (body or SSE frame)."""
+    msg = formatter_error_text({"error": err})[:200]
+    etype = ""
+    if isinstance(err, dict):
+        etype = str(err.get("type") or "").lower()
+        if status is None:
+            for key in ("status", "code"):
+                value = err.get(key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    status = value
+                    break
+                if isinstance(value, str) and value.isdigit():
+                    status = int(value)
+                    break
+    if status is not None:
+        kind = f"HTTP {status}"
+        advance = _status_advances(status)
+    else:
+        kind = "error body"
+        advance = not any(t in etype for t in _ABORT_ERROR_TYPES)
+    return _UpstreamFailure(f"{kind}: {msg}" if msg else kind, kind=kind, advance=advance)
+
+
+def _classify_exception(e: BaseException) -> _UpstreamFailure:
+    """Map a transport exception to a chain decision by type/status, not wording."""
+    if isinstance(e, _UpstreamFailure):
+        return e
+    if isinstance(e, urllib.error.HTTPError):
+        err: object = None
+        try:
+            parsed = json.loads(e.read(4096) or b"null")
+            if isinstance(parsed, dict):
+                err = parsed.get("error")
+        except Exception:
+            pass
+        return _error_body_failure(err, status=int(e.code))
+    is_url_error = isinstance(e, urllib.error.URLError)
+    inner = e.reason if is_url_error else e
+    if isinstance(inner, (TimeoutError, socket.timeout)):
+        return _UpstreamFailure("timed out", kind="timeout", advance=True)
+    if isinstance(inner, (ConnectionRefusedError, socket.gaierror)) or (
+        is_url_error and not isinstance(inner, ConnectionError)
+    ):
+        return _UpstreamFailure(
+            "gateway unreachable", kind="offline", advance=False, offline=True,
+        )
+    if isinstance(inner, (OSError, http.client.HTTPException)):
+        return _UpstreamFailure(
+            f"connection failed ({type(inner).__name__})", kind="connection", advance=True,
+        )
+    if isinstance(inner, ValueError):
+        return _UpstreamFailure("malformed response", kind="malformed", advance=True)
+    return _UpstreamFailure(
+        f"unexpected error ({type(inner).__name__})", kind="error", advance=True,
+    )
 
 
 def _attempt_timeout(deadline: float, per_attempt: float) -> float:
@@ -435,58 +505,130 @@ def _attempt_timeout(deadline: float, per_attempt: float) -> float:
     return min(per_attempt, max(0.0, deadline - time.monotonic()))
 
 
-# (expires_at_monotonic, healthy, reason) for the single OmniRoute gateway.
-_probe_cache: tuple[float, bool, str] | None = None
-_probe_lock = threading.Lock()
+# Completion-first availability: there is no preflight. A refused/unresolvable
+# connection on a real completion marks the gateway offline for a few seconds.
+_offline_until = 0.0
+_offline_lock = threading.Lock()
 
 
-def reset_probe_cache() -> None:
-    """Drop the cached liveness verdict (config reload / tests)."""
-    global _probe_cache
-    with _probe_lock:
-        _probe_cache = None
+def reset_gateway_offline_cache() -> None:
+    """Forget a cached offline verdict (config reload / tests)."""
+    global _offline_until
+    with _offline_lock:
+        _offline_until = 0.0
 
 
-def probe_formatter(timeout: float | None = None) -> tuple[bool, str]:
-    """Authenticated OmniRoute liveness check, cached for a few seconds.
+def _gateway_known_offline() -> bool:
+    with _offline_lock:
+        return time.monotonic() < _offline_until
 
-    `/v1/models` rebuilds a large catalog and can exceed 3s cold, so the probe
-    budget is configurable and its verdict cached. A missing API key fails
-    closed before any network request.
-    """
-    global _probe_cache
-    if not config.OMNIROUTE_API_KEY:
-        return False, "OMNIROUTE_API_KEY is required"
-    if timeout is None:
-        timeout = config.FORMATTER_PROBE_TIMEOUT_SECONDS
-    now = time.monotonic()
-    with _probe_lock:
-        cached = _probe_cache
-        if cached is not None and now < cached[0]:
-            return cached[1], cached[2]
-    try:
-        req = urllib.request.Request(
-            formatter_health_url(),
-            headers={"Authorization": f"Bearer {config.OMNIROUTE_API_KEY}"},
-            method="GET",
-        )
-        # Close the response: the old call leaked the socket every probe.
-        with urllib.request.urlopen(req, timeout=timeout):
-            pass
-        healthy, reason = True, ""
-    except Exception as e:
-        healthy, reason = False, str(e)
-    ttl = (
-        config.FORMATTER_PROBE_TTL_SECONDS if healthy
-        else config.FORMATTER_PROBE_FAIL_TTL_SECONDS
+
+def _mark_gateway_offline() -> None:
+    global _offline_until
+    with _offline_lock:
+        _offline_until = time.monotonic() + config.FORMATTER_OFFLINE_TTL_SECONDS
+
+
+def _completion_request(payload: bytes, *, stream: bool) -> urllib.request.Request:
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {config.OMNIROUTE_API_KEY}",
+    }
+    if stream:
+        headers["Accept"] = "text/event-stream"
+    return urllib.request.Request(
+        formatter_request_url(), data=payload, headers=headers, method="POST",
     )
-    with _probe_lock:
-        # Expiry is measured from when the probe FINISHED, not when it started.
-        # A failing probe burns its whole timeout, so `now + ttl` was already in
-        # the past whenever timeout > ttl — the failure verdict expired on
-        # arrival and every request re-paid the full probe with the proxy down.
-        _probe_cache = (time.monotonic() + ttl, healthy, reason)
-    return healthy, reason
+
+
+def _complete_once(payload: bytes, timeout: float) -> str:
+    """One non-streaming completion; raises `_UpstreamFailure` on any failure."""
+    try:
+        with urllib.request.urlopen(_completion_request(payload, stream=False), timeout=timeout) as resp:
+            raw = resp.read()
+    except Exception as e:
+        raise _classify_exception(e) from e
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise _UpstreamFailure("malformed JSON response", kind="malformed", advance=True) from None
+    if not isinstance(data, dict):
+        raise _UpstreamFailure("malformed response", kind="malformed", advance=True)
+    if data.get("error"):
+        raise _error_body_failure(data["error"])
+    choices = data.get("choices")
+    finish = ""
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        finish = str(choices[0].get("finish_reason") or "")
+    if finish in _TRUNCATED_FINISH_REASONS:
+        raise _UpstreamFailure(
+            f"output truncated (finish_reason={finish})", kind=f"finish {finish}", advance=True,
+        )
+    return formatter_response_text(data)
+
+
+def _run_chain(chain: list[str], *, system_prompt: str, user_content: str,
+               max_tokens: int, temperature: float | None,
+               per_attempt: float, budget: float, label: str,
+               on_delta=None, strip_preamble: bool = True) -> tuple[str, str, int]:
+    """Try `chain` tiers in order. Returns (text, failure_reason, tier).
+
+    Empty text means no tier produced a complete answer; `failure_reason`
+    says why. `on_delta` switches to streaming: once visible text has been
+    painted a failure cannot advance, since a second answer would paint over
+    the first. Reasoning blocks are always stripped; `strip_preamble` also
+    applies the RP meta-preamble heuristic (formatter calls only).
+    """
+    if not config.OMNIROUTE_API_KEY:
+        return "", f"{label} unavailable: OMNIROUTE_API_KEY is required", -1
+    finish = strip_formatter_preamble if strip_preamble else strip_reasoning
+    deadline = time.monotonic() + budget
+    last_reason = f"{label} failed"
+    for idx, model in enumerate(chain):
+        if _gateway_known_offline():
+            return "", f"{label} gateway offline (OmniRoute not reachable)", -1
+        timeout = _attempt_timeout(deadline, per_attempt)
+        if timeout <= 0:
+            log.warning("%s chain time budget exhausted before tier %d", label, idx)
+            return "", f"{label} timed out: chain time budget exhausted", -1
+        payload_obj = formatter_payload(
+            system_prompt=system_prompt,
+            user_content=user_content,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        failure: _UpstreamFailure | None = None
+        if on_delta is not None:
+            payload_obj["stream"] = True
+            painted, failure = _stream_formatter(
+                json.dumps(payload_obj).encode(), on_delta,
+                timeout=timeout, deadline=deadline,
+            )
+            if failure is not None and painted:
+                log.warning("%s stream on '%s' truncated (%s)", label, model, failure.kind)
+                return "", f"{label} streaming truncated: {failure.reason}", -1
+            text = finish(painted)
+        else:
+            try:
+                text = finish(_complete_once(json.dumps(payload_obj).encode(), timeout))
+            except _UpstreamFailure as f:
+                text, failure = "", f
+        if failure is None:
+            if text:
+                return text, "", idx
+            failure = _UpstreamFailure("returned empty output", kind="empty", advance=True)
+        if failure.offline:
+            _mark_gateway_offline()
+            log.warning("%s gateway unreachable — cached offline", label)
+            return "", f"{label} gateway offline (OmniRoute not reachable)", -1
+        last_reason = f"{label} failed: {failure.reason}"
+        if failure.advance and idx + 1 < len(chain):
+            log.warning("%s model '%s' skipped (%s) — trying next tier", label, model, failure.kind)
+            continue
+        log.warning("%s model '%s' failed (%s)", label, model, failure.kind)
+        return "", last_reason, -1
+    return "", last_reason, -1
 
 
 def disfluency_clean(text: str) -> tuple[str, bool, str]:
@@ -495,6 +637,7 @@ def disfluency_clean(text: str) -> tuple[str, bool, str]:
     Returns (cleaned_text, was_cleaned, reason_if_skipped).
     Falls through to the original text on timeout, gateway failure, or oversized input.
     `was_cleaned` is True when the cleanup actually ran; False on skip/failure.
+    The whole cleanup chain shares one deadline.
     """
     if not text or not text.strip():
         return text, False, "empty input"
@@ -505,71 +648,33 @@ def disfluency_clean(text: str) -> tuple[str, bool, str]:
     if word_count > config.DISFLUENCY_CLEAN_MAX_WORDS:
         return text, False, f"input {word_count} words exceeds cap {config.DISFLUENCY_CLEAN_MAX_WORDS}"
 
-    # The configurable budget accommodates a cold `/v1/models` catalog build.
-    healthy, _reason = probe_formatter()
-    if not healthy:
-        log.info("disfluency_clean: OmniRoute unreachable — passing through raw")
-        return text, False, "cleanup gateway unreachable (omniroute)"
-
-    request_url = formatter_request_url()
     chain = formatter_model_chain(cleanup=True)
-    last_reason = "cleanup failed"
-
-    for idx, model in enumerate(chain):
-        has_next = idx + 1 < len(chain)
-        payload = json.dumps(
-            formatter_payload(
-                system_prompt=DISFLUENCY_CLEAN_SYSTEM,
-                user_content=text,
-                model=model,
-                max_tokens=max(512, len(text) * 2),
-                temperature=0.0,
-            )
-        ).encode()
-        try:
-            req = urllib.request.Request(
-                request_url,
-                data=payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {config.OMNIROUTE_API_KEY}",
-                },
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=config.DISFLUENCY_CLEAN_TIMEOUT) as resp:
-                data = json.loads(resp.read())
-            err_msg = formatter_error_text(data)
-            if err_msg:
-                if has_next and _is_chain_skippable_error(err_msg):
-                    last_reason = f"cleanup failed: {err_msg}"
-                    continue
-                return text, False, f"cleanup failed: {err_msg}"
-            cleaned = formatter_response_text(data)
-            if not cleaned:
-                last_reason = "cleanup returned empty"
-                if has_next:
-                    continue
-                return text, False, last_reason
-            # Safety: if cleanup output is drastically shorter (<40% of input by
-            # word count) we're likely looking at a truncation or the model
-            # dropping content — fall back to raw.
-            if len(cleaned.split()) < max(3, word_count * 0.4):
-                log.warning(
-                    "disfluency_clean: output suspiciously short "
-                    f"({len(cleaned.split())} words vs {word_count}) — falling back to raw"
-                )
-                return text, False, "cleanup output too short, possible truncation"
-            record_model_attribution(model, tier=idx)
-            return cleaned, True, ""
-        except Exception as e:
-            msg = str(e)
-            if has_next and _is_chain_skippable_error(msg):
-                last_reason = f"cleanup failed: {msg}"
-                continue
-            log.info(f"disfluency_clean: failed ({e}) — passing through raw")
-            return text, False, f"cleanup failed: {e}"
-
-    return text, False, last_reason
+    cleaned, reason, tier = _run_chain(
+        chain,
+        system_prompt=DISFLUENCY_CLEAN_SYSTEM,
+        user_content=text,
+        max_tokens=max(512, len(text) * 2),
+        temperature=0.0,
+        per_attempt=config.DISFLUENCY_CLEAN_TIMEOUT,
+        budget=config.DISFLUENCY_CLEAN_CHAIN_BUDGET_SECONDS,
+        label="cleanup",
+        # Cleanup output is the user's text, not an RP rewrite: the RP
+        # meta-preamble heuristic could drop a genuine first paragraph.
+        strip_preamble=False,
+    )
+    if not cleaned:
+        return text, False, reason
+    # Safety: if cleanup output is drastically shorter (<40% of input by
+    # word count) we're likely looking at a truncation or the model
+    # dropping content — fall back to raw.
+    if len(cleaned.split()) < max(3, word_count * 0.4):
+        log.warning(
+            "disfluency_clean: output suspiciously short "
+            f"({len(cleaned.split())} words vs {word_count}) — falling back to raw"
+        )
+        return text, False, "cleanup output too short, possible truncation"
+    record_model_attribution(chain[tier], tier=tier)
+    return cleaned, True, ""
 
 
 # ─── Phase 3: Per-character mode memory ──────────────────
@@ -619,7 +724,7 @@ def load_char_modes() -> dict:
             return {}
 
     with char_modes_lock:
-        if _char_modes_cache["data"] and _char_modes_cache["mtime"] == mtime:
+        if _char_modes_cache["mtime"] == mtime:
             return _char_modes_cache["data"]
         try:
             raw = config.CHAR_MODES_FILE.read_bytes()
@@ -845,6 +950,36 @@ def scene_contract_prompt(contract: dict | None) -> str:
     return prompt[:2000]
 
 
+def request_scene_state(character_id: str = "", chat_id: str = "") -> dict:
+    """The ST state snapshot, only when it is fresh and describes this request.
+
+    A request without any character/chat identity (manual use), a stale or
+    dead snapshot, or one for another chat/character yields {} so unrelated
+    scene facts never reach the prompt. In a group chat the requested
+    character must be a member of the snapshot's group.
+    """
+    if not character_id and not chat_id:
+        return {}
+    snap = snapshot_state()
+    if not snap.get("fresh"):
+        return {}
+    if chat_id and str(snap.get("chatId") or "") != str(chat_id):
+        return {}
+    if character_id:
+        want = canonical_character_key(character_id)
+        if canonical_character_key(snap.get("characterId", "")) != want:
+            members = snap.get("groupMembers") if isinstance(snap.get("groupMembers"), list) else []
+            if not any(
+                isinstance(m, dict) and want in (
+                    canonical_character_key(m.get("avatar", "")),
+                    canonical_character_key(m.get("name", "")),
+                )
+                for m in members
+            ):
+                return {}
+    return snap
+
+
 def update_state(payload: dict) -> dict:
     """Merge incoming ST state payload. Returns snapshot after merge."""
     allowed_keys = {
@@ -873,16 +1008,21 @@ def update_state(payload: dict) -> dict:
     return snapshot_state()
 
 
+# Reasoning blocks some models emit inline: <think> and <thinking>, any case.
+_REASONING_OPEN_TAGS = ("<thinking>", "<think>")
+_REASONING_OPEN_RE = re.compile(r"<(?:think|thinking)>", re.IGNORECASE)
+_REASONING_BLOCK_RE = re.compile(r"<(think|thinking)>.*?</\1>", re.IGNORECASE | re.DOTALL)
+
+
 class _ThinkingTagFilter:
-    """State machine that suppresses bytes between <thinking>...</thinking>
+    """State machine that suppresses `<think>`/`<thinking>` blocks (any case)
     in a token-streamed payload.
 
     Reasoning models can emit substantial thinking blocks at the start of the
     response. Without filtering, the SSE delta consumer would flash the
     raw chain-of-thought into #send_textarea before the final
-    `dictation-result` event overwrote it. We keep a tiny char-by-char
-    state machine that handles partial tag matches across SSE chunk
-    boundaries.
+    `dictation-result` event overwrote it. Partial tags split across SSE
+    chunk boundaries are held back until they resolve.
 
     Usage:
         f = _ThinkingTagFilter()
@@ -892,11 +1032,8 @@ class _ThinkingTagFilter:
         tail = f.flush()  # any held-back partial tag bytes (rare)
     """
 
-    OPEN = "<thinking>"
-    CLOSE = "</thinking>"
-
     def __init__(self) -> None:
-        self.in_thinking = False
+        self.close = ""  # lowercase close tag of the block we are inside
         self.buf = ""  # held-back bytes that might be a partial open/close tag
 
     def feed(self, chunk: str) -> str:
@@ -904,45 +1041,42 @@ class _ThinkingTagFilter:
             return ""
         self.buf += chunk
         out_parts: list[str] = []
-        # Walk the buffer; emit safe chars, hold back anything that could
-        # extend into a tag.
         while self.buf:
-            if self.in_thinking:
-                idx = self.buf.find(self.CLOSE)
+            lower = self.buf.lower()
+            if self.close:
+                idx = lower.find(self.close)
                 if idx == -1:
-                    # Hold back the trailing chars that could complete CLOSE.
-                    keep = min(len(self.CLOSE) - 1, len(self.buf))
+                    # Hold back the trailing chars that could complete the close tag.
+                    keep = min(len(self.close) - 1, len(self.buf))
                     self.buf = self.buf[-keep:] if keep > 0 else ""
-                    return "".join(out_parts)
-                # Found close tag — drop it, exit thinking, continue
-                self.buf = self.buf[idx + len(self.CLOSE):]
-                self.in_thinking = False
+                    break
+                self.buf = self.buf[idx + len(self.close):]
+                self.close = ""
                 continue
-            # Not in thinking — emit until we hit (or might hit) <thinking>.
-            idx = self.buf.find(self.OPEN)
-            if idx >= 0:
-                out_parts.append(self.buf[:idx])
-                self.buf = self.buf[idx + len(self.OPEN):]
-                self.in_thinking = True
+            m = _REASONING_OPEN_RE.search(self.buf)
+            if m:
+                out_parts.append(self.buf[:m.start()])
+                self.close = "</" + m.group(0)[1:].lower()
+                self.buf = self.buf[m.end():]
                 continue
-            # No full open tag. Emit everything except a possible partial
-            # tag prefix at the tail.
+            # No full open tag: emit everything except a possible partial tag.
             possible = 0
-            for k in range(1, len(self.OPEN)):
-                if self.buf.endswith(self.OPEN[:k]):
-                    possible = k
+            for tag in _REASONING_OPEN_TAGS:
+                for k in range(possible + 1, len(tag)):
+                    if lower.endswith(tag[:k]):
+                        possible = k
             if possible:
                 out_parts.append(self.buf[:-possible])
                 self.buf = self.buf[-possible:]
             else:
                 out_parts.append(self.buf)
                 self.buf = ""
-            return "".join(out_parts)
+            break
         return "".join(out_parts)
 
     def flush(self) -> str:
-        """Drop any unterminated <thinking>...; emit residual buffer."""
-        if self.in_thinking:
+        """Drop any unterminated reasoning block; emit residual buffer."""
+        if self.close:
             self.buf = ""
             return ""
         out, self.buf = self.buf, ""
@@ -965,6 +1099,15 @@ _FORMATTER_LEADIN_RE = re.compile(
 )
 
 
+def strip_reasoning(output: str) -> str:
+    """Remove `<think>`/`<thinking>` blocks (any case), incl. an unterminated one."""
+    text = _REASONING_BLOCK_RE.sub("", str(output or ""))
+    unterminated = _REASONING_OPEN_RE.search(text)
+    if unterminated:
+        text = text[:unterminated.start()]
+    return text.strip()
+
+
 def strip_formatter_preamble(output: str) -> str:
     """Drop model meta-commentary before the actual rewritten dictation.
 
@@ -975,11 +1118,7 @@ def strip_formatter_preamble(output: str) -> str:
     like formatter commentary and a later paragraph looks like the actual
     rewrite, return only the rewrite.
     """
-    text = str(output or "").strip()
-    if not text:
-        return ""
-
-    text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL).strip()
+    text = strip_reasoning(output)
     if not text:
         return ""
 
@@ -1007,109 +1146,98 @@ def strip_formatter_preamble(output: str) -> str:
     return text
 
 
-def _parse_sse_delta(line_data: str) -> tuple[str, bool]:
-    """Parse one OpenAI-shape SSE `data:` line; return (delta_text, is_done).
+def _parse_sse_delta(line_data: str) -> tuple[str, str, object]:
+    """Parse one OpenAI-shape SSE `data:` line.
 
-    `{"choices":[{"delta":{"content":"..."}}]}` chunks and the `[DONE]`
-    sentinel are the only shapes `/v1/chat/completions` streams; anything else
-    returns ("", False).
+    Returns (delta_text, finish, error): `finish` is "[DONE]" for the
+    sentinel, the chunk's `finish_reason` when present, else "". `error` is
+    the frame's `error` object when the gateway streams one, else None.
+    Malformed frames return ("", "", None).
     """
     if not line_data:
-        return "", False
+        return "", "", None
     if line_data.strip() == "[DONE]":
-        return "", True
+        return "", "[DONE]", None
     try:
         obj = json.loads(line_data)
     except Exception:
-        return "", False
+        return "", "", None
     if not isinstance(obj, dict):
-        return "", False
+        return "", "", None
+    if obj.get("error"):
+        return "", "", obj["error"]
     choices = obj.get("choices")
-    if isinstance(choices, list) and choices:
-        ch0 = choices[0] or {}
-        if not isinstance(ch0, dict):
-            return "", False
-        delta = ch0.get("delta") or ch0.get("message") or {}
-        if isinstance(delta, dict):
-            content = delta.get("content")
-            if isinstance(content, str) and content:
-                # finish_reason on the same chunk = done after this delta
-                done = bool(ch0.get("finish_reason"))
-                return content, done
-        if ch0.get("finish_reason"):
-            return "", True
-    return "", False
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return "", "", None
+    ch0 = choices[0]
+    finish = str(ch0.get("finish_reason") or "")
+    delta = ch0.get("delta") or ch0.get("message") or {}
+    content = delta.get("content") if isinstance(delta, dict) else None
+    return (content if isinstance(content, str) else ""), finish, None
 
 
-def _stream_formatter(url: str, payload: bytes,
-                       on_delta, timeout: float,
-                       deadline: float | None = None) -> tuple[str, str]:
+def _stream_formatter(payload: bytes, on_delta, *, timeout: float,
+                      deadline: float | None = None) -> tuple[str, "_UpstreamFailure | None"]:
     """POST `payload` with stream=True; parse SSE deltas; call `on_delta(text)`
-    for each visible (post-thinking-filter) chunk.
+    for each visible (post-reasoning-filter) chunk.
 
-    Returns (full_visible_text, error_reason). On mid-stream failure, the
-    partial buffer is returned so the caller can surface what we got rather
-    than lose data.
+    Returns (visible_text, failure). `failure` is None only when the stream
+    ended with `[DONE]` or a `stop`-like finish reason; a clean EOF without a
+    completion marker, a `length`/`content_filter` finish, an error frame, a
+    transport error or the deadline all return a failure alongside whatever
+    was already painted.
 
     `timeout` is a socket-operation timeout, so it cannot bound a stream that
     trickles steadily. `deadline` (a time.monotonic() value) is checked between
     SSE events, which stops a slow-but-alive stream from being consumed forever.
     One already-started read can still overrun it.
     """
-    req = urllib.request.Request(
-        url,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-            "Authorization": f"Bearer {config.OMNIROUTE_API_KEY}",
-        },
-        method="POST",
-    )
     tag_filter = _ThinkingTagFilter()
     visible_buf: list[str] = []
+
+    def _paint(visible: str) -> None:
+        visible_buf.append(visible)
+        try:
+            on_delta(visible)
+        except Exception as cb_e:
+            log.warning("on_delta callback raised: %s", type(cb_e).__name__)
+
+    finish = ""
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            # Each event is "data: <json>\n\n" (sometimes "event: ...\n" first).
-            # We work line-oriented; line could be bytes.
+        with urllib.request.urlopen(_completion_request(payload, stream=True), timeout=timeout) as resp:
             for raw_line in resp:
                 if deadline is not None and time.monotonic() >= deadline:
-                    return (
-                        "".join(visible_buf),
-                        "stream exceeded the formatter time budget",
+                    return "".join(visible_buf), _UpstreamFailure(
+                        "timed out: stream exceeded the formatter time budget",
+                        kind="timeout", advance=True,
                     )
                 line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
-                if not line:
-                    continue
-                if line.startswith(":"):
-                    # SSE comment / heartbeat
-                    continue
-                if line.startswith("event:"):
-                    continue
-                if line.startswith("data:"):
-                    data_str = line[len("data:"):].strip()
-                    delta, done = _parse_sse_delta(data_str)
-                    if delta:
-                        visible = tag_filter.feed(delta)
-                        if visible:
-                            visible_buf.append(visible)
-                            try:
-                                on_delta(visible)
-                            except Exception as cb_e:
-                                log.warning("on_delta callback raised: %s", cb_e)
-                    if done:
-                        break
-        tail = tag_filter.flush()
-        if tail:
-            visible_buf.append(tail)
-            try:
-                on_delta(tail)
-            except Exception as cb_e:
-                log.warning("on_delta callback raised: %s", cb_e)
-        return "".join(visible_buf), ""
+                if not line.startswith("data:"):
+                    continue  # blank separators, `:` heartbeats, `event:` lines
+                delta, chunk_finish, err = _parse_sse_delta(line[len("data:"):].strip())
+                if err is not None:
+                    return "".join(visible_buf), _error_body_failure(err)
+                if delta:
+                    visible = tag_filter.feed(delta)
+                    if visible:
+                        _paint(visible)
+                if chunk_finish:
+                    finish = chunk_finish
+                    break
     except Exception as e:
-        # Return partial so caller can fall back to dictation-result with what we got.
-        return "".join(visible_buf), f"stream failed: {e}"
+        return "".join(visible_buf), _classify_exception(e)
+    if not finish:
+        return "".join(visible_buf), _UpstreamFailure(
+            "stream ended without a completion marker", kind="eof", advance=True,
+        )
+    if finish in _TRUNCATED_FINISH_REASONS:
+        return "".join(visible_buf), _UpstreamFailure(
+            f"output truncated (finish_reason={finish})", kind=f"finish {finish}", advance=True,
+        )
+    tail = tag_filter.flush()
+    if tail:
+        _paint(tail)
+    return "".join(visible_buf), None
 
 
 def format_rp(*args, **kwargs) -> tuple[str, bool, str]:
@@ -1136,7 +1264,10 @@ def _format_rp(text: str, mode: int = 1, context: str = "",
                user_content_override: str = "",
                temperature: float | None = None,
                request_id: str = "",
-               model_override: str = "") -> tuple[str, bool, str]:
+               model_override: str = "",
+               transcript_chat_id: str | None = None,
+               cleanup_chain: bool = False,
+               timing: dict | None = None) -> tuple[str, bool, str]:
     """Format text through authenticated OmniRoute.
 
     mode=1 formats; mode=2 enhances. Prompt overrides let pipeline steps reuse
@@ -1144,24 +1275,24 @@ def _format_rp(text: str, mode: int = 1, context: str = "",
     skip_persona_character skips the persona/character injection blocks so the
     caller (persona_pov step) can build its own framing.
     user_content_override bypasses the default user-content assembly entirely.
-    scene_continuity is compact visual/spatial state from ST extensions.
+    scene_continuity is compact visual/spatial state from ST extensions; it is
+    only used when no scene contract (which already carries it) is given.
     scene_contract is request-scoped MVP-26 guidance; it is never persisted.
+    transcript_chat_id: None sends no session history; a string (including
+    "") adds that chat's recent session transcript (mode 2 only).
+    cleanup_chain selects the cheap cleanup chain (grammar) unless a model
+    is pinned. `timing["ttft"]` is stamped at the first streamed token.
 
     request_id: when non-empty, request `stream: true` and emit
     `dictation-token` SSE events with {requestId, delta, done} as tokens
-    arrive. The final canonical text still returns via the function's normal
-    return tuple — caller emits `dictation-result` with that text and the
-    extension overwrites the streamed buffer (final text is source of truth).
-    Empty request_id keeps the legacy non-streaming path.
+    arrive; a terminal `done: true` token is emitted on every exit. The final
+    canonical text still returns via the function's normal return tuple —
+    caller emits `dictation-result` with that text and the extension
+    overwrites the streamed buffer (final text is source of truth).
 
     Returns (formatted_text, formatting_skipped, reason).
     On skip/failure, formatted_text is the raw input and reason explains why.
     """
-    healthy, _reason = probe_formatter()
-    if not healthy:
-        log.warning("OmniRoute formatter not reachable — returning raw text")
-        return text, True, "RP gateway offline (OmniRoute not reachable)"
-
     if system_prompt_override:
         system_prompt = system_prompt_override
     else:
@@ -1203,9 +1334,7 @@ def _format_rp(text: str, mode: int = 1, context: str = "",
     else:
         user_content = ""
 
-        if mode == 2 and contract_prompt:
-            user_content += contract_prompt + "\n\n"
-        elif mode == 2 and scene_continuity.strip():
+        if mode == 2 and not contract_prompt and scene_continuity.strip():
             user_content += (
                 "[SCENE CONTINUITY from SillyTavern tracker — respect these current visual/spatial facts; "
                 "do NOT narrate them unless relevant to the dictated line:]\n"
@@ -1220,138 +1349,59 @@ def _format_rp(text: str, mode: int = 1, context: str = "",
                 + chat_context + "\n\n"
             )
 
-        # Add transcript history if available (RP+ only)
-        if mode == 2:
-            transcript_ctx = build_transcript_context()
+        transcript_ctx = ""
+        if mode == 2 and transcript_chat_id is not None:
+            transcript_ctx = build_transcript_context(transcript_chat_id)
             if transcript_ctx:
                 user_content += f"[CONVERSATION HISTORY for context — do NOT rewrite this, just use it to understand tone and continuity:]\n{transcript_ctx}\n\n"
 
-        # Add the last message context if provided
-        if context.strip():
-            user_content += f"[THE MESSAGE YOU ARE RESPONDING TO — use this to tailor your rewrite's tone and references:]\n{context.strip()}\n\n"
+        # The last AI message, unless a history block above already carries it.
+        last_ai = context.strip()
+        if last_ai and last_ai not in chat_context and last_ai not in transcript_ctx:
+            user_content += f"[THE MESSAGE YOU ARE RESPONDING TO — use this to tailor your rewrite's tone and references:]\n{last_ai}\n\n"
 
         user_content += f"[YOUR DICTATED INPUT — rewrite ONLY this, in the persona's voice, addressing the character above:]\n{text}"
 
-    request_url = formatter_request_url()
     # Ordered OmniRoute model chain; explicit picks remain single-model.
-    chain = formatter_model_chain(model_override=model_override)
-    if not chain:
-        return text, True, "pinned formatter model is not selectable on OmniRoute"
-    last_reason = "RP formatting failed"
-    # Retry bound across tiers. A per-tier timeout now skips to the next model,
-    # so without this a 3-tier chain could stack three full timeouts onto one
-    # interactive regenerate. This gates which tiers are attempted; it does not
-    # cap a single in-flight request.
-    deadline = time.monotonic() + config.FORMATTER_CHAIN_BUDGET_SECONDS
+    chain = formatter_model_chain(cleanup=cleanup_chain, model_override=model_override)
 
-    for idx, model in enumerate(chain):
-        attempt_timeout = _attempt_timeout(deadline, config.FORMATTER_TIMEOUT_SECONDS)
-        if attempt_timeout <= 0:
-            log.warning("RP formatting chain budget exhausted before model '%s'", model)
-            last_reason = "RP formatting exhausted its time budget"
-            break
-        payload_obj = formatter_payload(
-            system_prompt=system_prompt,
-            user_content=user_content,
-            model=model,
-            max_tokens=4096,
-            temperature=temperature,
-        )
-        if request_id:
-            payload_obj["stream"] = True
-        payload = json.dumps(payload_obj).encode()
-        has_next = idx + 1 < len(chain)
+    on_delta = None
+    if request_id:
+        # MVP-13: forward each visible (post-reasoning-filter) delta to the SSE
+        # bus so the ST extension can paint #send_textarea token-by-token.
+        def on_delta(delta_text: str) -> None:
+            if timing is not None and "ttft" not in timing:
+                timing["ttft"] = time.monotonic()
+            events.broadcast_event("dictation-token", {
+                "requestId": request_id,
+                "delta": delta_text,
+                "done": False,
+            })
 
-        if request_id:
-            # MVP-13: streaming path. Forward each visible (post-thinking-filter)
-            # delta to the SSE bus as a `dictation-token` event so the ST
-            # extension can paint #send_textarea token-by-token. The buffered
-            # full text is still returned to the caller, which emits the final
-            # `dictation-result` (source of truth — the extension overwrites
-            # the streamed buffer with that, preventing drift).
-            def _emit(delta_text: str) -> None:
-                events.broadcast_event("dictation-token", {
-                    "requestId": request_id,
-                    "delta": delta_text,
-                    "done": False,
-                })
-
-            full_text, stream_err = _stream_formatter(
-                request_url, payload, _emit,
-                timeout=attempt_timeout,
-                deadline=deadline,
+    try:
+        if not chain:
+            out, reason, tier = "", "pinned formatter model is not selectable on OmniRoute", -1
+        else:
+            out, reason, tier = _run_chain(
+                chain,
+                system_prompt=system_prompt,
+                user_content=user_content,
+                max_tokens=4096,
+                temperature=temperature,
+                per_attempt=config.FORMATTER_TIMEOUT_SECONDS,
+                budget=config.FORMATTER_CHAIN_BUDGET_SECONDS,
+                label="RP formatting",
+                on_delta=on_delta,
             )
-            full_text = strip_formatter_preamble(full_text)
-            if stream_err:
-                # Check the error BEFORE accepting text. A stream that timed out
-                # mid-answer leaves truncated prose in full_text; the old order
-                # recorded that as a clean success and blocked any fallback.
-                if not full_text:
-                    # Nothing visible reached the UI, so another tier is safe.
-                    if has_next and _is_chain_skippable_error(stream_err):
-                        log.warning("RP model '%s' skipped (%s) — trying next tier", model, stream_err)
-                        last_reason = f"RP streaming failed: {stream_err}"
-                        continue
-                    events.broadcast_event("dictation-token", {"requestId": request_id, "delta": "", "done": True})
-                    log.warning("RP streaming failed: %s", stream_err)
-                    return text, True, f"RP streaming failed: {stream_err}"
-                # Partial tokens already painted the client. Retrying another
-                # model would paint a second answer over the first, so keep the
-                # raw text canonical and report the truncation instead of
-                # passing a half-formatted line off as success.
-                events.broadcast_event("dictation-token", {"requestId": request_id, "delta": "", "done": True})
-                log.warning("RP streaming truncated on '%s': %s", model, stream_err)
-                return text, True, f"RP streaming truncated: {stream_err}"
-            if full_text:
-                events.broadcast_event("dictation-token", {"requestId": request_id, "delta": "", "done": True})
-                record_model_attribution(model, tier=idx)
-                return full_text, False, ""
-            # Clean stream that produced no visible text (thinking-only output).
-            # Advance like the non-streaming path does on an empty response.
-            if has_next:
-                last_reason = "RP gateway returned empty stream"
-                continue
-            events.broadcast_event("dictation-token", {"requestId": request_id, "delta": "", "done": True})
-            return text, True, "RP gateway returned empty stream"
-
-        # Non-streaming path.
-        try:
-            req = urllib.request.Request(
-                request_url,
-                data=payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {config.OMNIROUTE_API_KEY}",
-                },
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=attempt_timeout) as resp:
-                data = json.loads(resp.read())
-            err_msg = formatter_error_text(data)
-            if err_msg:
-                if has_next and _is_chain_skippable_error(err_msg):
-                    log.warning("RP model '%s' skipped (%s) — trying next tier", model, err_msg)
-                    last_reason = f"RP formatting failed: {err_msg}"
-                    continue
-                return text, True, f"RP formatting failed: {err_msg}"
-            formatted = strip_formatter_preamble(formatter_response_text(data))
-            if formatted:
-                record_model_attribution(model, tier=idx)
-                return formatted, False, ""
-            last_reason = "RP gateway returned empty response"
-            if has_next:
-                continue
-            return text, True, last_reason
-        except Exception as e:
-            msg = str(e)
-            if has_next and _is_chain_skippable_error(msg):
-                log.warning("RP model '%s' skipped (%s) — trying next tier", model, msg)
-                last_reason = f"RP formatting failed: {msg}"
-                continue
-            log.warning(f"RP formatting failed: {e}")
-            return text, True, f"RP formatting failed: {e}"
-
-    return text, True, last_reason
+    finally:
+        if request_id:
+            events.broadcast_event("dictation-token", {
+                "requestId": request_id, "delta": "", "done": True,
+            })
+    if not out:
+        return text, True, reason
+    record_model_attribution(chain[tier], tier=tier)
+    return out, False, ""
 
 
 # ─── Phase 2: Modes system ───────────────────────────────
@@ -1360,7 +1410,7 @@ DEFAULT_MODES: list[dict] = [
         "id": "plain",
         "label": "Plain",
         "icon": "mic",
-        "whisper_model": config.DEFAULT_MODEL,
+        "whisper_model": "",  # "" = inherit config.DEFAULT_MODEL (see _normalize_mode)
         "pipeline": ["whisper", "hallucination_filter", "command_dispatch"],
         "system_prompt": "",
         "temperature": 0.0,
@@ -1373,7 +1423,7 @@ DEFAULT_MODES: list[dict] = [
         "id": "grammar_clean",
         "label": "Grammar Clean",
         "icon": "broom",
-        "whisper_model": config.DEFAULT_MODEL,
+        "whisper_model": "",
         "pipeline": ["whisper", "hallucination_filter", "command_dispatch", "vocab_correct", "grammar_clean"],
         "system_prompt": GRAMMAR_CLEAN_SYSTEM,
         "temperature": 0.2,
@@ -1386,7 +1436,7 @@ DEFAULT_MODES: list[dict] = [
         "id": "rp_format",
         "label": "RP Format",
         "icon": "italic",
-        "whisper_model": config.DEFAULT_MODEL,
+        "whisper_model": "",
         "pipeline": ["whisper", "hallucination_filter", "command_dispatch", "vocab_correct", "rp_format"],
         "system_prompt": "",  # empty → use built-in RP_SYSTEM_FORMAT
         "temperature": 0.4,
@@ -1399,7 +1449,7 @@ DEFAULT_MODES: list[dict] = [
         "id": "rp_enhance",
         "label": "RP+",
         "icon": "sparkles",
-        "whisper_model": config.DEFAULT_MODEL,
+        "whisper_model": "",
         # disfluency_clean merged into rp_enhance system prompt — see ADR-9 / Agent 3 §10.
         "pipeline": ["whisper", "hallucination_filter", "command_dispatch", "vocab_correct", "rp_enhance"],
         "system_prompt": "",  # empty → use built-in RP_SYSTEM_ENHANCE
@@ -1413,7 +1463,7 @@ DEFAULT_MODES: list[dict] = [
         "id": "persona_pov",
         "label": "Persona POV",
         "icon": "user",
-        "whisper_model": config.DEFAULT_MODEL,
+        "whisper_model": "",
         "pipeline": ["whisper", "hallucination_filter", "command_dispatch", "vocab_correct", "disfluency_clean", "persona_pov"],
         "system_prompt": "",  # built dynamically from persona + character
         "temperature": 0.4,
@@ -1426,7 +1476,7 @@ DEFAULT_MODES: list[dict] = [
         "id": "narrator_past",
         "label": "Narrator Past",
         "icon": "book-open",
-        "whisper_model": config.DEFAULT_MODEL,
+        "whisper_model": "",
         "pipeline": ["whisper", "hallucination_filter", "command_dispatch", "vocab_correct", "disfluency_clean", "rp_enhance"],
         "system_prompt": (
             "Rewrite dictated speech into third-person past-tense narration for the current SillyTavern scene. "
@@ -1445,7 +1495,7 @@ DEFAULT_MODES: list[dict] = [
         "id": "narrator_present",
         "label": "Narrator Present",
         "icon": "book-open",
-        "whisper_model": config.DEFAULT_MODEL,
+        "whisper_model": "",
         "pipeline": ["whisper", "hallucination_filter", "command_dispatch", "vocab_correct", "disfluency_clean", "rp_enhance"],
         "system_prompt": (
             "Rewrite dictated speech into third-person present-tense narration for the current SillyTavern scene. "
@@ -1468,7 +1518,7 @@ DEFAULT_MODES: list[dict] = [
         "id": "command",
         "label": "Command",
         "icon": "terminal",
-        "whisper_model": config.DEFAULT_MODEL,
+        "whisper_model": "",
         "pipeline": ["whisper", "hallucination_filter", "command_dispatch"],
         "system_prompt": "",
         "temperature": 0.0,
@@ -1566,15 +1616,26 @@ def _ensure_default_vocab() -> None:
 _RETIRED_MODE_KEYS = ("preset", "formatter_provider")
 
 
+# The whisper model built-in modes were seeded with before modes inherited it.
+# A built-in mode still carrying exactly this value predates inheritance, so it
+# is treated as "inherit" rather than as a deliberate pin.
+_LEGACY_SEEDED_WHISPER_MODEL = "large-v3-turbo"
+_BUILTIN_MODE_IDS = frozenset(m["id"] for m in DEFAULT_MODES)
+
+
 def _normalize_mode(entry: dict) -> dict:
-    """Fill in missing fields on a mode dict with sane defaults."""
+    """Fill in missing fields on a mode dict with sane defaults.
+
+    `whisper_model` is persisted as "" to inherit `config.DEFAULT_MODEL`; the
+    normalized (in-memory) mode always carries the concrete model to use.
+    """
     for key in _RETIRED_MODE_KEYS:
         entry.pop(key, None)
     defaults = {
         "id": "",
         "label": entry.get("id", "Mode"),
         "icon": "mic",
-        "whisper_model": config.DEFAULT_MODEL,
+        "whisper_model": "",
         "pipeline": ["whisper"],
         "system_prompt": "",
         "temperature": 0.0,
@@ -1588,7 +1649,24 @@ def _normalize_mode(entry: dict) -> dict:
     }
     for k, v in defaults.items():
         entry.setdefault(k, v)
+    whisper_model = str(entry.get("whisper_model") or "").strip()
+    if not whisper_model or (
+        entry.get("id") in _BUILTIN_MODE_IDS and whisper_model == _LEGACY_SEEDED_WHISPER_MODEL
+    ):
+        whisper_model = config.DEFAULT_MODEL
+    entry["whisper_model"] = whisper_model
     return entry
+
+
+def _serialize_modes(modes: list[dict]) -> bytes:
+    """Persist modes; a model equal to the current default is stored as inherit."""
+    out = []
+    for m in modes:
+        m = dict(m)
+        if m.get("whisper_model") == config.DEFAULT_MODEL:
+            m["whisper_model"] = ""
+        out.append(m)
+    return _serialize_config(out)
 
 
 def load_modes() -> list[dict]:
@@ -1600,7 +1678,7 @@ def load_modes() -> list[dict]:
         try:
             mtime = config.MODES_FILE.stat().st_mtime
         except FileNotFoundError:
-            return [dict(m) for m in DEFAULT_MODES]
+            return [_normalize_mode(dict(m)) for m in DEFAULT_MODES]
 
     with modes_lock:
         if _modes_cache["data"] and _modes_cache["mtime"] == mtime:
@@ -1611,7 +1689,7 @@ def load_modes() -> list[dict]:
             modes = [_normalize_mode(dict(m)) for m in parsed if isinstance(m, dict) and m.get("id")]
             if not modes:
                 log.warning(f"{config.MODES_FILE} is empty or contained no valid modes; falling back to defaults")
-                modes = [dict(m) for m in DEFAULT_MODES]
+                modes = [_normalize_mode(dict(m)) for m in DEFAULT_MODES]
             else:
                 # Upgrade path: surface newly shipped built-in modes that a
                 # pre-existing modes file predates, without clobbering the
@@ -1627,7 +1705,7 @@ def load_modes() -> list[dict]:
                     modes.extend(_normalize_mode(dict(d)) for d in added)
         except Exception as e:
             log.warning(f"Failed to parse {config.MODES_FILE}: {e} — falling back to defaults")
-            modes = [dict(m) for m in DEFAULT_MODES]
+            modes = [_normalize_mode(dict(m)) for m in DEFAULT_MODES]
         _modes_cache["data"] = modes
         _modes_cache["mtime"] = mtime
         return modes
@@ -1666,12 +1744,15 @@ def resolve_mode(rp: int | None = None, mode_id: str | None = None) -> dict:
     return _normalize_mode({"id": target_id, "label": target_id, "pipeline": ["whisper"]})
 
 
-# Pipeline steps that actually call an LLM to rewrite the text. A mode without
-# one of these cannot reformat anything, so /reformat must say so instead of
-# returning the input unchanged as a success.
-FORMATTER_PIPELINE_STEPS = frozenset(
+# Pipeline steps whose model a formatter pin selects.
+PINNABLE_FORMATTER_STEPS = frozenset(
     {"grammar_clean", "rp_format", "rp_enhance", "persona_pov"}
 )
+# Every pipeline step that sends text to an LLM and rewrites it. A mode without
+# one of these cannot reformat anything, so /reformat must say so instead of
+# returning the input unchanged as a success. `disfluency_clean` is a provider
+# step too (cleanup chain), even though a formatter pin does not apply to it.
+FORMATTER_PIPELINE_STEPS = PINNABLE_FORMATTER_STEPS | {"disfluency_clean"}
 
 
 def mode_has_formatter_step(mode: dict) -> bool:
@@ -1729,18 +1810,19 @@ def _normalize_vocab_entry(entry: dict) -> dict | None:
 
 
 def load_vocab() -> list[dict]:
-    """Load vocab with mtime-based cache. Returns list of normalized entries."""
+    """Load vocab cached by (mtime_ns, size); an empty list is a valid hit."""
     try:
-        mtime = config.VOCAB_FILE.stat().st_mtime
+        st = config.VOCAB_FILE.stat()
     except FileNotFoundError:
         _ensure_default_vocab()
         try:
-            mtime = config.VOCAB_FILE.stat().st_mtime
+            st = config.VOCAB_FILE.stat()
         except FileNotFoundError:
             return []
+    mtime = (st.st_mtime_ns, st.st_size)
 
     with vocab_lock:
-        if _vocab_cache["data"] and _vocab_cache["mtime"] == mtime:
+        if _vocab_cache["mtime"] == mtime:
             return _vocab_cache["data"]
         try:
             raw = config.VOCAB_FILE.read_bytes()
@@ -1795,13 +1877,13 @@ def save_mode_formatter(mode_id: str, model: str) -> dict:
         found = next((m for m in modes if m.get("id") == mode_id), None)
         if found is None:
             raise ValueError(f"unknown mode '{mode_id}'")
-        if not mode_has_formatter_step(found):
+        if not any(step in PINNABLE_FORMATTER_STEPS for step in found.get("pipeline", [])):
             raise ValueError(
                 f"mode '{mode_id}' has no formatter step, so a model pin would never apply"
             )
         found["formatter_model"] = model
         try:
-            _atomic_write(config.MODES_FILE, _serialize_config(modes))
+            _atomic_write(config.MODES_FILE, _serialize_modes(modes))
         except Exception as e:
             log.warning(f"Failed to write {config.MODES_FILE}: {e}")
             raise ValueError(f"could not persist mode formatter: {e}") from e
@@ -1936,7 +2018,7 @@ voice_macros_lock = threading.Lock()
 # `_handle_transcribe` (via `resolve_ooc_override`) so it can flip the mode
 # to grammar_clean before the pipeline runs.
 OOC_PREFIX_RE = re.compile(
-    r"^\s*(?:OOC|out[\s\-]of[\s\-]character)[\s:.]+",
+    r"^\s*(?:OOC|out[\s\-]of[\s\-]character)[\s:.,]+",
     re.IGNORECASE,
 )
 
@@ -1959,31 +2041,47 @@ def resolve_ooc_override(raw_text: str, mode: dict) -> tuple[str, dict, bool]:
     return raw_text[m.end():].strip(), ooc_mode, True
 
 
+# Whisper punctuates spoken commands ("Computer, swipe, left."), so words of a
+# sentinel or phrase may be separated by any run of spaces/punctuation.
+_COMMAND_SEP = r"[\s,.;:!?\-]+"
+
+
+def _normalize_command_phrase(phrase: str) -> str:
+    """Lowercase words only: `Swipe, left` and `swipe left` compare equal."""
+    return " ".join(re.findall(r"[\w']+", phrase.lower()))
+
+
+def _command_words_pattern(phrase: str) -> str:
+    return _COMMAND_SEP.join(re.escape(w) for w in phrase.split())
+
+
 def _build_voice_macros_regex(sentinel: str, intents: list[dict]) -> re.Pattern:
     """Compile a sentinel + alternation regex from intent definitions.
 
-    Returns a regex with two capture groups: (1) the matched phrase
-    (lowercase-comparable) and (2) the original (untouched) text after
-    the sentinel boundary, used for trailing-residual capture.
+    Group 1 is the matched phrase as spoken (punctuation included); compare
+    it via `_normalize_command_phrase`. Everything after `m.end()` is the
+    residual.
     """
-    sentinel_alts = [re.escape(sentinel.strip())]
-    sentinel_alts.append(re.escape(f"hey {sentinel.strip()}"))
-    sentinel_pat = "(?:" + "|".join(sentinel_alts) + ")"
+    sentinel = sentinel.strip()
+    sentinel_pat = (
+        "(?:" + _command_words_pattern(f"hey {sentinel}") + "|"
+        + _command_words_pattern(sentinel) + ")"
+    )
 
-    # Sort longest first so multi-word phrases match before their
-    # single-word prefixes (e.g. "swipe right" before "swipe").
+    # Most words first, then longest, so multi-word phrases match before
+    # their single-word prefixes (e.g. "swipe right" before "swipe").
     all_phrases: list[str] = []
     for entry in intents:
         for p in entry.get("phrase", []) or []:
             if isinstance(p, str) and p.strip():
                 all_phrases.append(p.strip())
-    all_phrases.sort(key=lambda p: -len(p))
+    all_phrases.sort(key=lambda p: (-len(p.split()), -len(p)))
     if not all_phrases:
         all_phrases = ["send"]
-    phrase_alts = "|".join(re.escape(p) for p in all_phrases)
+    phrase_alts = "|".join(_command_words_pattern(p) for p in all_phrases)
 
     return re.compile(
-        rf"^\s*{sentinel_pat}[\s,:.]+({phrase_alts})\b",
+        rf"^\s*{sentinel_pat}{_COMMAND_SEP}({phrase_alts})\b",
         re.IGNORECASE,
     )
 
@@ -2086,6 +2184,12 @@ def command_dispatch(text: str) -> tuple[str, dict | None]:
         Empty string for pure-command utterances. Falls through to the
         rest of the pipeline as content for `append` / `replace` etc.
 
+    Pure intents (send, swipe, delete, …) discard the residual, so they only
+    match when the whole utterance is the command (sentinel + phrase +
+    optional punctuation). "Computer, send me the files" is ordinary
+    dictation, not a Send click. Entries with `args_after` consume the
+    residual as an argument and so may carry one.
+
     Sentinel + grammar are user-customisable via config.VOICE_MACROS_FILE;
     `load_voice_macros` always compiles the effective regex (defaults when no
     override exists, see Agent 3 §3).
@@ -2097,36 +2201,32 @@ def command_dispatch(text: str) -> tuple[str, dict | None]:
     m = rx.match(text)
     if not m:
         return text, None
-    matched_phrase = m.group(1).strip().lower()
-    residual = text[m.end():].strip()
-    # Strip trailing punctuation/whitespace that whisper appends to a
-    # short utterance (e.g. "Computer, send.") — leave content intact when
-    # there is real text after a sentence break.
-    residual = re.sub(r"^[\s,.;:!?]+", "", residual)
-    residual = re.sub(r"^[\s,.;:!?]+$", "", residual)
+    matched_phrase = _normalize_command_phrase(m.group(1))
+    # Leading separators and a punctuation-only tail ("Computer, send.") are
+    # not content; a hyphen/minus attached to a word or number ("-5") is.
+    residual = re.sub(r"^(?:[\s,.;:!?]|-(?!\w))+", "", text[m.end():].strip())
 
     # Resolve intent + static args by matching against the configured table.
     intents = cfg.get("intents") or DEFAULT_VOICE_INTENTS
     chosen: dict | None = None
     for entry in intents:
-        phrases_lc = [p.lower() for p in entry.get("phrase", [])]
-        # Compare against the longest matching phrase the regex captured.
-        # Regex alternation prefers earlier alternatives; we pre-sorted by
-        # length when building the pattern, so an exact lookup suffices.
-        if matched_phrase in phrases_lc:
+        if matched_phrase in {_normalize_command_phrase(p) for p in entry.get("phrase", [])}:
             chosen = entry
             break
     if chosen is None:
         # Fallback: use the matched phrase itself as the intent name.
         chosen = {"intent": matched_phrase.replace(" ", "_"), "args": {}}
+    intent = chosen.get("intent", matched_phrase.replace(" ", "_"))
 
     args: dict = dict(chosen.get("args") or {})
     if chosen.get("args_after") and residual:
         args[chosen["args_after"]] = residual
         residual = ""
+    elif intent in PURE_COMMAND_INTENTS and residual:
+        return text, None
 
     cmd = {
-        "intent": chosen.get("intent", matched_phrase.replace(" ", "_")),
+        "intent": intent,
         "args": args,
         "source_text": text,
         "phrase": matched_phrase,
@@ -2271,10 +2371,16 @@ def compute_low_confidence_spans(
         if not isinstance(entry, dict):
             continue
         word = str(entry.get("word", "")).strip()
-        if not word:
-            continue
         # Strip whisper's leading-space convention before length-gating.
         clean_word = word.strip(" \t\n.,;:!?'\"")
+        if not clean_word:
+            continue
+        # Align EVERY word (not only flagged ones) so the cursor tracks the
+        # transcript and a repeated word anchors to its own occurrence.
+        word_re = re.compile(r"(?<!\w)" + re.escape(clean_word.lower()) + r"(?!\w)")
+        located = word_re.search(text_lower, cursor)
+        if located:
+            cursor = located.end()
         if len(clean_word) < config.WORD_CONFIDENCE_MIN_LEN:
             continue
         logprob = entry.get("logprob")
@@ -2282,7 +2388,6 @@ def compute_low_confidence_spans(
             confidence = float(entry.get("confidence", 0.0) or 0.0)
             if confidence <= 0.0:
                 continue
-            import math
             logprob = math.log(confidence)
         try:
             logprob = float(logprob)
@@ -2290,17 +2395,13 @@ def compute_low_confidence_spans(
             continue
         if logprob >= thr:
             continue
-        # Locate the word in `text` from the running cursor; fall back to
-        # absolute search if the cursored attempt misses (vocab rewrites
-        # can shift offsets between whisper's output and `text`).
-        idx = text_lower.find(clean_word.lower(), cursor)
-        if idx < 0:
-            idx = text_lower.find(clean_word.lower())
-        start_idx = idx
-        end_idx = idx + len(clean_word) if idx >= 0 else -1
-        if idx >= 0:
-            cursor = end_idx
-        alternatives = []
+        # Vocab rewrites can shift offsets between whisper's output and
+        # `text`; fall back to an absolute search when the cursor missed.
+        if located is None:
+            located = word_re.search(text_lower)
+        start_idx = located.start() if located else -1
+        end_idx = located.end() if located else -1
+        alternatives: list[str] = []
         if vocab_forms:
             alternatives = difflib.get_close_matches(
                 clean_word, vocab_forms, n=3, cutoff=0.5,
@@ -2368,8 +2469,8 @@ def build_whisper_prompt(character_id: str = "") -> str:
 # ─── Phase 2: Pipeline runner ────────────────────────────
 def _build_persona_pov_prompt(persona: dict, character: dict, chat_context: str,
                               scene_continuity: str = "",
-                              scene_contract: dict | None = None) -> tuple[str, str]:
-    """Build the (system_prompt, user_content) pair for persona_pov mode."""
+                              scene_contract: dict | None = None) -> str:
+    """Build the system prompt for persona_pov mode."""
     persona_name = persona.get("name", "the persona")
     character_name = character.get("name", "the character")
 
@@ -2409,8 +2510,7 @@ def _build_persona_pov_prompt(persona: dict, character: dict, chat_context: str,
         "Keep the persona's cadence, but stay close to the dictated words. "
         "Do not add extra actions, reactions, or new scene detail."
     )
-    system_prompt = "\n\n".join(sections)
-    return system_prompt, ""
+    return "\n\n".join(sections)
 
 
 def build_repair_trace(raw: str, cleaned: str = "", final: str = "") -> dict:
@@ -2453,18 +2553,30 @@ def run_pipeline(text: str, mode: dict,
                  prose_format: bool = False,
                  formatter_model: str = "",
                  request_id: str = "",
-                 timing: dict | None = None) -> tuple[str, bool, str, str]:
+                 timing: dict | None = None,
+                 chat_id: str = "",
+                 reformat: bool = False) -> tuple[str, bool, str, str]:
     """Run the pipeline steps of `mode` over `text`.
 
     Returns (text, skipped, reason, cleaned_text).
     `skipped` signals that the LLM-polish stage did not happen (frontend shows toast);
-    vocab_correct and disfluency_clean are pre-processors and do not count as "skipping".
+    vocab_correct and disfluency_clean are pre-processors and do not count as "skipping"
+    unless cleanup is the mode's only provider step.
     `cleaned_text` is the post-disfluency-clean intermediate (empty string if cleanup
     was not part of the pipeline, skipped, or passed through unchanged).
 
+    Mode flags gate every prompt input: `use_persona`, `use_character` and
+    `use_chat_context` (chat history, last AI message, session transcript,
+    scene continuity) apply to all formatter steps and to the scene contract.
+    `chat_id` scopes the session transcript to that chat and must match the
+    ST state for state facts to enter the scene contract. `reformat=True`
+    re-runs text the user already saw, so `hallucination_filter` and
+    `command_dispatch` are skipped.
+
     `timing` (POL-16): if provided, after each step we set
-    `timing[f"step_{step}"] = time.monotonic()`. Caller post-processes the dict
-    into a single JSON log line. Pure side-channel; never affects pipeline output.
+    `timing[f"step_{step}"] = time.monotonic()`, plus `ttft` at the first
+    streamed token. Caller post-processes the dict into a single JSON log
+    line. Pure side-channel; never affects pipeline output.
 
     `request_id` (MVP-13 + MVP-16): when non-empty, we additionally broadcast
     `dictation-state` SSE events at every step boundary. The ST extension
@@ -2504,6 +2616,8 @@ def run_pipeline(text: str, mode: dict,
     reset_model_attribution()
 
     pipeline = [step for step in mode.get("pipeline", []) if step != "whisper"]
+    if reformat:
+        pipeline = [s for s in pipeline if s not in ("hallucination_filter", "command_dispatch")]
     if not pipeline:
         # Plain mode — no pipeline transitions to broadcast.
         return text, False, "", ""
@@ -2512,15 +2626,36 @@ def run_pipeline(text: str, mode: dict,
     # Per-mode LLM pin (if any) resolves here, before any step runs, so every
     # formatter step in this pipeline targets the same model.
     formatter_model = resolve_formatter_model(mode, formatter_model)
-    if scene_contract is None:
+
+    # Resolve the allowed prompt inputs once; every step below uses these.
+    use_persona = bool(mode.get("use_persona"))
+    use_character = bool(mode.get("use_character"))
+    use_chat = bool(mode.get("use_chat_context"))
+    persona_in = persona_id if use_persona and persona_id != "none" else ""
+    character_in = character_id if use_character and character_id != "none" else ""
+    context_in = context if use_chat else ""
+    chat_context_in = chat_context if use_chat else ""
+    continuity_in = scene_continuity if use_chat else ""
+    transcript_chat_id = chat_id if use_chat else None
+
+    if scene_contract is None and any(s in ("rp_enhance", "persona_pov") for s in pipeline):
+        state = request_scene_state(character_id, chat_id)
+        drop: set[str] = set()
+        if not use_persona:
+            drop.add("personaId")
+        if not use_character:
+            drop.update({"characterId", "characterName", "groupMembers", "lastSpeaker"})
+        if not use_chat:
+            drop.update({"sceneContinuity", "lastSpeaker"})
         scene_contract = build_scene_contract(
-            snapshot_state(),
-            persona_id=persona_id,
-            character_id=character_id,
-            chat_context=chat_context,
-            scene_continuity=scene_continuity,
+            {k: v for k, v in state.items() if k not in drop},
+            persona_id=persona_in,
+            character_id=character_in,
+            chat_context=chat_context_in,
+            scene_continuity=continuity_in,
         )
     cleaned_text = ""
+    cleanup_failure = ""
     formatting_skipped = False
     formatting_reason = ""
 
@@ -2531,7 +2666,7 @@ def run_pipeline(text: str, mode: dict,
             if timing is not None:
                 timing[f"step_{step}"] = time.monotonic()
             if was_dropped:
-                log.info("hallucination_filter: dropped utterance — %s", reason)
+                log.info("hallucination_filter: dropped utterance (%d chars)", len(text))
                 # Short-circuit: empty text signals the frontend to no-op.
                 return "", False, f"hallucination filter dropped: {reason}", ""
             continue
@@ -2557,8 +2692,8 @@ def run_pipeline(text: str, mode: dict,
                 })
             except Exception as _e:  # pragma: no cover — best-effort SSE
                 log.debug("dictation-command emit failed: %s", _e)
-            log.info("command_dispatch: intent=%s residual=%r",
-                     cmd["intent"], residual[:60])
+            log.info("command_dispatch: intent=%s residual_len=%d",
+                     cmd["intent"], len(residual))
             if cmd["intent"] in PURE_COMMAND_INTENTS:
                 # Pure command — drop the text; downstream pipeline is bypassed.
                 # Frontends consume the SSE event for the actual UI action.
@@ -2581,6 +2716,8 @@ def run_pipeline(text: str, mode: dict,
             if was_cleaned and cleaned != out:
                 cleaned_text = cleaned
                 out = cleaned
+            if not was_cleaned:
+                cleanup_failure = reason
             if timing is not None:
                 timing[f"step_{step}"] = time.monotonic()
             # Non-blocking: failures here never abort the pipeline; just pass through.
@@ -2597,6 +2734,7 @@ def run_pipeline(text: str, mode: dict,
                 user_content_override=user_content,
                 temperature=mode.get("temperature"),
                 model_override=formatter_model,
+                cleanup_chain=True,  # cheap chain unless a model is pinned
             )
             if skipped:
                 formatting_skipped = True
@@ -2608,14 +2746,9 @@ def run_pipeline(text: str, mode: dict,
         if step == "rp_format":
             system = mode.get("system_prompt") or ""
             out, skipped, reason = format_rp(
-                out, mode=1, context=context,
-                persona_id=persona_id if mode.get("use_persona") else "",
+                out, mode=1, context=context_in,
                 use_rules=use_rules,
                 prose_format=prose_format,
-                character_id=character_id if mode.get("use_character") else "",
-                chat_context=chat_context if mode.get("use_chat_context") else "",
-                scene_continuity=scene_continuity,
-                scene_contract=scene_contract,
                 system_prompt_override=system,
                 temperature=mode.get("temperature"),
                 model_override=formatter_model,
@@ -2630,18 +2763,20 @@ def run_pipeline(text: str, mode: dict,
         if step == "rp_enhance":
             system = mode.get("system_prompt") or ""
             out, skipped, reason = format_rp(
-                out, mode=2, context=context,
-                persona_id=persona_id if mode.get("use_persona") else "",
+                out, mode=2, context=context_in,
+                persona_id=persona_in,
                 use_rules=use_rules or bool(mode.get("use_rules")),
                 prose_format=prose_format,
-                character_id=character_id if mode.get("use_character") else "",
-                chat_context=chat_context if mode.get("use_chat_context") else "",
-                scene_continuity=scene_continuity,
+                character_id=character_in,
+                chat_context=chat_context_in,
+                scene_continuity=continuity_in,
                 scene_contract=scene_contract,
                 system_prompt_override=system,
                 temperature=mode.get("temperature"),
                 request_id=request_id,  # MVP-13 — stream deltas via SSE
                 model_override=formatter_model,
+                transcript_chat_id=transcript_chat_id,
+                timing=timing,
             )
             if skipped:
                 formatting_skipped = True
@@ -2651,39 +2786,42 @@ def run_pipeline(text: str, mode: dict,
             continue
 
         if step == "persona_pov":
-            # Requires both persona + character; otherwise fall back to rp_enhance.
-            persona = load_persona_full(persona_id) if persona_id and persona_id != "none" else {}
-            char_card_text = build_character_context(character_id) if character_id and character_id != "none" else ""
-            card = load_character_card(character_id) if character_id and character_id != "none" else {}
-            char_name = card.get("name", character_id) if card else character_id
+            # Needs a persona and a character card, each allowed by the mode
+            # flags; otherwise the step is an RP+ rewrite under the same flags.
+            persona = load_persona_full(persona_in) if persona_in else {}
+            card = load_character_card(character_in) if character_in else {}
+            if card.get("error"):
+                card = {}
+            char_card_text = character_context_from_card(card, character_in) if card else ""
             if not persona or not char_card_text:
                 log.info("persona_pov missing persona or character — falling back to rp_enhance")
                 out, skipped, reason = format_rp(
-                    out, mode=2, context=context,
-                    persona_id=persona_id, use_rules=use_rules,
+                    out, mode=2, context=context_in,
+                    persona_id=persona_in, use_rules=use_rules,
                     prose_format=prose_format,
-                    character_id=character_id,
-                    chat_context=chat_context,
-                    scene_continuity=scene_continuity,
+                    character_id=character_in,
+                    chat_context=chat_context_in,
+                    scene_continuity=continuity_in,
                     scene_contract=scene_contract,
                     temperature=mode.get("temperature"),
                     request_id=request_id,  # MVP-13
                     model_override=formatter_model,
+                    transcript_chat_id=transcript_chat_id,
+                    timing=timing,
                 )
-                fb_reason = "persona_pov requires both persona and character; fell back to rp_enhance"
                 if skipped:
                     formatting_skipped = True
-                    formatting_reason = fb_reason + f"; {reason}"
-                else:
-                    formatting_skipped = True  # signal the fallback happened
-                    formatting_reason = fb_reason
+                    formatting_reason = (
+                        "persona_pov requires both persona and character; "
+                        f"fell back to rp_enhance; {reason}"
+                    )
                 if timing is not None:
                     timing[f"step_{step}"] = time.monotonic()
                 continue
 
-            character = {"name": char_name, "card": char_card_text}
-            system_prompt, _unused_user_override = _build_persona_pov_prompt(
-                persona, character, chat_context, scene_continuity, scene_contract,
+            character = {"name": card.get("name") or character_in, "card": char_card_text}
+            system_prompt = _build_persona_pov_prompt(
+                persona, character, chat_context_in, continuity_in, scene_contract,
             )
             user_content = f"The dictated line:\n{out}"
             out, skipped, reason = format_rp(
@@ -2694,6 +2832,7 @@ def run_pipeline(text: str, mode: dict,
                 temperature=mode.get("temperature"),
                 request_id=request_id,  # MVP-13
                 model_override=formatter_model,
+                timing=timing,
             )
             if skipped:
                 formatting_skipped = True
@@ -2704,4 +2843,8 @@ def run_pipeline(text: str, mode: dict,
 
         log.warning(f"Unknown pipeline step '{step}' — skipping")
 
+    # Cleanup as the mode's only provider step: its failure is the mode's failure.
+    if cleanup_failure and not any(s in PINNABLE_FORMATTER_STEPS for s in pipeline):
+        formatting_skipped = True
+        formatting_reason = cleanup_failure
     return out, formatting_skipped, formatting_reason, cleaned_text

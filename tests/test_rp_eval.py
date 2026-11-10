@@ -1,23 +1,16 @@
 from __future__ import annotations
 
-import importlib.util
 import json
 import pathlib
-import sys
-from importlib.machinery import SourceFileLoader
+
+from conftest import load_script
 
 SRC = pathlib.Path(__file__).resolve().parents[1] / "server" / "rp_eval.py"
 FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures" / "rp_eval" / "cases.json"
 
 
 def load_mod():
-    loader = SourceFileLoader("rp_eval", str(SRC))
-    spec = importlib.util.spec_from_loader("rp_eval", loader)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["rp_eval"] = module
-    spec.loader.exec_module(module)
-    return module
+    return load_script(SRC, "rp_eval")
 
 
 def test_rp_eval_passes_clean_synthetic_case():
