@@ -1,43 +1,44 @@
 # Dictation Bridge
 
-A SillyTavern extension that wires the self-hosted dictation server
-(`~/.local/bin/dictation-server`, HTTPS on port 8384) directly into ST's
-chat input, replacing the current copy-paste workflow.
+A SillyTavern extension that wires the self-hosted Calliope dictation server
+(HTTPS, port 8384 by default) into ST's chat input, replacing the
+copy-paste workflow.
 
 ## What it does
 
-Tapping a mic button in the chat send bar opens the dictation server's web
-UI (popup window by default, modal iframe optional) with the active chat,
-persona, and character IDs passed as query parameters. The server uses
-those IDs to pull live ST context and format the dictated line in-persona.
-When dictation completes, the server now has two delivery paths:
+The mic button in the chat send bar has three modes (Extensions → Dictation
+Bridge → **Microphone action**):
 
-- primary live path: `dictation-result` over `/events` SSE, which lets the
-  extension write directly into `#send_textarea` even when the phone page is
-  standalone; and
-- embed fallback: `window.postMessage` from the popup/iframe to this extension.
+- **Phone popup** (default) — opens the Calliope phone page in a popup window
+  (or a modal iframe on desktop) paired to this ST tab with a one-time code.
+- **Desktop push-to-talk** — hold the mic (pointer, or Space/Enter while it is
+  focused) to record in this browser; release to transcribe.
+- **Desktop toggle** — click to start, click again to stop.
 
-Both paths can optionally fire the Send button automatically.
+Desktop capture records with `MediaRecorder` in the first container the
+browser supports (`audio/webm;codecs=opus`, `audio/mp4`, `audio/ogg;codecs=opus`)
+and uploads it once to `POST /transcribe`; the server converts it with ffmpeg.
+Audio lives only in memory and in that request body, and recording stops
+after 60 seconds. Capture start also sends a fire-and-forget `POST /warm` so
+whisper can boot while you speak.
 
-This closes the loop on the primary dictation flow: dictate on the phone
-at `https://<pc-ip>:8384`, format/enhance in-persona on the PC, land in ST
-with one click — no clipboard round-trip.
+Finished text reaches ST in exactly one way: the authenticated `/events`
+Server-Sent Events stream (`dictation-result`), plus the `/transcribe`
+response for desktop captures. Both go through the same per-request dedupe
+and cross-tab ownership, so a dictation is inserted once. Formatter output can
+stream into the textarea as it is generated (`dictation-token`); the final
+result replaces the streamed text.
 
 ## Install
 
-Third-party extensions live under SillyTavern's user extension tree. The
-current deployment target is:
+Third-party extensions live under SillyTavern's user extension tree:
 
 ```
 <ST-root>/data/default-user/extensions/third-party/dictation-bridge/
 ```
 
-Symlink or copy this `extension/` directory there, then hard-refresh
-SillyTavern. Avoid tokenized URLs in screenshots or docs.
-
-After the files are in place, reload SillyTavern (hard refresh the page).
-The extension will load automatically; no install flow is needed because
-the directory is already inside ST's extensions tree.
+Symlink or copy this `extension/` directory there and hard-refresh
+SillyTavern. A symlink means every edit here goes live on the next refresh.
 
 ## Configuration
 
@@ -45,113 +46,116 @@ All settings live under ST's Extensions drawer → "Dictation Bridge":
 
 | Setting | Default | Meaning |
 |---|---|---|
-| Server URL | `https://<current ST host>:8384` | Dictation server URL. Defaults to the same hostname used for SillyTavern, with port `8384`, so LAN/mobile ST sessions follow IP changes automatically. |
-| Server bearer token | blank | Paste the server token from `~/.local/share/dictation-server/token`; the status chip distinguishes missing, valid, invalid/stale, and unknown tokens. |
-| Re-pair this phone / Copy pairing URL / Show local QR | n/a | Opens, copies, or renders a fresh tokenized phone URL for the active ST chat/persona/character. The QR is generated locally in the browser with the vendored Nayuki MIT library; hide clears the canvas and removes the URL node. Treat it like a password. |
-| Open style | Popup | Popup spawns a small window next to the chat; iframe overlays a modal inside ST. Popup is recommended for the phone workflow since you're typically holding the phone separately. |
-| Text handling | Replace | `Replace` overwrites the current textarea, `Append` adds to whatever's already there. |
-| Auto-send after dictation | off | If on, the formatted result both fills the textarea and clicks the Send button. |
-| Push last AI message as tonal context | on | On `dictation-ready`, posts the most recent non-user message back to the server so the LLM formatter has tone to lean on. |
-| Live mirror edits from server | off | Experimental — if the server sends `dictation-edit` on every keystroke, the textarea updates live. Currently off by default to avoid churn. |
+| Server URL | `https://<current ST host>:8384` | Defaults to the hostname ST is opened on, so LAN/Tailscale sessions follow automatically. Changing it reconnects SSE and reloads the mode, model and voice lists. |
+| Server bearer token | blank | Paste the server token (`~/.local/share/dictation-server/token` on the server). Status shows missing / valid / rejected (401) / unreachable separately. Changing it reconnects and reloads the lists. |
+| Re-pair this phone / Copy pairing URL / Show local QR | n/a | Asks the server for a one-time pairing code (`POST /pair/bootstrap`) and opens, copies or renders a phone URL carrying `?pair=<code>`. The phone exchanges the code once (`POST /pair/exchange`); it expires after two minutes. The QR is drawn locally with the vendored Nayuki library; Hide clears the canvas. |
+| Open style | Popup | Popup window or (desktop only) modal iframe for the phone page. |
+| Microphone action | Phone popup | See above. The quick-launch "Dictation" button opens the phone page in phone mode and starts/stops a recording in both desktop modes. |
+| Text handling | Replace | `Replace` overwrites the message box, `Append` adds below the existing text. |
+| Auto-send after dictation | off | Click Send after inserting the result. |
+| Push last AI message as tonal context | on | Desktop capture sends the last AI message (≤4,000 chars) in the `X-Dictation-Context` header; the phone page receives it via `dictation-set-context`. |
+| Live mirror edits | off | Mirror `dictation-edit` messages from an embedded phone page into the textarea. |
+| Broadcast ST state | on | `POST /state` on chat/character/persona changes, on focus/visibility, and a 30 s heartbeat sent only by the visible tab you used last. The last AI message is capped at 4,000 chars. A rejected update is reported (diagnostics, and a warning when launching the phone page). |
+| Receive dictation via SSE | on | Subscribe to `/events`. The server pings every 15 s; after 45 s of silence the status shows *stale* and the extension reconnects. |
+| Voice commands | on | Act on `dictation-command` events (send, undo, clear, read last, …). |
+| Formatter mode (per character) | server default | Remembered per character through `/state/mode-memory`; desktop capture uses the mode of the character that was active when recording started. Disabled while the new character's mode loads. |
+| Global model override / Model assigned to a mode | Auto | Sticky OmniRoute model override, and per-mode pins saved server-side. |
 
-### Phone workflow
+### Multiple tabs and chat switches
 
-From the phone browser, open a fresh paired page from the ST mic button or
-from Extensions → Dictation Bridge → **Re-pair this phone**. **Show local QR**
-renders the same tokenized URL to a Canvas in the ST settings panel without a
-server round-trip, CDN, or third-party QR service. **Copy pairing URL** remains
-the fallback when QR rendering or scanning is unavailable. The server scrubs
-`?token=` from browser history after load, but copied/scanned pairing URLs and
-QR screenshots should be treated like passwords. Standalone phone pages receive
-results back to ST via SSE; embed mode additionally uses `postMessage` as a
-local fallback.
+Every open ST tab receives the same events. Tabs arbitrate per request with
+Web Locks (localStorage fallback); only opaque request IDs and timestamps
+cross tabs. The tab that wins a streamed request holds a lock until its final
+result is handled. Other tabs, including tabs opened mid-stream, wait for
+that lock and only deliver the result if the owning tab closed without
+delivering it.
+
+Switching chats cancels a desktop recording or upload, removes partially
+streamed text without restoring the previous chat's draft, and drops any
+result, queued result, voice command or undo snapshot that belongs to the
+previous chat. A request is tied to the chat generation that was open when
+this tab first saw it (or, for desktop captures, when recording started), so
+work begun in one chat does not land in the next. A phone result that this
+tab first sees after a switch carries no originating chat id and is inserted
+into whichever chat is open at that moment.
 
 ### Self-signed cert
 
-The server ships its own self-signed cert. Before the mic button will
-work, visit the server URL once in a regular browser tab on the same
-machine as SillyTavern and accept the cert warning. The extension does a
-`/health` probe before opening the UI and shows a toast if the probe
-fails (cert rejection or server down).
+Visit the server URL once in a normal tab on the same browser profile and
+accept the certificate. The extension probes `/health` (8 s timeout) before
+opening the phone page and explains whether the server is unreachable or the
+token was rejected.
 
-## Limitations / known issues
+## Security notes
 
-- **Pairing state** — a page can be token-valid but not following the current SillyTavern chat if it was opened from an old bookmark/tab. Open from the refreshed ST mic button when the phone says stale/not paired.
-- **Multiple SillyTavern tabs** — every open tab receives the same server events, so tabs arbitrate per request (Web Locks, with a BroadcastChannel/localStorage fallback that only shares opaque request IDs). The tab that wins a streamed request is the only one that clears its textarea, paints streamed tokens, and applies the final result; other tabs leave their draft untouched. If a stream stalls for 45 s or the SSE connection drops, the owning tab restores its pre-stream text. One "undo" after a dictation restores the pre-dictation text; the undo history is cleared on chat switch.
-- **Self-signed cert** — one-time trust prompt on every browser profile.
-  Some browsers will silently block cross-origin `fetch` to an untrusted
-  cert; the probe will fail cleanly and instruct the user.
-- **Popup blockers** — if popups are blocked for SillyTavern, either
-  allow them or switch Open style to "iframe".
-- **Mixed content** — the server is HTTPS, so ST at `http://` would
-  normally be fine. If ST is behind HTTPS with strict CSP, the iframe
-  may be blocked; the popup window bypasses page-level CSP.
-- **Grouped chats** — current builds send group id, members, and last speaker; use the addressee picker when you need a specific group member voice. Server-side synthetic regression tests cover the group payload shape; use the manual smoke checklist in `../docs/troubleshooting.md` for live ST validation without exposing private chat text.
-- **Third-party loading** — if ST's extension loader doesn't find the
-  `third-party/` subdirectory convention, move the folder one level up
-  into `extensions/` and reload.
+- The bearer token is stored in ST's extension settings and shown in a
+  password field. Every other ST extension runs in the same origin and can
+  read it; only install extensions you trust.
+- `EventSource` cannot send headers, so the SSE connection carries the token
+  as a `?token=` query parameter. Keep the server's request logging free of
+  query strings and do not share `/events` URLs.
+- Pairing URLs carry a short-lived one-time code, not the token; still treat
+  copied URLs and QR screenshots as private until they expire.
+- The embed `postMessage` handler only accepts messages whose origin is the
+  configured server and whose source is the window this extension opened.
+  Canonical dictation results arrive only over SSE or the desktop
+  `/transcribe` response; the embedded phone page's live edits
+  (`dictation-edit`, applied only when Live mirror is on) are the one case
+  where dictated text travels over this origin- and source-checked
+  `postMessage` channel.
+
+The authentication matrix for every endpoint is documented in
+`../PRIVACY.md#authentication`.
 
 ## Development notes
 
-### postMessage contract
+### Embed postMessage contract
 
-Both halves must agree on the message shape. The server emits the
-following to the parent window (this extension):
+Phone page → extension (origin and source checked):
 
 ```js
-// ready to receive context, UI is wired up
-{ type: 'dictation-ready' }
-
-// final formatted result (primary payload)
-{
-  type: 'dictation-result',
-  text: string,              // formatted, in-persona output — this is what lands in ST
-  raw: string,               // optional, original transcript before formatting
-  mode: string,              // optional, mode ID that was used (e.g. 'rp-enhance')
-  formatting_skipped: boolean, // true if RP+ fell back to plain pass-through
-  formatting_reason: string    // optional explanation shown in toast
-}
-
-// live-edit mirror (optional, only acted on when liveMirror is enabled)
-{ type: 'dictation-edit', text: string }
+{ type: 'dictation-ready' }               // page wired up; extension replies with context
+{ type: 'dictation-edit', text: string }  // optional live mirror (liveMirror setting)
 ```
 
-The extension emits back:
+Extension → phone page (target origin = configured server):
 
 ```js
-// tonal context from ST's current chat
 { type: 'dictation-set-context', context: string }
-
-// optional mode switch — not wired to UI yet
 { type: 'dictation-set-mode', mode: string }
 ```
 
-Origin is verified on inbound messages against the configured `serverUrl`
-origin, so pages in other tabs can't inject fake results.
+### Server fields the extension reads
+
+- SSE `dictation-result`: `requestId`, `text`, `mode`, `model`, `model_fallback`,
+  `formatting_skipped`, `formatting_reason`, `is_ooc`, `mode_override`, `auto_send`.
+- `/transcribe` response: the same plus `request_id`, `entry_id`,
+  `raw`/`cleaned`/`repair_trace` and `low_confidence_spans`
+  (`{word, start_idx, end_idx, confidence, logprob, alternatives, text_only?}`).
+  When SSE delivered the text first, the response only adds the confidence
+  chips, repair trace and entry id.
+- `/word-alternatives`: `{alternatives: [{text, score, source}]}`.
+- `/audit/network`: `{totals_60s, recent: [...], warning?}` (`?all=1` for the
+  whole ring buffer).
+- SSE `ping` (liveness) and `dictation-state` (`error` aborts a live stream).
+
+Missing endpoints or fields on older servers are tolerated (`/warm` 404s are
+ignored).
 
 ### Debugging
 
-Open the browser devtools on SillyTavern and filter the console for
-`[dictation-bridge]`. The extension logs:
-
-- `initialized` — at boot
-- `server ready` — when the iframe/popup sends `dictation-ready`
-- `server probe failed` — when `/health` fetch errors
-- `send_textarea not found` / `send_but not found` — if ST's DOM has
-  changed unexpectedly
-
-The server side has its own logging; run the server in a terminal (or
-`journalctl --user -u dictation-server -f`) to watch the embed handshake
-from the other end.
+Filter the browser console for `[dictation-bridge]`. The Diagnostics button
+on the quick-launch card checks `/health`, the token, SSE freshness, the last
+accepted `/state` post, Kokoro and the audit endpoint in parallel, without
+rendering tokens, URLs with codes, chat text or audio.
 
 ### Files
 
 - `manifest.json` — extension manifest (ST loads this first)
-- `index.js` — main logic (ES module, no build step)
-- `qrcodegen.min.js` — vendored Nayuki QR Code generator (MIT), used only for local pairing QR Canvas rendering
-- `style.css` — mic button and modal styling
+- `index.js` — all logic (ES module, no build step)
+- `qrcodegen.min.js` — vendored Nayuki QR Code generator (MIT), used only for local pairing QR rendering
+- `style.css` — mic button, quick-launch card and modal styling
 - `README.md` — this file
 
-The extension has one bundled browser dependency, `qrcodegen.min.js`, documented
-in `../THIRD_PARTY_NOTICES.md`. jQuery is available globally via ST but the
-extension avoids it where vanilla DOM is equivalent.
+The only bundled dependency is `qrcodegen.min.js`, documented in
+`../THIRD_PARTY_NOTICES.md`.

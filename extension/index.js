@@ -1,21 +1,19 @@
 // Dictation Bridge — SillyTavern extension
-// Connects ST's chat input to the self-hosted dictation server at
-// https://<pc-ip>:8384. A mic button in the send bar opens the server UI
-// (popup or modal iframe) with the active chat/persona/character IDs pre-
-// filled, then receives the formatted text via window.postMessage and
-// drops it into #send_textarea.
+// Connects ST's chat input to the self-hosted Calliope dictation server at
+// https://<pc-ip>:8384. The send-bar mic either records natively in this
+// browser (desktop push-to-talk / toggle) or opens the phone UI (popup or
+// modal iframe) with a one-time pairing code. Final text always arrives
+// through the authenticated /events SSE stream (or the desktop /transcribe
+// response) and is dropped into #send_textarea.
 //
-// Matching server-side embed contract (see humble-munching-island.md
-// phase 2e) — both sides must agree:
-//   server -> extension:
+// Embed postMessage contract — both sides must agree:
+//   server page -> extension (origin AND source checked):
 //     { type: 'dictation-ready' }
-//     SSE dictation-transcript { requestId, phase, has_text, source, latency_ms? } // no raw ASR text over SSE
-//     SSE dictation-result { text, has_repair_trace?, mode?, formatting_skipped?, formatting_reason? }
-//     postMessage dictation-ready only; dictation text flows through authed SSE, not iframe parent messaging
 //     { type: 'dictation-edit', text }        // optional live mirror
-//   extension -> server:
+//   extension -> server page:
 //     { type: 'dictation-set-context', context: string }
 //     { type: 'dictation-set-mode', mode: string }
+// Dictation text never travels over postMessage; see the SSE handlers below.
 
 import { eventSource, event_types, name1, this_chid, characters, user_avatar, chat } from '../../../../script.js';
 import { extension_settings, getContext } from '../../../extensions.js';
@@ -87,12 +85,41 @@ function authHeaders() {
     return t ? { 'Authorization': `Bearer ${t}` } : {};
 }
 
+const PROBE_TIMEOUT_MS = 8_000;
+const TTS_FETCH_TIMEOUT_MS = 90_000;
+
+/** fetch with a finite deadline, optionally chained to a caller's abort
+ *  signal. `consume` reads the body inside the same deadline. */
+async function fetchWithTimeout(url, options = {}, timeoutMs = PROBE_TIMEOUT_MS, signal = null, consume = null) {
+    const controller = new AbortController();
+    const onAbort = () => controller.abort();
+    if (signal) {
+        if (signal.aborted) controller.abort();
+        else signal.addEventListener('abort', onAbort, { once: true });
+    }
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const res = await fetch(url, { ...options, signal: controller.signal });
+        return consume ? await consume(res) : res;
+    } finally {
+        clearTimeout(timer);
+        signal?.removeEventListener?.('abort', onAbort);
+    }
+}
+
 // Phase 1: state broadcast.
 // Posts current ST context to <serverUrl>/state so the phone UI can auto-
 // configure without the user re-picking mode/character each time.
 const STATE_HEARTBEAT_MS = 30_000;
 let stateHeartbeatTimer = null;
-let lastStatePayload = null; // for dedupe — avoid firing on duplicate events
+// Server keeps the first 4000 chars; capping here keeps the keepalive body
+// well under the browser's 64 KiB quota.
+const STATE_LAST_AI_MAX_CHARS = 4000;
+const STATE_META_MAX_CHARS = 4000;
+const STATE_OWNER_KEY = 'calliope:state-heartbeat-owner';
+let lastStateSuccess = { key: '', t: 0 }; // dedupe + freshness (accepted posts only)
+let lastStateAttemptAt = 0;
+let lastStateError = '';
 let mobileLifecycleStatePushBound = false;
 
 /** Active connection (popup window or iframe element). */
@@ -103,10 +130,12 @@ let popupWatcher = null;
 
 // Slice B — direct desktop microphone capture. Audio exists only in this
 // in-memory session object and the request body; it is never persisted here.
+// The server normalises every accepted container through ffmpeg.
 const DESKTOP_CAPTURE_MAX_MS = 60_000;
 const DESKTOP_AUDIO_FORMATS = [
-    { mimeType: 'audio/webm;codecs=opus', extension: '.webm' },
-    { mimeType: 'audio/webm', extension: '.webm' },
+    'audio/webm;codecs=opus',
+    'audio/mp4',
+    'audio/ogg;codecs=opus',
 ];
 const DESKTOP_CAPTURE_MODES = new Set(['phone-popup', 'desktop-push-to-talk', 'desktop-toggle']);
 let desktopCapture = null;
@@ -120,20 +149,101 @@ const PENDING_CANONICAL_RESULT_CAP = 16;
 // Cross-tab side-effect ownership. Only opaque server event/request IDs and
 // timestamps cross the tab boundary; transcript text, commands, and tokens do not.
 const TAB_INSTANCE_ID = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
-const incomingClaims = new Map();
 let incomingClaimChannel = null;
 try {
     incomingClaimChannel = new BroadcastChannel('calliope-dictation-claims');
     incomingClaimChannel.addEventListener('message', (event) => {
-        const { type, key, claimant } = event?.data || {};
-        if (!key) return;
-        if (type === 'done') incomingClaims.delete(key);
-        if (type === 'claim' && claimant) {
-            if (!incomingClaims.has(key)) incomingClaims.set(key, new Set());
-            incomingClaims.get(key).add(String(claimant));
-        }
+        const { type, requestId } = event?.data || {};
+        if (type === 'suppress' && requestId) suppressRequestLocally(String(requestId));
     });
 } catch {}
+
+// Chat generation: bumped when the active chat identity changes (not on a
+// same-chat reload). Requests, captures, streams, queued results and undo
+// snapshots remember the generation they began in and never touch the
+// textarea of a later one.
+let chatGeneration = 0;
+// Identity of the chat the current generation belongs to; null = not yet
+// recorded (nothing in flight depends on it).
+let lastChatIdentity = null;
+const REQUEST_REGISTRY_CAP = 64;
+// requestId -> { generation, suppressed }
+const requestRegistry = new Map();
+
+/** Record the generation a request was first seen in (idempotent). */
+function noteRequest(requestId) {
+    const id = String(requestId || '');
+    if (!id) return null;
+    let entry = requestRegistry.get(id);
+    if (entry) return entry;
+    entry = { generation: chatGeneration, suppressed: false };
+    requestRegistry.set(id, entry);
+    while (requestRegistry.size > REQUEST_REGISTRY_CAP) {
+        requestRegistry.delete(requestRegistry.keys().next().value);
+    }
+    return entry;
+}
+
+/** True when a request may still touch this tab's textarea. */
+function requestIsCurrent(requestId) {
+    const id = String(requestId || '');
+    if (!id) return true;
+    const entry = noteRequest(id);
+    return !entry.suppressed && entry.generation === chatGeneration;
+}
+
+function suppressRequestLocally(requestId) {
+    const entry = noteRequest(requestId);
+    if (entry) entry.suppressed = true;
+    const claim = streamOwnership.get(requestId);
+    if (claim) { claim.state = 'dropped'; claim.queue = []; }
+    if (streamingSession?.requestId === requestId) abortStreamingSession();
+    pendingCanonicalResults.splice(0, pendingCanonicalResults.length,
+        ...pendingCanonicalResults.filter(item => item.requestId !== requestId));
+}
+
+/** Cancel a request in every tab: completion markers stop any tab from
+ *  streaming, inserting or dispatching it; the broadcast aborts a live stream. */
+function suppressRequest(requestId) {
+    const id = String(requestId || '');
+    if (!id) return;
+    for (const kind of ['stream', 'result', 'command']) markIncomingHandled(`${kind}:${id}`);
+    try { incomingClaimChannel?.postMessage({ type: 'suppress', requestId: id }); } catch {}
+    releaseStreamLease(id);
+    suppressRequestLocally(id);
+}
+
+// Stream owner liveness lease: the tab that wins a streamed request holds a
+// Web Lock until the final result is handled, the stream is abandoned, or the
+// tab dies. Other tabs wait on that lock before contending for the result, so
+// they only take over after the owner is gone without a result marker.
+// requestId -> release()
+const streamLeases = new Map();
+
+function streamLeaseName(requestId) {
+    return `calliope:lease:${requestId}`;
+}
+
+function holdStreamLease(requestId) {
+    if (!navigator?.locks?.request || !requestId || streamLeases.has(requestId)) return;
+    let release;
+    const held = new Promise(resolve => { release = resolve; });
+    streamLeases.set(requestId, release);
+    navigator.locks.request(streamLeaseName(requestId), () => held).catch(() => {});
+}
+
+function releaseStreamLease(requestId) {
+    const release = streamLeases.get(requestId);
+    if (!release) return;
+    streamLeases.delete(requestId);
+    release();
+}
+
+/** Resolve once no live tab holds the stream lease for this request. */
+function waitForStreamLease(requestId) {
+    if (!requestId || !navigator?.locks?.request || streamLeases.has(requestId)) return Promise.resolve();
+    return navigator.locks.request(streamLeaseName(requestId), () => {}).catch(() => {});
+}
 
 function incomingStorageKey(key) {
     return `calliope:handled:${key}`;
@@ -152,7 +262,6 @@ function incomingWasHandled(key) {
 
 function markIncomingHandled(key) {
     try { localStorage.setItem(incomingStorageKey(key), String(Date.now())); } catch {}
-    try { incomingClaimChannel?.postMessage({ type: 'done', key }); } catch {}
 }
 
 async function ownIncomingSideEffect(kind, opaqueId, action) {
@@ -183,7 +292,6 @@ async function ownIncomingSideEffect(kind, opaqueId, action) {
         if (localStorage.getItem(claimKey)) return false;
         localStorage.setItem(claimKey, claim);
         claimed = true;
-        try { incomingClaimChannel?.postMessage({ type: 'claim', key, claimant: TAB_INSTANCE_ID }); } catch {}
         await new Promise(resolve => setTimeout(resolve, 100));
         if (incomingWasHandled(key) || localStorage.getItem(claimKey) !== claim) return false;
         const result = action();
@@ -243,6 +351,23 @@ function serverOrigin() {
 
 function canonicalCharacterKey(value) {
     return String(value || '').trim().replace(/\.png$/i, '');
+}
+
+/** Stable identity of the open chat: group or character card + chat file.
+ *  ST also fires CHAT_CHANGED for same-chat reloads; those keep this value. */
+function currentChatIdentity() {
+    if (selected_group) {
+        const group = groups?.find(g => g.id == selected_group) || null;
+        return `group:${selected_group}:${group?.chat_id ?? ''}`;
+    }
+    const ch = characters?.[this_chid];
+    if (!ch) return '';
+    return `char:${ch.avatar || ch.name || ''}:${ch.chat ?? ''}`;
+}
+
+/** Pin the current chat identity before work that must not outlive it. */
+function rememberChatIdentity() {
+    if (lastChatIdentity === null) lastChatIdentity = currentChatIdentity();
 }
 
 /** Best-effort current-context snapshot for query params. */
@@ -465,9 +590,9 @@ function buildStatePayload() {
         characterId: ctx.characterId,
         characterName,
         personaId: ctx.personaId,
-        lastAiMessage: ctx.lastAi,
+        lastAiMessage: String(ctx.lastAi || '').slice(0, STATE_LAST_AI_MAX_CHARS),
         sceneContinuity: extractSceneContinuity(),
-        sceneContinuityMeta: JSON.stringify(window.sceneContinuityTracker?.getMeta?.() || {}),
+        sceneContinuityMeta: boundedSceneContinuityMeta(),
         sourceDevice: 'st-desktop',
         // POL-6 additions — server treats them as optional.
         groupId,
@@ -477,40 +602,92 @@ function buildStatePayload() {
     };
 }
 
-/** Fire-and-forget POST to /state. Silent on failure — server may be off. */
+function boundedSceneContinuityMeta() {
+    let meta = '{}';
+    try { meta = JSON.stringify(window.sceneContinuityTracker?.getMeta?.() || {}); } catch {}
+    return meta.length <= STATE_META_MAX_CHARS ? meta : '{}';
+}
+
+/** POST the current ST context to /state. Returns true when the server
+ *  accepted it, false when the attempt failed, null when nothing was sent. */
 async function postState(reason) {
-    if (!settings().broadcastState) return;
+    if (!settings().broadcastState) return null;
     const payload = buildStatePayload();
-    if (!payload.chatId && !payload.characterId) return; // no context loaded yet
-    // Dedupe identical payloads within 2s window (ST fires overlapping events)
+    if (!payload.chatId && !payload.characterId) return null; // no context loaded yet
+    // Dedupe identical payloads within 2s of the last *accepted* post (ST fires
+    // overlapping events); a failed post never suppresses the retry.
     const key = JSON.stringify(payload);
-    if (lastStatePayload && lastStatePayload.key === key
-        && (Date.now() - lastStatePayload.t) < 2000) return;
-    lastStatePayload = { key, t: Date.now() };
+    const now = Date.now();
+    if (lastStateSuccess.key === key && (now - lastStateSuccess.t) < 2000) return true;
+    lastStateAttemptAt = now;
 
     const url = `${settings().serverUrl.replace(/\/+$/, '')}/state`;
     try {
-        await fetch(url, {
+        const res = await fetchWithTimeout(url, {
             method: 'POST',
             mode: 'cors',
             cache: 'no-store',
             // keepalive lets this small payload survive pagehide/visibilitychange
-            // teardown (mobile lifecycle push) instead of being aborted mid-flight.
+            // teardown (mobile lifecycle push) instead of being aborted mid-flight;
+            // the body is capped above to stay under the 64 KiB keepalive quota.
             keepalive: true,
             headers: { 'Content-Type': 'application/json', ...authHeaders() },
-            body: JSON.stringify(payload),
+            body: key,
         });
+        if (!res.ok) {
+            lastStateError = `state_http_${res.status}`;
+            if (reason !== 'heartbeat') WARN(`postState[${reason}] rejected`, lastStateError);
+            return false;
+        }
+        lastStateSuccess = { key, t: Date.now() };
+        lastStateError = '';
+        return true;
     } catch (e) {
+        lastStateError = e?.name === 'AbortError' ? 'timeout' : 'network';
         // Expected when server is off; don't spam logs.
-        if (reason === 'heartbeat') return;
-        WARN(`postState[${reason}] failed`, e?.message || e);
+        if (reason !== 'heartbeat') WARN(`postState[${reason}] failed`, e?.message || e);
+        return false;
     }
+}
+
+// Heartbeat owner lease: "<tabId>:<renewedAt>" in localStorage. The owner
+// keeps posting while hidden (ST minimized during phone dictation); another
+// tab takes over on focus/visibility gain or once the lease expires.
+const STATE_OWNER_LEASE_MS = STATE_HEARTBEAT_MS * 2.5;
+
+function claimStateHeartbeat() {
+    try { localStorage.setItem(STATE_OWNER_KEY, `${TAB_INSTANCE_ID}:${Date.now()}`); } catch {}
+}
+
+/** Whether this tab sends the periodic heartbeat; renews the lease when it
+ *  does. A lone tab always owns it (its own lease, or an expired one). */
+function ownsStateHeartbeat() {
+    let owner = '';
+    let renewedAt = 0;
+    try {
+        const raw = String(localStorage.getItem(STATE_OWNER_KEY) || '');
+        const sep = raw.lastIndexOf(':');
+        owner = sep > 0 ? raw.slice(0, sep) : '';
+        renewedAt = Number(raw.slice(sep + 1)) || 0;
+    } catch {
+        return true;
+    }
+    let focused = false;
+    try { focused = document.visibilityState === 'visible' && !!document.hasFocus?.(); } catch {}
+    const mine = owner === TAB_INSTANCE_ID;
+    const expired = !owner || Date.now() - renewedAt > STATE_OWNER_LEASE_MS;
+    if (!mine && !expired && !focused) return false;
+    claimStateHeartbeat();
+    return true;
 }
 
 function startStateHeartbeat() {
     stopStateHeartbeat();
     if (!settings().broadcastState) return;
-    stateHeartbeatTimer = setInterval(() => postState('heartbeat'), STATE_HEARTBEAT_MS);
+    ownsStateHeartbeat(); // claims only if focused or no live lease exists
+    stateHeartbeatTimer = setInterval(() => {
+        if (ownsStateHeartbeat()) postState('heartbeat');
+    }, STATE_HEARTBEAT_MS);
 }
 
 function stopStateHeartbeat() {
@@ -525,11 +702,15 @@ function setupMobileLifecycleStatePush() {
     // snapshot before ST is hidden and another when it is foregrounded again so
     // the standalone phone tab does not need a manual refresh to catch up.
     document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) claimStateHeartbeat();
         push(document.hidden ? 'visibility-hidden' : 'visibility-visible');
     });
     window.addEventListener('pagehide', () => push('pagehide'));
     window.addEventListener('pageshow', () => push('pageshow'));
-    window.addEventListener('focus', () => push('focus'));
+    window.addEventListener('focus', () => {
+        claimStateHeartbeat();
+        push('focus');
+    });
 }
 
 // ─── MVP-13: streaming formatter partials ──────────────────────────────────
@@ -542,13 +723,16 @@ function setupMobileLifecycleStatePush() {
 //
 // Every open ST tab receives the same SSE stream, so stream START goes through
 // the same cross-tab arbitration as results (ownIncomingSideEffect, keyed by
-// requestId). Only the owner snapshots/clears its textarea and paints deltas;
-// other tabs ignore that requestId entirely, including its final result.
+// requestId). Only the owner snapshots/clears its textarea and paints deltas.
+// The owner holds a liveness lease (holdStreamLease) until the result is
+// handled; other tabs, including late joiners, wait for that lease before
+// contending for the final result, so they only take over from a dead owner.
 const STREAMING_SESSION_TIMEOUT_MS = 45_000;
 const STREAM_OWNERSHIP_CAP = 32;
-// { requestId, base, preStreamValue, undoEntry, accumulated, raf, appendMode, inactivityTimer }
+// { requestId, generation, base, preStreamValue, lastPainted, undoEntry,
+//   accumulated, raf, appendMode, inactivityTimer }
 let streamingSession = null;
-// requestId -> { state: 'pending' | 'owner' | 'lost', queue: [{delta, done}], settled: Promise }
+// requestId -> { state: 'pending' | 'owner' | 'lost' | 'dropped', queue: [{delta, done}], settled: Promise }
 const streamOwnership = new Map();
 
 function refreshStreamingSessionTimeout() {
@@ -570,6 +754,7 @@ function flushStreamingFrame() {
     if (!ta) return;
     const sep = streamingSession.base ? '\n\n' : '';
     ta.value = streamingSession.base + sep + streamingSession.accumulated;
+    streamingSession.lastPainted = ta.value;
     ta.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
@@ -583,7 +768,9 @@ function endStreamingSession() {
 }
 
 /** Drop the active stream and put the textarea back to its pre-stream value.
- *  Only the owning tab ever has a session, so only the owner is touched. */
+ *  Only the owning tab ever has a session, so only the owner is touched. The
+ *  lease is released without a result marker, so a surviving tab may still
+ *  deliver the canonical result. */
 function abortStreamingSession() {
     const session = streamingSession;
     if (!session) return;
@@ -595,6 +782,22 @@ function abortStreamingSession() {
     // The stream never landed, so its pre-stream undo entry is now a no-op.
     if (session.undoEntry && undoStack[undoStack.length - 1] === session.undoEntry) undoStack.pop();
     endStreamingSession();
+    releaseStreamLease(session.requestId);
+}
+
+/** Chat switched mid-stream: remove only our streamed partial text (never
+ *  write the previous chat's draft into the new one) and cancel the request
+ *  everywhere so its result cannot land in the new chat. */
+function dropStreamingSessionForChatSwitch() {
+    const session = streamingSession;
+    if (!session) return;
+    const ta = document.getElementById('send_textarea');
+    if (ta && ta.value === session.lastPainted && ta.value !== session.base) {
+        ta.value = session.base;
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    endStreamingSession();
+    suppressRequest(session.requestId);
 }
 
 /** Owner-only stream start: snapshot the pre-stream value once (for undo and
@@ -606,13 +809,16 @@ function beginStreamingSession(requestId) {
     const cfg = settings();
     clearRepairTrace();
     abortStreamingSession();
+    rememberChatIdentity();
     const preStreamValue = ta.value || '';
     const base = cfg.appendMode === 'append' ? preStreamValue.replace(/\s+$/, '') : '';
     const undoEntry = pushUndoSnapshot('dictation-stream');
     streamingSession = {
         requestId,
+        generation: chatGeneration,
         base,
         preStreamValue,
+        lastPainted: preStreamValue,
         undoEntry,
         accumulated: '',
         raf: null,
@@ -622,6 +828,7 @@ function beginStreamingSession(requestId) {
     if (cfg.appendMode !== 'append') {
         // Clear textarea so the streamed text shows from a clean slate.
         ta.value = '';
+        streamingSession.lastPainted = '';
         ta.dispatchEvent(new Event('input', { bubbles: true }));
     }
     refreshStreamingSessionTimeout();
@@ -648,7 +855,7 @@ function applyStreamToken({ delta, done }) {
 
 function handleDictationToken(data) {
     const requestId = String(data?.requestId || '');
-    if (!requestId) return;
+    if (!requestId || !requestIsCurrent(requestId)) return;
     const token = { delta: String(data.delta || ''), done: !!data.done };
     if (streamingSession?.requestId === requestId) {
         applyStreamToken(token);
@@ -656,8 +863,8 @@ function handleDictationToken(data) {
     }
     const known = streamOwnership.get(requestId);
     if (known) {
-        // Pending: buffer until arbitration settles. Lost: another tab owns
-        // it. Owner without a session: stream already ended/aborted here.
+        // Pending: buffer until arbitration settles. Lost/dropped: not ours.
+        // Owner without a session: stream already ended/aborted here.
         if (known.state === 'pending') known.queue.push(token);
         return;
     }
@@ -667,8 +874,12 @@ function handleDictationToken(data) {
         streamOwnership.delete(streamOwnership.keys().next().value);
     }
     claim.settled = ownIncomingSideEffect('stream', requestId, () => {
+        if (claim.state !== 'pending' || !requestIsCurrent(requestId)) return false;
         if (!beginStreamingSession(requestId)) return false;
         claim.state = 'owner';
+        // Registered before the stream marker is written, so every other tab
+        // queues behind this lease.
+        holdStreamLease(requestId);
         const queued = claim.queue;
         claim.queue = [];
         for (const queuedToken of queued) applyStreamToken(queuedToken);
@@ -677,28 +888,42 @@ function handleDictationToken(data) {
         WARN('dictation-token ownership failed', err?.message || err);
         return false;
     }).then(owned => {
-        if (claim.state !== 'owner' || owned !== true) {
+        if (claim.state === 'pending' || (claim.state === 'owner' && owned !== true)) {
             claim.state = 'lost';
             claim.queue = [];
         }
     });
 }
 
-/** Final result: a tab that lost the stream for this requestId leaves the
- *  result to the stream owner; everyone else contends as before. */
-async function handleDictationResultEvent(data, lastEventId) {
-    const requestId = String(data.requestId || data.request_id || '');
+/** Final result (SSE, or the desktop /transcribe response). The stream owner
+ *  applies it directly; every other tab first waits for the owner's lease and
+ *  then contends, which only succeeds when the owner died without a result
+ *  marker. Results for requests from an earlier chat generation are dropped. */
+async function handleDictationResultEvent(data, lastEventId, source = desktopCapture ? 'desktop' : 'phone') {
+    const requestId = String(data?.requestId || data?.request_id || '');
+    if (!requestIsCurrent(requestId)) return false;
+    const generation = chatGeneration;
     const claim = requestId ? streamOwnership.get(requestId) : null;
     if (claim?.settled) await claim.settled;
-    if (claim?.state === 'lost') return false;
-    return ownIncomingSideEffect('result', data.requestId || data.request_id || data.ts || lastEventId, () => {
-        const applied = applyDictationResult(data, { source: desktopCapture ? 'desktop' : 'phone' });
-        if (!applied && !String(data?.text ?? '').trim()
-                && streamingSession && (!requestId || streamingSession.requestId === requestId)) {
-            abortStreamingSession();
-        }
-        return applied;
-    });
+    if (claim?.state === 'dropped') return false;
+    // Without Web Locks there is no liveness signal; the owner keeps it.
+    if (claim?.state === 'lost' && !navigator?.locks?.request) return false;
+    if (claim?.state !== 'owner') await waitForStreamLease(requestId);
+    const stillCurrent = () => generation === chatGeneration && requestIsCurrent(requestId);
+    if (!stillCurrent()) return false;
+    try {
+        return await ownIncomingSideEffect('result', requestId || data?.ts || lastEventId, () => {
+            if (!stillCurrent()) return false;
+            const applied = applyDictationResult(data, { source });
+            if (!applied && !String(data?.text ?? '').trim()
+                    && streamingSession && (!requestId || streamingSession.requestId === requestId)) {
+                abortStreamingSession();
+            }
+            return applied;
+        });
+    } finally {
+        if (requestId) releaseStreamLease(requestId);
+    }
 }
 
 
@@ -814,7 +1039,18 @@ function ensureStateBarObserver() {
                 ensureStateBar();
             }
         });
-        stateBarObserver.observe(document.body, { childList: true, subtree: true });
+        const observe = () => stateBarObserver.observe(document.body, { childList: true, subtree: true });
+        if (!document.hidden) observe();
+        // A hidden tab needs no repair work for every streamed ST token; catch
+        // up once when it becomes visible again.
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                stateBarObserver.disconnect();
+            } else {
+                ensureStateBar();
+                observe();
+            }
+        });
     } catch (e) {
         WARN('state-bar observer setup failed', e?.message || e);
     }
@@ -887,6 +1123,10 @@ function handleDictationStateEvent(data) {
     const requestId = String(data.requestId || '');
     const state = String(data.state || '');
     const details = data.details ? String(data.details) : '';
+    if (requestId && !requestIsCurrent(requestId)) return;
+    // A failed pipeline will never send its canonical result; restore now
+    // instead of waiting for the 45 s inactivity timeout.
+    if (state === 'error' && streamingSession?.requestId === requestId) abortStreamingSession();
     if (!requestId || !state) return;
 
     // Switch session on new requestId; clear any pending hide timer so a fresh
@@ -915,7 +1155,9 @@ function handleDictationStateEvent(data) {
 // dependent ad-hoc reformat requests. The phone UI has its own picker through
 // the /state contract; this does not overload the character-mode schema.
 
-let activeAddressee = null; // { groupId, characterName | '*all' }
+// { groupId, characterName | '*all', characterKey }: characterKey is the
+// card's avatar filename stem (server card identity); the name is a label.
+let activeAddressee = null;
 
 // ─── QW1: formatter mode picker ────────────────────────────────────────────
 // Fetches the pipeline modes from GET /modes and reads/writes the per-
@@ -925,6 +1167,16 @@ let cachedModes = null; // [{id,label,...}] cached for the session
 let formatterModeEl = null;
 let formatterModeHintEl = null;
 let formatterModeRefreshSeq = 0;
+// Character key the mode <select> currently shows; null while loading. The
+// select value is never trusted for another character.
+let formatterModeElKey = null;
+// canonical character key -> remembered mode id ('' = server default). Filled
+// on context change so capture never waits on /state/mode-memory after key-up.
+const modeMemoryCache = new Map();
+const modeMemoryInflight = new Map();
+// canonical key -> count of this client's writes; a revalidation started
+// before a local write must not overwrite it.
+const modeMemoryWriteSeq = new Map();
 
 /** Character key used for per-character mode memory. Matches the id the
  *  server resolves from broadcast /state (characterId). In group chats no
@@ -939,14 +1191,14 @@ function currentReformatCharacterKey() {
     if (!selected_group) return currentModeMemoryKey();
     if (activeAddressee?.groupId !== String(selected_group)) return '';
     const name = activeAddressee.characterName || '';
-    return name === '*all' ? '' : canonicalCharacterKey(name);
+    return name === '*all' ? '' : canonicalCharacterKey(activeAddressee.characterKey || name);
 }
 
 async function fetchModes() {
     if (Array.isArray(cachedModes) && cachedModes.length) return cachedModes;
     const cfg = settings();
     const url = `${cfg.serverUrl.replace(/\/+$/, '')}/modes`;
-    const res = await fetch(url, {
+    const res = await fetchWithTimeout(url, {
         method: 'GET',
         mode: 'cors',
         cache: 'no-store',
@@ -963,32 +1215,81 @@ async function fetchModes() {
     return modes;
 }
 
-/** GET the remembered mode id for a character, or '' when none/unresolved. */
+/** GET the remembered mode id for a character: '' when none, null on failure. */
 async function fetchCharMode(characterId) {
     const char = String(characterId || '').trim();
     if (!char) return '';
     const cfg = settings();
     const url = `${cfg.serverUrl.replace(/\/+$/, '')}/state/mode-memory?character=${encodeURIComponent(char)}`;
     try {
-        const res = await fetch(url, {
+        const res = await fetchWithTimeout(url, {
             method: 'GET',
             mode: 'cors',
             cache: 'no-store',
             headers: { ...authHeaders() },
         });
-        if (!res.ok) return '';
+        if (!res.ok) return null;
         const data = await res.json();
         return String(data?.mode || '').trim();
     } catch (e) {
         WARN('fetchCharMode failed', e?.message || e);
-        return '';
+        return null;
     }
+}
+
+/** Always ask the server (one shared in-flight fetch per key) and update the
+ *  cache, unless this client wrote the key meanwhile (its write wins). On
+ *  failure the cached value, if any, is kept. */
+function revalidateCharMode(characterKey) {
+    const key = canonicalCharacterKey(characterKey);
+    if (!key) return Promise.resolve('');
+    if (modeMemoryInflight.has(key)) return modeMemoryInflight.get(key);
+    const writeSeq = modeMemoryWriteSeq.get(key) || 0;
+    const pending = fetchCharMode(key).then((mode) => {
+        if (modeMemoryInflight.get(key) === pending) modeMemoryInflight.delete(key);
+        const written = (modeMemoryWriteSeq.get(key) || 0) !== writeSeq;
+        if (mode === null || written) return modeMemoryCache.get(key) ?? (mode || '');
+        modeMemoryCache.set(key, mode);
+        return mode;
+    });
+    modeMemoryInflight.set(key, pending);
+    return pending;
+}
+
+/** Mode for capture: a running revalidation, else the cache, else a fetch.
+ *  Called at capture start, so release never waits on a round trip. */
+function resolveCharMode(characterKey) {
+    const key = canonicalCharacterKey(characterKey);
+    if (!key) return Promise.resolve('');
+    if (modeMemoryInflight.has(key)) return modeMemoryInflight.get(key);
+    if (modeMemoryCache.has(key)) return Promise.resolve(modeMemoryCache.get(key));
+    return revalidateCharMode(key);
+}
+
+/** This client wrote (mode) or failed to write (null) the key's memory. */
+function recordLocalModeWrite(characterKey, mode) {
+    const key = canonicalCharacterKey(characterKey);
+    if (!key) return;
+    modeMemoryWriteSeq.set(key, (modeMemoryWriteSeq.get(key) || 0) + 1);
+    if (mode === null) modeMemoryCache.delete(key);
+    else modeMemoryCache.set(key, mode);
+}
+
+function resetModeMemoryCache() {
+    modeMemoryCache.clear();
+    modeMemoryInflight.clear();
+    cachedModes = null;
 }
 
 async function refreshFormatterModeForContext() {
     const seq = ++formatterModeRefreshSeq;
     const char = currentModeMemoryKey();
+    // Revalidate on every context activation: the phone may have changed the
+    // remembered mode. Also warms the capture-time cache without the panel.
+    const reformatKey = currentReformatCharacterKey();
+    const remembered = revalidateCharMode(reformatKey);
     if (!formatterModeEl) return;
+    formatterModeElKey = null;
     if (!char) {
         formatterModeEl.value = '';
         formatterModeEl.disabled = true;
@@ -997,14 +1298,32 @@ async function refreshFormatterModeForContext() {
             : 'No character resolved yet.';
         return;
     }
-    formatterModeEl.disabled = false;
-    if (formatterModeHintEl) formatterModeHintEl.textContent = `Loading remembered mode for ${char}…`;
-    const remembered = await fetchCharMode(char);
+    if (modeMemoryCache.has(char)) {
+        // Stale-while-revalidate: show the cached mode now, correct it below.
+        const cached = modeMemoryCache.get(char);
+        formatterModeEl.value = cachedModes?.some(m => m.id === cached) ? cached : '';
+        formatterModeEl.disabled = false;
+        formatterModeElKey = char;
+    } else {
+        formatterModeEl.disabled = true;
+        if (formatterModeHintEl) formatterModeHintEl.textContent = `Loading remembered mode for ${char}…`;
+    }
+    const mode = await remembered;
     if (seq !== formatterModeRefreshSeq || char !== currentModeMemoryKey()) return;
-    formatterModeEl.value = cachedModes?.some(m => m.id === remembered) ? remembered : '';
-    if (formatterModeHintEl) formatterModeHintEl.textContent = remembered
+    formatterModeEl.value = cachedModes?.some(m => m.id === mode) ? mode : '';
+    formatterModeEl.disabled = false;
+    formatterModeElKey = char;
+    if (formatterModeHintEl) formatterModeHintEl.textContent = mode
         ? `Remembered for ${char}.`
         : `Using server default for ${char}.`;
+}
+
+/** E7: the single context-change repaint — addressee picker, mode select
+ *  (after its per-character fetch settles), model pin/hint, voice target. */
+async function refreshContextUi() {
+    try { renderAddresseePicker(); } catch (e) { WARN('addressee repaint failed', e?.message || e); }
+    await refreshFormatterModeForContext();
+    settingsContextRepaint?.();
 }
 
 /** POST a per-character mode selection. The server validates the mode id and
@@ -1027,8 +1346,9 @@ async function persistCharMode(characterId, modeId) {
         });
         let data = null;
         try { data = await res.json(); } catch {}
-        return res.ok && String(data?.character || '') === char
+        const ok = res.ok && String(data?.character || '') === char
             && String(data?.mode || '') === String(modeId || '').trim();
+        return ok;
     } catch (e) {
         WARN('persistCharMode failed', e?.message || e);
         return false;
@@ -1048,21 +1368,25 @@ async function reformatCurrentText(modeId) {
     }
     const cfg = settings();
     const ctx = currentContext();
+    const generation = chatGeneration;
+    const entryId = lastAppliedDictation?.generation === generation ? lastAppliedDictation.entryId : '';
     const url = `${cfg.serverUrl.replace(/\/+$/, '')}/reformat`;
+    const body = {
+        text: source,
+        mode: String(modeId || '').trim(),
+        formatter_model: cfg.formatterModel || '',
+        context: ctx.lastAi || '',
+        persona: cfg.reformatPersona || ctx.personaId || '',
+        character: currentReformatCharacterKey(),
+        persist_transcript: false,
+    };
+    if (entryId) body.entry_id = entryId;
     const res = await fetch(url, {
         method: 'POST',
         mode: 'cors',
         cache: 'no-store',
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify({
-            text: source,
-            mode: String(modeId || '').trim(),
-            formatter_model: cfg.formatterModel || '',
-            context: ctx.lastAi || '',
-            persona: cfg.reformatPersona || ctx.personaId || '',
-            character: currentReformatCharacterKey(),
-            persist_transcript: false,
-        }),
+        body: JSON.stringify(body),
     });
     let data = null;
     try { data = await res.json(); } catch {}
@@ -1079,11 +1403,11 @@ async function reformatCurrentText(modeId) {
     }
     const out = String(data?.text || '');
     if (!out.trim()) throw new Error('server returned empty text');
-    if (!ta || ta.value !== source) {
+    if (!ta || ta.value !== source || generation !== chatGeneration) {
         toast('warning', 'Message changed while reformatting — server result was not applied');
         return data;
     }
-    writeToTextarea(out, { autoSend: false, appendMode: 'replace' });
+    writeToTextarea(out, { appendMode: 'replace' });
     if (typeof data?.mode === 'string' && data.mode) lastDoneMode = data.mode;
     toast('success', `Reformatted as ${escapeHtml(data?.mode || modeId || 'mode')}`);
     return data;
@@ -1145,35 +1469,43 @@ function renderAddresseePicker() {
     host.querySelectorAll('.dbb-addr-chip').forEach(chip => {
         chip.addEventListener('click', () => {
             const name = chip.getAttribute('data-name') || '';
-            activeAddressee = { groupId, characterName: name };
+            const group = groups?.find(g => g.id == selected_group) || null;
+            const avatar = name === '*all' ? ''
+                : ((group?.members || []).find(file => (characters || []).find(c => c?.avatar === file)?.name === name) || '');
+            activeAddressee = { groupId, characterName: name, characterKey: canonicalCharacterKey(avatar || name) };
             renderAddresseePicker(); // repaint with the new selection.
+            refreshContextUi().catch(e => WARN('context refresh failed', e?.message || e));
         });
     });
 }
 
 // ─── POL-3: low-confidence "did you mean?" banner ─────────────────────────
-// Server adds `low_confidence_spans: [{text, start, end, confidence,
-// alternatives?: string[]}]` to the /transcribe response and the
-// dictation-result SSE event. We render a slim banner above the textarea:
+// The /transcribe response carries `low_confidence_spans: [{word, start_idx,
+// end_idx, confidence, logprob, alternatives: string[], text_only?}]` with
+// offsets into the server's canonical text. We render a slim banner above
+// the textarea:
 //
 //   Low confidence: [wear] [shore] [lithium]   ✕
 //
-// Each chip is a button: click → small popover with top-3 alternatives +
-// "Keep original". Selecting an alternative replaces the word in the
-// textarea (best-effort whole-word replacement, preserving cursor).
-//
-// This is the v1 banner-style implementation. The full overlay version
-// (positioned wavy underline aligned with textarea content) is deferred
-// to Phase 5 v2 — see roadmap POL-3 for the rationale.
+// Each chip opens a popover with up to three alternatives (from the span, or
+// POST /word-alternatives -> {alternatives: [{text, score, source}]}) plus
+// "Keep original". A replacement uses the span's offset, mapped through where
+// the dictation landed in the textarea, while that offset still points at the
+// word; otherwise it falls back to the first whole-word match. Resolving one
+// chip leaves the remaining chips usable.
 const LOWCONF_BANNER_ID = 'dictation_bridge_lowconf_banner';
 const LOWCONF_POPOVER_ID = 'dictation_bridge_lowconf_popover';
 const LOWCONF_BANNER_HIDE_MS = 10_000; // auto-dismiss after 10s
 
 let lowConfBannerTimer = null;
 let lowConfBannerInputBound = false;
+let lowConfProgrammaticInput = false;
+// Spans behind the rendered chips: [{ word, alts, start }] (start = textarea offset or -1)
+let lowConfSpans = [];
 
 function clearLowConfBanner() {
     if (lowConfBannerTimer) { clearTimeout(lowConfBannerTimer); lowConfBannerTimer = null; }
+    lowConfSpans = [];
     const el = document.getElementById(LOWCONF_BANNER_ID);
     if (el) try { el.remove(); } catch {}
     closeLowConfPopover();
@@ -1184,32 +1516,73 @@ function closeLowConfPopover() {
     if (pop) try { pop.remove(); } catch {}
 }
 
-/** Replace first whole-word occurrence of `word` in #send_textarea with `replacement`. */
-function replaceWordInTextarea(word, replacement) {
-    const ta = document.getElementById('send_textarea');
-    if (!ta || !word) return false;
-    const value = ta.value || '';
-    // Word-boundary match, case-insensitive, first occurrence only.
-    const re = new RegExp(`\\b${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-    const m = value.match(re);
-    if (!m || m.index == null) return false;
-    pushUndoSnapshot('lowconf-replace');
-    const start = m.index;
-    const end = start + m[0].length;
-    // setRangeText is the cleanest path that preserves cursor placement.
-    try {
-        ta.focus();
-        ta.setSelectionRange(start, end);
-        if (typeof ta.setRangeText === 'function') {
-            ta.setRangeText(replacement, start, end, 'end');
-        } else {
-            ta.value = value.slice(0, start) + replacement + value.slice(end);
-            ta.setSelectionRange(start + replacement.length, start + replacement.length);
+function lowConfAlternativeText(alt) {
+    return String(typeof alt === 'string' ? alt : (alt?.text ?? '')).trim();
+}
+
+/** Server spans -> chip spans. `placement` ({insertStart, textOffset}) maps a
+ *  server offset to a textarea offset: insertStart + start_idx - textOffset. */
+function normalizeLowConfSpans(spans, placement = null) {
+    const out = [];
+    const seen = new Set();
+    for (const s of Array.isArray(spans) ? spans : []) {
+        const word = String(s?.word ?? s?.text ?? '').trim();
+        if (!word) continue;
+        const startIdx = Number(s?.start_idx);
+        let start = -1;
+        if (placement && !s?.text_only && Number.isInteger(startIdx) && startIdx >= placement.textOffset) {
+            start = placement.insertStart + startIdx - placement.textOffset;
         }
-    } catch {
-        ta.value = value.slice(0, start) + replacement + value.slice(end);
+        const key = `${word.toLowerCase()}@${start}`;
+        if (seen.has(key) || (start < 0 && out.some(o => o.word.toLowerCase() === word.toLowerCase()))) continue;
+        seen.add(key);
+        const alts = (Array.isArray(s?.alternatives) ? s.alternatives : [])
+            .map(lowConfAlternativeText).filter(Boolean).slice(0, 3);
+        out.push({ word, alts, start });
     }
-    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    return out;
+}
+
+/** Textarea offset of a span: its recorded offset while that still holds the
+ *  word, else the first whole-word (Unicode-aware) match, else -1. */
+function locateLowConfSpan(value, span) {
+    const text = String(value || '');
+    const word = span.word;
+    if (span.start >= 0 && text.slice(span.start, span.start + word.length).toLowerCase() === word.toLowerCase()) {
+        return span.start;
+    }
+    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const m = new RegExp(`(?<![\\p{L}\\p{N}_])${escaped}(?![\\p{L}\\p{N}_])`, 'iu').exec(text);
+    return m ? m.index : -1;
+}
+
+/** Pure replacement: returns {value, caret} or null; shifts later spans. */
+function applyLowConfReplacement(value, spans, index, replacement) {
+    const span = spans[index];
+    if (!span) return null;
+    const pos = locateLowConfSpan(value, span);
+    if (pos < 0) return null;
+    const end = pos + span.word.length;
+    const delta = replacement.length - span.word.length;
+    for (const other of spans) {
+        if (other !== span && other.start > pos) other.start += delta;
+    }
+    span.start = -1;
+    span.resolved = true;
+    return { value: value.slice(0, pos) + replacement + value.slice(end), caret: pos + replacement.length };
+}
+
+function replaceLowConfSpanInTextarea(index, replacement) {
+    const ta = document.getElementById('send_textarea');
+    if (!ta || !replacement) return false;
+    const next = applyLowConfReplacement(ta.value || '', lowConfSpans, index, replacement);
+    if (!next) return false;
+    pushUndoSnapshot('lowconf-replace');
+    ta.value = next.value;
+    try { ta.focus(); ta.setSelectionRange(next.caret, next.caret); } catch {}
+    lowConfProgrammaticInput = true;
+    try { ta.dispatchEvent(new Event('input', { bubbles: true })); }
+    finally { lowConfProgrammaticInput = false; }
     return true;
 }
 
@@ -1217,7 +1590,7 @@ async function fetchWordAlternatives(word, contextText) {
     const cfg = settings();
     const url = `${cfg.serverUrl.replace(/\/+$/, '')}/word-alternatives`;
     try {
-        const res = await fetch(url, {
+        const res = await fetchWithTimeout(url, {
             method: 'POST',
             mode: 'cors',
             cache: 'no-store',
@@ -1226,16 +1599,25 @@ async function fetchWordAlternatives(word, contextText) {
         });
         if (!res.ok) return [];
         const data = await res.json();
-        if (Array.isArray(data?.alternatives)) return data.alternatives.slice(0, 3);
-        return [];
+        if (!Array.isArray(data?.alternatives)) return [];
+        return data.alternatives.map(lowConfAlternativeText).filter(Boolean).slice(0, 3);
     } catch (e) {
         WARN('word-alternatives fetch failed', e?.message || e);
         return [];
     }
 }
 
-function buildLowConfPopover(word, alternatives, anchorRect) {
+function resolveLowConfChip(index) {
+    const chip = document.querySelector(`#${LOWCONF_BANNER_ID} .dbb-lc-chip[data-index="${index}"]`);
+    if (chip) try { chip.remove(); } catch {}
     closeLowConfPopover();
+    const banner = document.getElementById(LOWCONF_BANNER_ID);
+    if (banner && !banner.querySelector('.dbb-lc-chip')) clearLowConfBanner();
+}
+
+function buildLowConfPopover(index, alternatives, anchorRect) {
+    closeLowConfPopover();
+    const word = lowConfSpans[index]?.word || '';
     const pop = document.createElement('div');
     pop.id = LOWCONF_POPOVER_ID;
     pop.style.cssText = [
@@ -1274,24 +1656,15 @@ function buildLowConfPopover(word, alternatives, anchorRect) {
     pop.querySelectorAll('.dbb-lc-alt').forEach(el => {
         el.addEventListener('click', () => {
             const alt = el.getAttribute('data-alt') || '';
-            if (alt && replaceWordInTextarea(word, alt)) {
+            if (alt && replaceLowConfSpanInTextarea(index, alt)) {
                 toast('success', `Replaced &ldquo;${escapeHtml(word)}&rdquo; → &ldquo;${escapeHtml(alt)}&rdquo;`);
+            } else {
+                toast('warning', `&ldquo;${escapeHtml(word)}&rdquo; is no longer in the message box`);
             }
-            closeLowConfPopover();
-            // Remove the chip whose word we resolved.
-            const chip = document.querySelector(`#${LOWCONF_BANNER_ID} [data-word="${CSS.escape(word.toLowerCase())}"]`);
-            if (chip) try { chip.remove(); } catch {}
-            const banner = document.getElementById(LOWCONF_BANNER_ID);
-            if (banner && !banner.querySelector('.dbb-lc-chip')) clearLowConfBanner();
+            resolveLowConfChip(index);
         });
     });
-    pop.querySelector('.dbb-lc-keep')?.addEventListener('click', () => {
-        const chip = document.querySelector(`#${LOWCONF_BANNER_ID} [data-word="${CSS.escape(word.toLowerCase())}"]`);
-        if (chip) try { chip.remove(); } catch {}
-        closeLowConfPopover();
-        const banner = document.getElementById(LOWCONF_BANNER_ID);
-        if (banner && !banner.querySelector('.dbb-lc-chip')) clearLowConfBanner();
-    });
+    pop.querySelector('.dbb-lc-keep')?.addEventListener('click', () => resolveLowConfChip(index));
 
     // Clicks outside dismiss.
     setTimeout(() => {
@@ -1311,28 +1684,18 @@ function onDocClickClosePopover(e) {
 }
 
 /**
- * POL-3 entry point: render the low-confidence banner from a list of
- * spans (shape: {text, alternatives?, confidence?}). De-dups by word,
- * skips empty alternatives, no-ops if list is empty.
+ * POL-3 entry point: render the low-confidence banner from server spans.
+ * `placement` maps server offsets into the textarea (see normalizeLowConfSpans).
+ * No-ops when no span carries a word.
  */
-function renderLowConfBanner(spans) {
+function renderLowConfBanner(spans, placement = null) {
     clearLowConfBanner();
-    if (!Array.isArray(spans) || spans.length === 0) return;
-
-    // De-dup by lowercased word; preserve first occurrence's alternatives.
-    const seen = new Map();
-    for (const s of spans) {
-        const word = String(s?.text || '').trim();
-        if (!word) continue;
-        const key = word.toLowerCase();
-        if (seen.has(key)) continue;
-        const alts = Array.isArray(s.alternatives) ? s.alternatives.filter(Boolean).slice(0, 3) : [];
-        seen.set(key, { word, alts });
-    }
-    if (seen.size === 0) return;
+    const normalized = normalizeLowConfSpans(spans, placement);
+    if (!normalized.length) return;
 
     const ta = document.getElementById('send_textarea');
     if (!ta || !ta.parentElement) return;
+    lowConfSpans = normalized;
 
     const banner = document.createElement('div');
     banner.id = LOWCONF_BANNER_ID;
@@ -1354,11 +1717,10 @@ function renderLowConfBanner(spans) {
     ].join(';');
 
     const labelHtml = `<span style="color:#FFB648;font-weight:600">Low confidence:</span>`;
-    const chips = [...seen.values()].map(({ word, alts }) => `
+    const chips = normalized.map(({ word }, index) => `
         <button type="button"
                 class="dbb-lc-chip"
-                data-word="${escapeHtml(word.toLowerCase())}"
-                data-alts="${escapeHtml(JSON.stringify(alts))}"
+                data-index="${index}"
                 title="Click to choose alternative"
                 style="padding:2px 8px;border:1px solid rgba(255, 182, 72, 0.55);background:transparent;color:#FFB648;border-radius:2px;cursor:pointer;font-size:12px;font-family:inherit;text-decoration:underline wavy var(--ap-amber, #FFB648);text-decoration-thickness:1px">${escapeHtml(word)}</button>
     `).join('');
@@ -1372,22 +1734,24 @@ function renderLowConfBanner(spans) {
         chip.addEventListener('click', async (ev) => {
             ev.preventDefault();
             ev.stopPropagation();
-            const word = chip.textContent.trim();
-            let alts = [];
-            try { alts = JSON.parse(chip.getAttribute('data-alts') || '[]'); } catch {}
-            // If server didn't ship alternatives, fetch fresh — uses bearer auth.
-            if (!alts || alts.length === 0) {
+            const index = Number(chip.getAttribute('data-index'));
+            const span = lowConfSpans[index];
+            if (!span) return;
+            let alts = span.alts;
+            // If the server didn't ship alternatives, fetch fresh — uses bearer auth.
+            if (!alts.length) {
                 const ctxText = (document.getElementById('send_textarea')?.value || '').slice(0, 400);
-                alts = await fetchWordAlternatives(word, ctxText);
+                alts = await fetchWordAlternatives(span.word, ctxText);
+                if (lowConfSpans[index] !== span) return; // banner replaced meanwhile
+                span.alts = alts;
             }
-            const rect = chip.getBoundingClientRect();
-            buildLowConfPopover(word, alts, rect);
+            buildLowConfPopover(index, alts, chip.getBoundingClientRect());
         });
     });
 
     banner.querySelector('#dbb_lc_dismiss')?.addEventListener('click', clearLowConfBanner);
 
-    // Auto-dismiss after 10s, on textarea input, or Esc.
+    // Auto-dismiss after 10s, on user typing, or Esc.
     lowConfBannerTimer = setTimeout(clearLowConfBanner, LOWCONF_BANNER_HIDE_MS);
     if (!lowConfBannerInputBound) {
         ta.addEventListener('input', onTextareaInputDismissBanner, { passive: true });
@@ -1397,6 +1761,8 @@ function renderLowConfBanner(spans) {
 }
 
 function onTextareaInputDismissBanner() {
+    // Our own chip replacement also fires input; that must keep the other chips.
+    if (lowConfProgrammaticInput) return;
     if (document.getElementById(LOWCONF_BANNER_ID)) clearLowConfBanner();
 }
 
@@ -1422,15 +1788,21 @@ function pushUndoSnapshot(reason) {
     const prev = ta.value || '';
     // Skip duplicate snapshots — repeated identical state pollutes the stack.
     const top = undoStack[undoStack.length - 1];
-    if (top && top.prevValue === prev) return null;
-    const entry = { prevValue: prev, ts: Date.now(), reason: reason || '' };
+    if (top && top.prevValue === prev && top.generation === chatGeneration) return null;
+    const entry = { prevValue: prev, ts: Date.now(), reason: reason || '', generation: chatGeneration };
     undoStack.push(entry);
     while (undoStack.length > UNDO_STACK_CAP) undoStack.shift();
     return entry;
 }
 
+/** Pop the newest snapshot taken in the current chat; older chats' drafts
+ *  are discarded, never restored into this conversation. */
 function popUndoSnapshot() {
-    return undoStack.pop() || null;
+    while (undoStack.length) {
+        const entry = undoStack.pop();
+        if (entry.generation === chatGeneration) return entry;
+    }
+    return null;
 }
 
 /** Toast helper. Reuses ST's globally jQuery-loaded toastr. 1.2s default. */
@@ -1706,7 +2078,13 @@ function handleDictationCommand(data) {
 let sseSource = null;
 let sseReconnectDelay = 1000;
 const SSE_RECONNECT_CAP = 30_000;
+// The server sends a named `ping` every 15 s; silence for 45 s means the
+// connection is dead even if the socket still looks open. Armed only after
+// the first ping so servers without ping support are not reconnected forever.
+const SSE_SILENCE_MS = 45_000;
 let sseReconnectTimer = null;
+let sseWatchdogTimer = null;
+let ssePingSeen = false;
 let sseStatus = { state: 'disconnected', lastEventAt: 0, lastError: '' };
 let serverAuthStatus = { health: 'unknown', token: 'unknown', lastCheckedAt: 0, lastError: '' };
 
@@ -1745,6 +2123,7 @@ function updateSseStatusIndicator() {
         const colors = {
             connected: '#4caf50',
             connecting: '#e6a756',
+            stale: '#e6a756',
             disconnected: '#7a7a9a',
             error: '#cc5555',
         };
@@ -1756,6 +2135,30 @@ function updateSseStatusIndicator() {
     }
     // Mirror into the quick-launch card if it's mounted.
     try { paintQuickLaunchStatus(); } catch {}
+}
+
+function armSseWatchdog() {
+    clearTimeout(sseWatchdogTimer);
+    sseWatchdogTimer = null;
+    if (!ssePingSeen || !sseSource) return;
+    const source = sseSource;
+    sseWatchdogTimer = setTimeout(() => {
+        if (sseSource !== source) return;
+        try { source.close(); } catch {}
+        sseSource = null;
+        abortStreamingSession();
+        sseStatus.state = 'stale';
+        sseStatus.lastError = 'No events for 45 s';
+        updateSseStatusIndicator();
+        scheduleSseReconnect();
+    }, SSE_SILENCE_MS);
+}
+
+/** Any named event (including `ping`) proves the connection is alive. */
+function noteSseActivity() {
+    sseStatus.lastEventAt = Date.now();
+    if (sseStatus.state === 'stale' || sseStatus.state === 'connecting') sseStatus.state = 'connected';
+    armSseWatchdog();
 }
 
 function connectSSE() {
@@ -1788,18 +2191,23 @@ function connectSSE() {
         updateSseStatusIndicator();
     });
 
-    sseSource.addEventListener('ready', (e) => {
+    sseSource.addEventListener('ready', () => {
         // Server's opening handshake.
         sseStatus.state = 'connected';
-        sseStatus.lastEventAt = Date.now();
+        noteSseActivity();
         updateSseStatusIndicator();
+    });
+
+    sseSource.addEventListener('ping', () => {
+        ssePingSeen = true;
+        noteSseActivity();
     });
 
     // MVP-13: streaming formatter deltas (perceived-latency only; the canonical
     // dictation-result event below replaces the streamed text with the polished
     // assembled version once formatting finishes).
     sseSource.addEventListener('dictation-token', (e) => {
-        sseStatus.lastEventAt = Date.now();
+        noteSseActivity();
         let data;
         try { data = JSON.parse(e.data); }
         catch { WARN('SSE dictation-token: bad JSON'); return; }
@@ -1816,13 +2224,17 @@ function connectSSE() {
     // dictation-command SSE event. When voiceCommandsEnabled is false,
     // ignore the event entirely so a single ST instance can opt out
     // (useful when two ST tabs would otherwise both fire the action).
+    // Commands for a request from an earlier chat never fire.
     sseSource.addEventListener('dictation-command', (e) => {
-        sseStatus.lastEventAt = Date.now();
+        noteSseActivity();
         if (!settings().voiceCommandsEnabled) return;
         try {
             const data = JSON.parse(e.data);
-            if (!commandCanExecute(data)) return;
-            ownIncomingSideEffect('command', data.requestId || data.ts || e.lastEventId, () => {
+            const requestId = String(data?.requestId || '');
+            if (!requestIsCurrent(requestId) || !commandCanExecute(data)) return;
+            const generation = chatGeneration;
+            ownIncomingSideEffect('command', requestId || data.ts || e.lastEventId, () => {
+                if (generation !== chatGeneration || !requestIsCurrent(requestId)) return false;
                 return handleDictationCommand(data);
             }).catch(err => WARN('dictation-command ownership failed', err?.message || err));
         } catch (err) {
@@ -1832,7 +2244,7 @@ function connectSSE() {
 
     // MVP-16: pipeline state-machine bar above #send_textarea.
     sseSource.addEventListener('dictation-state', (e) => {
-        sseStatus.lastEventAt = Date.now();
+        noteSseActivity();
         try {
             const data = JSON.parse(e.data);
             handleDictationStateEvent(data);
@@ -1845,14 +2257,14 @@ function connectSSE() {
     // It is intentionally separate from dictation-token/dictation-result so raw
     // transcripts never write into #send_textarea or duplicate canonical output.
     sseSource.addEventListener('dictation-transcript', (e) => {
-        sseStatus.lastEventAt = Date.now();
+        noteSseActivity();
         updateSseStatusIndicator();
         let data;
         try { data = JSON.parse(e.data); }
         catch { WARN('SSE dictation-transcript: bad JSON'); return; }
         const requestId = String(data.requestId || '');
         const phase = String(data.phase || '');
-        if (!requestId) return;
+        if (!requestId || !requestIsCurrent(requestId)) return;
         const label = phase === 'final' ? 'Heard' : 'Hearing';
         const preview = 'speech';
         const latency = Number.isFinite(Number(data.latency_ms)) ? ` · ${Math.round(Number(data.latency_ms))}ms` : '';
@@ -1861,7 +2273,7 @@ function connectSSE() {
     });
 
     sseSource.addEventListener('dictation-result', (e) => {
-        sseStatus.lastEventAt = Date.now();
+        noteSseActivity();
         updateSseStatusIndicator();
         let data;
         try { data = JSON.parse(e.data); }
@@ -1870,7 +2282,10 @@ function connectSSE() {
             .catch(err => WARN('dictation-result ownership failed', err?.message || err));
     });
 
-    sseSource.addEventListener('error', (e) => {
+    sseSource.addEventListener('error', () => {
+        // Tokens may have been lost: restore the pre-stream text now. The
+        // released lease lets a still-connected tab deliver the result.
+        abortStreamingSession();
         // EventSource auto-reconnects, but on a closed state we force our own
         // backoff path so the UI reflects it and self-signed cert failures
         // don't silently loop.
@@ -1900,6 +2315,9 @@ function scheduleSseReconnect() {
 
 function disconnectSSE() {
     if (sseReconnectTimer) { clearTimeout(sseReconnectTimer); sseReconnectTimer = null; }
+    clearTimeout(sseWatchdogTimer);
+    sseWatchdogTimer = null;
+    ssePingSeen = false;
     if (sseSource) {
         try { sseSource.close(); } catch {}
         sseSource = null;
@@ -1922,6 +2340,8 @@ function dictationRequestWasApplied(requestId) {
     return !!requestId && appliedDictationRequestIds.includes(requestId);
 }
 
+/** Accept a result for later delivery (another stream is active). Counts as
+ *  handled for cross-tab purposes: this tab is committed to deliver it. */
 function queuePendingCanonicalResult(data, source) {
     const requestId = String(data?.requestId || data?.request_id || '');
     if (!requestId) return false;
@@ -1929,18 +2349,31 @@ function queuePendingCanonicalResult(data, source) {
     if (existing) {
         existing.data = data;
         existing.source = source;
-        return false;
+        return true;
     }
-    pendingCanonicalResults.push({ requestId, data, source });
+    pendingCanonicalResults.push({ requestId, data, source, generation: chatGeneration });
     while (pendingCanonicalResults.length > PENDING_CANONICAL_RESULT_CAP) pendingCanonicalResults.shift();
-    return false;
+    return true;
 }
 
 function flushPendingCanonicalResults() {
-    if (streamingSession || !pendingCanonicalResults.length) return;
-    const next = pendingCanonicalResults.shift();
-    applyDictationResult(next.data, { source: next.source });
-    if (!streamingSession && pendingCanonicalResults.length) queueMicrotask(flushPendingCanonicalResults);
+    while (!streamingSession && pendingCanonicalResults.length) {
+        const next = pendingCanonicalResults.shift();
+        // Queued in an earlier chat: drop, never insert into this one.
+        if (next.generation !== chatGeneration || !requestIsCurrent(next.requestId)) continue;
+        applyDictationResult(next.data, { source: next.source });
+        return;
+    }
+}
+
+// The most recent dictation this tab inserted, for HTTP metadata enrichment,
+// offset-aware confidence chips and /reformat entry ids.
+// { requestId, generation, entryId, text, placement: {insertStart, textOffset} }
+let lastAppliedDictation = null;
+
+function lowConfidenceSpansOf(data) {
+    const spans = data?.low_confidence_spans || data?.lowConfidenceSpans;
+    return Array.isArray(spans) ? spans : [];
 }
 
 /** Apply the canonical server result through the shared textarea/result path.
@@ -1955,7 +2388,8 @@ function applyDictationResult(data, { source = 'phone' } = {}) {
         return queuePendingCanonicalResult(data, source);
     }
     if (streamingSession && !requestId) return false;
-    let text = String(data?.text ?? '').trim();
+    const serverText = String(data?.text ?? '');
+    let text = serverText.trim();
     if (!text) return false;
     const ta = document.getElementById('send_textarea');
     if (!ta) return false;
@@ -1967,10 +2401,12 @@ function applyDictationResult(data, { source = 'phone' } = {}) {
     const cfg = settings();
     const doAutoSend = data.auto_send === true ? true : !!cfg.autoSend;
 
+    let prefixLength = 0;
     const modeOverride = String(data.mode_override || data.modeOverride || '').toLowerCase();
     if ((modeOverride === 'ooc' || modeOverride === 'grammar_clean')
             && data.is_ooc === true && !/^\s*ooc\b/i.test(text)) {
         text = `OOC: ${text}`;
+        prefixLength = 'OOC: '.length;
     }
 
     if (streamingSession) {
@@ -1983,15 +2419,21 @@ function applyDictationResult(data, { source = 'phone' } = {}) {
         ta.value = (sessAppendMode === 'append' ? base + sep : '') + text;
         ta.dispatchEvent(new Event('input', { bubbles: true }));
         try { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); } catch {}
-        if (doAutoSend) {
-            const btn = document.getElementById('send_but');
-            if (btn) btn.click(); else WARN('send_but not found, cannot auto-send');
-            setTimeout(() => maybeReadDictatedPersonaText(text), 200);
-        }
     } else {
-        writeToTextarea(text, { autoSend: doAutoSend, appendMode: cfg.appendMode });
-        if (doAutoSend) setTimeout(() => maybeReadDictatedPersonaText(text), 200);
+        writeToTextarea(text, { appendMode: cfg.appendMode });
     }
+    // Server span offsets index `serverText`; the dictation sits at the end.
+    const placement = {
+        insertStart: (ta.value || '').length - text.length + prefixLength,
+        textOffset: serverText.length - serverText.trimStart().length,
+    };
+    lastAppliedDictation = {
+        requestId,
+        generation: chatGeneration,
+        entryId: typeof data.entry_id === 'string' ? data.entry_id : '',
+        text,
+        placement,
+    };
 
     renderRepairTraceFromPayload(data, text);
     if (data.formatting_skipped && window.toastr) {
@@ -2003,12 +2445,36 @@ function applyDictationResult(data, { source = 'phone' } = {}) {
         window.toastr.success(label, 'Dictation Bridge', { timeOut: 1500 });
     }
 
-    const spans = data.low_confidence_spans || data.lowConfidenceSpans;
-    if (Array.isArray(spans) && spans.length) {
-        try { renderLowConfBanner(spans); }
+    const spans = lowConfidenceSpansOf(data);
+    if (spans.length) {
+        try { renderLowConfBanner(spans, placement); }
         catch (err) { WARN('lowconf banner render failed', err?.message || err); }
     }
+    if (doAutoSend) {
+        // Canonical ST path: click #send_but. This routes through
+        // sendTextareaMessage() -> Generate(), preserving pre-send hooks.
+        const btn = document.getElementById('send_but');
+        if (btn) btn.click(); else WARN('send_but not found, cannot auto-send');
+        setTimeout(() => maybeReadDictatedPersonaText(text), 200);
+    }
     queueMicrotask(flushPendingCanonicalResults);
+    return true;
+}
+
+/** The desktop HTTP response for a request this tab already inserted via SSE:
+ *  add what the SSE event lacks (confidence spans, full repair trace, entry
+ *  id) without inserting the text again. */
+function enrichAppliedDictationResult(data) {
+    const requestId = String(data?.requestId || data?.request_id || '');
+    const applied = lastAppliedDictation;
+    if (!requestId || applied?.requestId !== requestId || applied.generation !== chatGeneration) return false;
+    if (typeof data?.entry_id === 'string' && data.entry_id) applied.entryId = data.entry_id;
+    renderRepairTraceFromPayload(data, applied.text);
+    const spans = lowConfidenceSpansOf(data);
+    if (spans.length) {
+        try { renderLowConfBanner(spans, applied.placement); }
+        catch (err) { WARN('lowconf banner render failed', err?.message || err); }
+    }
     return true;
 }
 
@@ -2016,7 +2482,7 @@ async function buildPairedPhoneUrl({ embed = true } = {}) {
     const cfg = settings();
     const ctx = currentContext();
     const base = cfg.serverUrl.replace(/\/+$/, '');
-    const response = await fetch(`${base}/pair/bootstrap`, {
+    const response = await fetchWithTimeout(`${base}/pair/bootstrap`, {
         method: 'POST',
         mode: 'cors',
         cache: 'no-store',
@@ -2055,13 +2521,45 @@ async function copyPairedPhoneUrl() {
     }
 }
 
-async function openPairedPhoneUrl() {
+/** Open a placeholder window synchronously inside the user gesture (popup
+ *  blockers reject window.open after awaits); navigate it once ready. */
+function openPendingPopup(name, features) {
+    let win = null;
+    try { win = window.open('about:blank', name, features); } catch {}
+    if (!win) return null;
     try {
-        const url = await buildPairedPhoneUrl({ embed: false });
-        window.open(url, 'calliope_pair_phone', 'width=500,height=900,menubar=no,toolbar=no,location=yes,status=no,scrollbars=yes,resizable=yes');
-    } catch (e) {
-        toast('error', `Could not create pairing URL: ${escapeHtml(e?.message || 'request failed')}`);
+        win.document.title = 'Calliope';
+        win.document.body.textContent = 'Connecting to Calliope…';
+    } catch {}
+    return win;
+}
+
+function navigatePendingPopup(win, url) {
+    if (!win || win.closed) return false;
+    try {
+        win.location.replace(url);
+        return true;
+    } catch {
+        return false;
     }
+}
+
+function closePendingPopup(win) {
+    if (win && !win.closed) try { win.close(); } catch {}
+}
+
+function openPairedPhoneUrl() {
+    const win = openPendingPopup('calliope_pair_phone', 'width=500,height=900,menubar=no,toolbar=no,location=yes,status=no,scrollbars=yes,resizable=yes');
+    if (!win) {
+        toast('error', 'Popup blocked. Allow popups for SillyTavern, or use Copy pairing URL.');
+        return;
+    }
+    buildPairedPhoneUrl({ embed: false })
+        .then(url => { if (!navigatePendingPopup(win, url)) closePendingPopup(win); })
+        .catch((e) => {
+            closePendingPopup(win);
+            toast('error', `Could not create pairing URL: ${escapeHtml(e?.message || 'request failed')}`);
+        });
 }
 
 function drawQrToCanvas(text, canvas) {
@@ -2132,7 +2630,7 @@ async function probeServer() {
     try {
         // /health does not require auth server-side, but sending the header is
         // harmless and lets the server count authed clients in audit logs.
-        const res = await fetch(url, {
+        const res = await fetchWithTimeout(url, {
             method: 'GET',
             mode: 'cors',
             cache: 'no-store',
@@ -2166,7 +2664,7 @@ async function probeServerAuth() {
     }
     const url = `${cfg.serverUrl.replace(/\/+$/, '')}/state`;
     try {
-        const res = await fetch(url, {
+        const res = await fetchWithTimeout(url, {
             method: 'GET',
             mode: 'cors',
             cache: 'no-store',
@@ -2190,6 +2688,20 @@ async function probeServerAuth() {
         paintQuickLaunchStatus();
         return false;
     }
+}
+
+/** Contract: POST /warm starts whisper-server in the background the moment
+ *  capture begins. Fire-and-forget; every failure (incl. older servers' 404)
+ *  is ignored. */
+function warmServer() {
+    try {
+        fetchWithTimeout(`${settings().serverUrl.replace(/\/+$/, '')}/warm`, {
+            method: 'POST',
+            mode: 'cors',
+            cache: 'no-store',
+            headers: { ...authHeaders() },
+        }).catch(() => {});
+    } catch {}
 }
 
 /** Inject the mic button into the chat send bar. Idempotent. */
@@ -2255,6 +2767,7 @@ function setMicActive(active) {
 }
 
 function setMicState(state) {
+    try { paintQuickLaunchDictationBtn(); } catch {}
     const btn = document.getElementById('dictation_bridge_mic');
     if (!btn) return;
     btn.classList.toggle('dictation-bridge-mic--recording', state === 'recording');
@@ -2275,9 +2788,11 @@ function setMicState(state) {
     btn.setAttribute('aria-busy', state === 'transcribing' ? 'true' : 'false');
 }
 
+/** First recorder container the browser supports; the server accepts all
+ *  three and normalises them through ffmpeg. */
 function desktopAudioFormat() {
     if (typeof MediaRecorder === 'undefined') return null;
-    return DESKTOP_AUDIO_FORMATS.find(format => MediaRecorder.isTypeSupported(format.mimeType)) || null;
+    return DESKTOP_AUDIO_FORMATS.find(mime => MediaRecorder.isTypeSupported(mime)) || null;
 }
 
 function cleanupDesktopCaptureHardware(capture) {
@@ -2304,15 +2819,28 @@ function finishDesktopCapture(capture) {
     }
 }
 
+/** Cancel recording/upload. An upload already sent may still produce SSE
+ *  events: its exact client request id (echoed by the server as the request
+ *  id) is suppressed in every tab so the aborted take never lands. Older
+ *  servers that do not echo it get nothing extra suppressed. */
 function cancelDesktopCapture(capture = desktopCapture) {
     if (!capture) return;
+    const wasUploading = capture.phase === 'transcribing' || capture.phase === 'delivering';
     capture.cancelled = true;
     capture.stopRequested = true;
     capture.abortController?.abort();
     if (capture.recorder && capture.recorder.state !== 'inactive') {
         try { capture.recorder.stop(); } catch {}
     }
+    if (wasUploading && capture.clientRequestId) suppressRequest(capture.clientRequestId);
     finishDesktopCapture(capture);
+}
+
+/** Random id the server reuses verbatim as the request id ([A-Za-z0-9_-]{22}). */
+function newClientRequestId() {
+    const bytes = new Uint8Array(16);
+    globalThis.crypto.getRandomValues(bytes);
+    return btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 function showDesktopCaptureError(error) {
@@ -2349,14 +2877,24 @@ function releaseDesktopPushToTalk(reason) {
 
 async function startDesktopRecording(trigger) {
     if (desktopCapture) return false;
-    const format = desktopAudioFormat();
-    if (!format || !navigator.mediaDevices?.getUserMedia) {
-        throw new Error('This browser cannot record server-compatible WebM audio');
+    const mimeType = desktopAudioFormat();
+    if (!mimeType || !navigator.mediaDevices?.getUserMedia) {
+        throw new Error('This browser cannot record audio in a format Calliope accepts (WebM, MP4 or Ogg)');
     }
+    warmServer();
 
+    // Context is resolved now, at capture start: a chat switch while
+    // recording cancels this capture instead of re-targeting it.
+    rememberChatIdentity();
+    const ctx = currentContext();
+    const character = currentReformatCharacterKey();
     const capture = {
         trigger,
-        format,
+        mimeType,
+        generation: chatGeneration,
+        context: { ctx, character, modePromise: resolveCharMode(character) },
+        requiresHold: trigger === 'pointer' || trigger === 'keyboard',
+        clientRequestId: newClientRequestId(),
         stream: null,
         recorder: null,
         chunks: [],
@@ -2374,14 +2912,15 @@ async function startDesktopRecording(trigger) {
     try {
         capture.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         if (desktopCapture !== capture || capture.cancelled || capture.stopRequested
-                || (settings().captureMode === 'desktop-push-to-talk' && !desktopPttHeld)) {
+                || capture.generation !== chatGeneration
+                || (capture.requiresHold && !desktopPttHeld)) {
             finishDesktopCapture(capture);
             return false;
         }
 
-        const recorder = capture.recorder = new MediaRecorder(capture.stream, {
-            mimeType: format.mimeType,
-        });
+        const recorder = capture.recorder = new MediaRecorder(capture.stream, { mimeType });
+        // Send what the recorder actually produces (it may add codec params).
+        capture.mimeType = recorder.mimeType || mimeType;
         recorder.addEventListener('dataavailable', (event) => {
             if (!capture.cancelled && event.data?.size) capture.chunks.push(event.data);
         });
@@ -2430,10 +2969,35 @@ function stopDesktopRecording(reason, capture = desktopCapture) {
     return true;
 }
 
+/** Deliver the /transcribe response through the same cross-tab ownership
+ *  and dedupe path as SSE: insert once, and if SSE already inserted this
+ *  request here, only add the richer HTTP metadata. */
+async function deliverDesktopResult(capture, data) {
+    const requestId = String(data?.request_id || data?.requestId || '');
+    if (!requestId) {
+        if (!applyDictationResult(data, { source: 'desktop' })) throw new Error('Server returned no transcript');
+        return;
+    }
+    const result = { ...data, requestId };
+    if (dictationRequestWasApplied(requestId)) {
+        enrichAppliedDictationResult(result);
+        return;
+    }
+    const applied = await handleDictationResultEvent(result, '', 'desktop');
+    if (applied || capture.cancelled || capture.generation !== chatGeneration) return;
+    if (dictationRequestWasApplied(requestId)) {
+        enrichAppliedDictationResult(result);
+        return;
+    }
+    // Delivered by another tab, or cancelled: nothing to report.
+    if (incomingWasHandled(`result:${requestId}`) || !requestIsCurrent(requestId)) return;
+    throw new Error('Server returned no transcript');
+}
+
 async function submitDesktopRecording(capture) {
     cleanupDesktopCaptureHardware(capture);
     if (desktopCapture !== capture || capture.cancelled) return;
-    const blob = new Blob(capture.chunks, { type: capture.format.mimeType });
+    const blob = new Blob(capture.chunks, { type: capture.mimeType });
     capture.chunks.length = 0;
     if (!blob.size) {
         finishDesktopCapture(capture);
@@ -2445,11 +3009,10 @@ async function submitDesktopRecording(capture) {
     capture.abortController = new AbortController();
     try {
         const cfg = settings();
-        const ctx = currentContext();
-        const character = currentReformatCharacterKey();
-        let modeId = String(formatterModeEl?.value || '').trim();
-        if (!modeId && character) modeId = await fetchCharMode(character);
-        if (capture.cancelled) return;
+        const { ctx, character } = capture.context;
+        // Resolved during recording; normally already settled at key-up.
+        const modeId = await capture.context.modePromise;
+        if (capture.cancelled || capture.generation !== chatGeneration) return;
 
         const requestedLanguage = String(cfg.language || 'auto').trim().toLowerCase() || 'auto';
         const language = /^(?:[a-z]{2,4}|auto)$/.test(requestedLanguage) ? requestedLanguage : 'auto';
@@ -2463,26 +3026,24 @@ async function submitDesktopRecording(capture) {
         if (cfg.formatterModel) params.set('formatter_model', cfg.formatterModel);
         params.set('character', character);
         params.set('language', language);
+        params.set('client_request_id', capture.clientRequestId);
         const url = `${cfg.serverUrl.replace(/\/+$/, '')}/transcribe?${params.toString()}`;
         const res = await fetch(url, {
             method: 'POST',
             mode: 'cors',
             cache: 'no-store',
-            headers: { 'Content-Type': capture.format.mimeType, ...contextHeaders, ...authHeaders() },
+            headers: { 'Content-Type': capture.mimeType, ...contextHeaders, ...authHeaders() },
             body: blob,
             signal: capture.abortController.signal,
         });
         let data = null;
         try { data = await res.json(); } catch {}
-        if (capture.cancelled) return;
+        if (capture.cancelled || capture.generation !== chatGeneration) return;
         if (!res.ok || data?.error) {
             throw new Error(String(data?.error || `transcribe_http_${res.status}`));
         }
-        if (!applyDictationResult(data, { source: 'desktop' })) {
-            if (!dictationRequestWasApplied(String(data?.request_id || data?.requestId || ''))) {
-                throw new Error('Server returned no transcript');
-            }
-        }
+        capture.phase = 'delivering';
+        await deliverDesktopResult(capture, data);
     } finally {
         finishDesktopCapture(capture);
     }
@@ -2507,67 +3068,92 @@ async function onMicClick() {
     }
 
     if (phoneLaunchPromise) return phoneLaunchPromise;
-    phoneLaunchPromise = launchPhoneDictation();
+    // Still inside the click: open the popup now so it keeps user activation.
+    const pendingWin = settings().openStyle === 'iframe' ? null : openPendingPopup('dictation_bridge', PHONE_POPUP_FEATURES);
+    phoneLaunchPromise = launchPhoneDictation(pendingWin);
     try { return await phoneLaunchPromise; }
     finally { phoneLaunchPromise = null; }
 }
 
-async function launchPhoneDictation() {
+/** Quick-launch "Dictation" button: phone mode opens the phone page; both
+ *  desktop modes toggle a recording (holding a settings button is awkward). */
+function onQuickLaunchDictation() {
+    if ((settings().captureMode || 'phone-popup') === 'phone-popup') return onMicClick();
+    if (desktopCapture) {
+        stopDesktopRecording('quick-launch');
+        return Promise.resolve();
+    }
+    return startDesktopRecording('quick-launch');
+}
 
-    const ok = await probeServer();
-    if (!ok) {
-        const toast = window.toastr;
-        const msg = 'Dictation server unreachable. Check serverUrl, accept the self-signed cert in a new tab, then retry.';
-        if (toast?.error) toast.error(msg, 'Dictation Bridge');
-        else alert(msg);
+function notifyLaunchError(msg) {
+    if (window.toastr?.error) window.toastr.error(msg, 'Dictation Bridge');
+    else alert(msg);
+}
+
+function authFailureMessage() {
+    const tokenState = tokenStatusLabel();
+    if (tokenState === 'missing') {
+        return 'Dictation server reachable, but no bearer token is configured. Paste the server token in Dictation Bridge settings.';
+    }
+    if (tokenState === 'invalid') {
+        return 'Dictation server rejected the bearer token (401). Re-pair or sync the token before opening the phone page.';
+    }
+    if (tokenState === 'unknown') {
+        return 'Dictation server answered /health, but the token check could not reach it (network error or timeout). Retry, or check the server URL and certificate.';
+    }
+    return `Dictation server could not verify the token (${escapeHtml(serverAuthStatus.lastError || 'server error')}). Check the server, then retry.`;
+}
+
+async function launchPhoneDictation(pendingWin = null) {
+    warmServer();
+    const fail = (msg) => {
+        closePendingPopup(pendingWin);
+        notifyLaunchError(msg);
+    };
+
+    if (!(await probeServer())) {
+        fail('Dictation server unreachable. Check serverUrl, accept the self-signed cert in a new tab, then retry.');
         return;
     }
-
-    const authed = await probeServerAuth();
-    if (!authed) {
-        const toast = window.toastr;
-        const tokenState = tokenStatusLabel();
-        const msg = tokenState === 'missing'
-            ? 'Dictation server reachable, but no bearer token is configured. Paste the server token in Dictation Bridge settings.'
-            : 'Dictation server reachable, but the bearer token is invalid/stale. Re-pair or sync the token before opening the phone page.';
-        if (toast?.error) toast.error(msg, 'Dictation Bridge');
-        else alert(msg);
+    if (!(await probeServerAuth())) {
+        fail(authFailureMessage());
         return;
     }
 
     // Make the launch itself a context handoff. This matters on Android/Chrome:
     // once the dictation tab is foregrounded, the ST tab can be frozen before
     // the normal 30s heartbeat gets another chance to run.
-    await postState('mic-open');
+    const stateAccepted = await postState('mic-open');
+    if (stateAccepted === false) {
+        toast('warning', `Calliope did not accept the current chat context (${escapeHtml(lastStateError || 'error')}); the phone page may follow a stale chat.`, { timeOut: 5000 });
+    }
 
     let url;
     try {
         url = await buildEmbedUrl();
     } catch (e) {
-        const msg = `Could not create one-time phone pairing: ${escapeHtml(e?.message || 'request failed')}`;
-        if (window.toastr?.error) window.toastr.error(msg, 'Dictation Bridge');
-        else alert(msg);
+        fail(`Could not create one-time phone pairing: ${escapeHtml(e?.message || 'request failed')}`);
         return;
     }
-    if (settings().openStyle === 'iframe') {
-        openIframe(url);
-    } else {
-        openPopup(url);
-    }
-    setMicActive(true);
+    const opened = settings().openStyle === 'iframe' ? openIframe(url) : openPopup(url, pendingWin);
+    if (opened) setMicActive(true);
 }
 
-function openPopup(url) {
-    const w = 500, h = 900;
-    const features = `width=${w},height=${h},menubar=no,toolbar=no,location=no,status=no,scrollbars=yes,resizable=yes`;
-    const win = window.open(url, 'dictation_bridge', features);
+const PHONE_POPUP_FEATURES = 'width=500,height=900,menubar=no,toolbar=no,location=no,status=no,scrollbars=yes,resizable=yes';
+
+/** Use the placeholder opened during the click when it survived; returns
+ *  whether a popup is now showing the phone page. */
+function openPopup(url, pendingWin = null) {
+    let win = null;
+    if (navigatePendingPopup(pendingWin, url)) win = pendingWin;
+    else {
+        try { win = window.open(url, 'dictation_bridge', PHONE_POPUP_FEATURES); } catch {}
+    }
     if (!win) {
-        const toast = window.toastr;
-        const msg = 'Popup blocked. Allow popups for SillyTavern or switch openStyle to "iframe".';
-        if (toast?.error) toast.error(msg, 'Dictation Bridge');
-        else alert(msg);
+        notifyLaunchError('Popup blocked. Allow popups for SillyTavern or switch openStyle to "iframe".');
         setMicActive(false);
-        return;
+        return false;
     }
     activeTarget = win;
     activeIsIframe = false;
@@ -2577,6 +3163,7 @@ function openPopup(url) {
         if (win.closed) closeActive(win);
     }, 500);
     popupWatcher = watcher;
+    return true;
 }
 
 function openIframe(url) {
@@ -2607,6 +3194,7 @@ function openIframe(url) {
     activeModal = modal;
     activeTarget = iframe.contentWindow;
     activeIsIframe = true;
+    return true;
 }
 
 function closeActive(expectedTarget = null) {
@@ -2646,7 +3234,7 @@ function postToServer(payload) {
 }
 
 /** Write text into ST's chat input, firing the input event so ST picks it up. */
-function writeToTextarea(text, { autoSend = false, appendMode = 'replace' } = {}) {
+function writeToTextarea(text, { appendMode = 'replace' } = {}) {
     const ta = document.getElementById('send_textarea');
     if (!ta) { WARN('send_textarea not found'); return; }
     // POL-1: snapshot pre-write state so 'scratch that' / 'undo' can restore.
@@ -2658,19 +3246,11 @@ function writeToTextarea(text, { autoSend = false, appendMode = 'replace' } = {}
     ta.dispatchEvent(new Event('input', { bubbles: true }));
     // ST auto-grows the textarea on input; focus helps visual feedback.
     try { ta.focus(); ta.setSelectionRange(next.length, next.length); } catch {}
-
-    if (autoSend) {
-        // Canonical ST path: click #send_but. This routes through sendTextareaMessage()
-        // -> Generate(), preserving all the usual pre-send hooks.
-        const btn = document.getElementById('send_but');
-        if (btn) btn.click();
-        else WARN('send_but not found, cannot auto-send');
-    }
 }
 
-/** Global postMessage handler. */
+/** Global postMessage handler: only the window we opened, from the server origin. */
 function onWindowMessage(event) {
-    if (!activeTarget) return;
+    if (!activeTarget || event.source !== activeTarget) return;
     const origin = serverOrigin();
     if (!origin || event.origin !== origin) return;
     const data = event?.data;
@@ -2683,33 +3263,9 @@ function onWindowMessage(event) {
             LOG('server ready');
             pushContextIfEnabled();
             break;
-        case 'dictation-result': {
-            const text = String(data.text ?? '');
-            if (!text) { WARN('dictation-result had empty text'); return; }
-            if (typeof data.model === 'string') lastDoneModel = data.model;
-            lastModelFallback = !!data.model_fallback;
-            const cfg = settings();
-            writeToTextarea(text, { autoSend: cfg.autoSend, appendMode: cfg.appendMode });
-            if (cfg.autoSend) setTimeout(() => maybeReadDictatedPersonaText(text), 200);
-            renderRepairTraceFromPayload(data, text);
-            if (data.formatting_skipped && window.toastr) {
-                const reason = data.formatting_reason ? `: ${escapeHtml(data.formatting_reason)}` : '';
-                window.toastr.warning(`RP formatting skipped${reason}. Raw transcript used.`, 'Dictation Bridge');
-            }
-            // POL-3: low-confidence banner if the server tagged spans.
-            const spans = data.low_confidence_spans || data.lowConfidenceSpans;
-            if (Array.isArray(spans) && spans.length) {
-                try { renderLowConfBanner(spans); }
-                catch (err) { WARN('lowconf banner render failed', err?.message || err); }
-            }
-            // For popups, close so the user is back in ST. For iframes, leave open
-            // so they can see the result — they close via the X or backdrop.
-            if (!activeIsIframe) closeActive();
-            break;
-        }
         case 'dictation-edit':
             if (settings().liveMirror) {
-                writeToTextarea(String(data.text ?? ''), { autoSend: false, appendMode: 'replace' });
+                writeToTextarea(String(data.text ?? ''), { appendMode: 'replace' });
             }
             break;
         default:
@@ -2775,10 +3331,11 @@ function renderRepairTraceFromPayload(data, finalText) {
 // server agent emits this when a non-loopback host is seen in the last
 // 60s), the modal header gets a red banner.
 //
-// Endpoint shape (best-effort; tolerant to changes):
-//   { entries: [ { ts, method, path, host, port, latency_ms,
-//                  bytes?, status? } ], warning?: string,
-//     summary?: { audio?, transcript?, llm?, phone? } }
+// Endpoint shape (server-owned):
+//   { generated_at, totals_60s: {loopback, non_loopback, error},
+//     recent: [ { ts, host, port, method, path, bytes_out, latency_ms,
+//                 is_loopback, error? } ], warning?: string }
+// `recent` covers the last 60 s; `?all=1` returns the whole ring buffer.
 const PRIVACY_PEEK_ID = 'dictation_bridge_privacy_peek';
 
 function isLoopbackHost(host) {
@@ -2806,23 +3363,24 @@ function fmtTime(ts) {
     } catch { return '--:--:--'; }
 }
 
-async function fetchAuditNetwork() {
+async function fetchAuditNetwork({ all = false } = {}) {
     const cfg = settings();
-    const url = `${cfg.serverUrl.replace(/\/+$/, '')}/audit/network`;
+    const url = `${cfg.serverUrl.replace(/\/+$/, '')}/audit/network${all ? '?all=1' : ''}`;
     try {
-        const res = await fetch(url, {
+        const res = await fetchWithTimeout(url, {
             method: 'GET',
             mode: 'cors',
             cache: 'no-store',
             headers: { ...authHeaders() },
         });
         if (!res.ok) {
-            return { error: `HTTP ${res.status}`, entries: [] };
+            return { error: `HTTP ${res.status}`, recent: [] };
         }
         const data = await res.json();
-        return data && typeof data === 'object' ? data : { entries: [] };
+        if (!data || typeof data !== 'object') return { recent: [] };
+        return { ...data, recent: Array.isArray(data.recent) ? data.recent : [] };
     } catch (e) {
-        return { error: e?.message || String(e), entries: [] };
+        return { error: e?.name === 'AbortError' ? 'timeout' : (e?.message || String(e)), recent: [] };
     }
 }
 
@@ -2834,7 +3392,7 @@ function renderAuditEntries(entries, limit) {
     const rows = slice.map((e) => {
         const host = String(e.host ?? e.destination ?? '');
         const port = e.port != null ? `:${e.port}` : '';
-        const loopback = isLoopbackHost(host);
+        const loopback = typeof e.is_loopback === 'boolean' ? e.is_loopback : isLoopbackHost(host);
         const color = loopback ? '#A8C97B' : '#FF5A4E';
         const label = loopback ? 'local' : 'EXTERNAL';
         const lat = e.latency_ms != null ? `${Math.round(e.latency_ms)}ms` : '';
@@ -2885,9 +3443,9 @@ function buildPrivacyPeekHtml(audit, opts = {}) {
                     <span style="color:#98876F">LLM cleanup:</span><span>${escapeHtml(llm)}</span>
                     <span style="color:#98876F">Phone &harr; PC:</span><span>${escapeHtml(phoneHost)}</span>
                 </div>
-                <div style="margin:0 0 6px 0;font-size:12px;color:#98876F">Network calls in last 5 min:</div>
+                <div style="margin:0 0 6px 0;font-size:12px;color:#98876F">${opts.full ? 'All recorded network calls' : 'Network calls in the last 60 s'}${audit?.totals_60s ? ` · 60 s totals: ${escapeHtml(Number(audit.totals_60s.loopback) || 0)} local, ${escapeHtml(Number(audit.totals_60s.non_loopback) || 0)} external, ${escapeHtml(Number(audit.totals_60s.error) || 0)} failed` : ''}:</div>
                 <div id="dbb_privacy_audit_list" style="max-height:240px;overflow:auto;border:1px solid rgba(255, 182, 72, 0.18);border-radius:2px;padding:4px 8px;background:rgba(0,0,0,0.25)">
-                    ${renderAuditEntries(audit?.entries, limit)}
+                    ${renderAuditEntries(audit?.recent, limit)}
                 </div>
                 <div style="display:flex;gap:8px;margin-top:12px;font-size:12px">
                     <button id="dbb_privacy_full_btn" class="menu_button" style="flex:0 0 auto">${opts.full ? '[Show last 10]' : '[View full audit log]'}</button>
@@ -2900,7 +3458,7 @@ function buildPrivacyPeekHtml(audit, opts = {}) {
 
 async function openPrivacyPeek(opts = {}) {
     closePrivacyPeek();
-    const audit = await fetchAuditNetwork();
+    const audit = await fetchAuditNetwork({ all: !!opts.full });
     const wrapper = document.createElement('div');
     wrapper.innerHTML = buildPrivacyPeekHtml(audit, opts);
     const modal = wrapper.firstElementChild;
@@ -2993,13 +3551,15 @@ function closeCheatsheet() {
 
 const TTS_BTN_CLASS = 'dictation-bridge-tts-btn';
 const TTS_BTN_FLAG = 'data-dbb-tts';     // marker: this .mes already got the button
-const TTS_AUTO_READ_LAST_KEY = 'dbb_auto_read_last_mesid';
 
-let currentTtsAudio = null;     // single global Audio so a new click stops the prior one
-let currentTtsBlobUrl = null;
+let currentTtsAudio = null;     // audio-like handle of the current playback (pause/play)
 let currentTtsBtn = null;
-let currentTtsAudioContext = null;
-let currentTtsAudioSource = null;
+// The current playback owns its own resources: { token, audio, url, source, ctx, released }
+let currentTtsPlayback = null;
+// Bumped by every Stop / new read / chat switch; pending fetches and
+// playbacks whose token is older never start, and their requests abort.
+let ttsPlaybackGeneration = 0;
+let ttsAbortController = new AbortController();
 let ttsUnlockedAudioContext = null; // kept warm after user gesture for auto-read playback
 let ttsBackendAvailable = null; // null = unknown; true/false after first call
 let ttsBackendNotifiedMissing = false;
@@ -3016,7 +3576,10 @@ const TTS_STREAM_PREVIEW_CHARS = 72;
 const TTS_REQUEST_MAX_CHARS = 4800; // server hard limit is 5000; keep request headroom
 const TTS_AUDIO_PLAY_TIMEOUT_MS = 3000; // browser play() can hang behind autoplay policy
 let ttsStreamUiState = { state: 'off', queueCount: 0, preview: '', paused: false };
-let repaintTtsRoster = null; // set by settings panel; called on group/chat switch
+// Set by the settings panel: repaint context-dependent controls / reload
+// server catalogs. No-ops until the panel exists.
+let settingsContextRepaint = null;
+let settingsCatalogReload = null;
 
 function ttsAudioErrorDetails(audio, blob) {
     const err = audio?.error;
@@ -3072,26 +3635,92 @@ async function playHtmlAudioWithTimeout(audio, timeoutMs = TTS_AUDIO_PLAY_TIMEOU
     }
 }
 
-async function createAndPlayTtsAudio(blob, onEnded) {
+function ttsAbortError() {
+    const err = new Error('tts_cancelled');
+    err.name = 'AbortError';
+    return err;
+}
+
+/** Snapshot of the playback generation. `valid()` narrows it (e.g. to one
+ *  stream chunk); `held()` keeps a ready chunk paused instead of playing. */
+function ttsPlaybackToken(extra = {}) {
+    return { gen: ttsPlaybackGeneration, signal: ttsAbortController.signal, ...extra };
+}
+
+function ttsTokenCurrent(token) {
+    return !!token && token.gen === ttsPlaybackGeneration && !token.signal.aborted
+        && (!token.valid || token.valid());
+}
+
+/** Invalidate every pending TTS fetch/playback start and abort its request. */
+function invalidateTtsPlayback() {
+    ttsPlaybackGeneration++;
+    try { ttsAbortController.abort(); } catch {}
+    ttsAbortController = new AbortController();
+}
+
+/** Stop whatever plays and return a fresh token for a new playback. */
+function startTtsPlayback() {
+    stopTts();
+    return ttsPlaybackToken();
+}
+
+function releaseTtsPlayback(playback) {
+    if (!playback || playback.released) return;
+    playback.released = true;
+    try { playback.source?.stop(); } catch {}
+    if (playback.ctx && playback.ctx !== ttsUnlockedAudioContext) {
+        try { playback.ctx.close(); } catch {}
+    }
+    try { playback.audio?.pause?.(); } catch {}
+    if (playback.url) {
+        try { URL.revokeObjectURL(playback.url); } catch {}
+        playback.url = null;
+    }
+    if (currentTtsPlayback === playback) {
+        currentTtsPlayback = null;
+        currentTtsAudio = null;
+    }
+}
+
+function adoptTtsPlayback(playback) {
+    if (currentTtsPlayback && currentTtsPlayback !== playback) releaseTtsPlayback(currentTtsPlayback);
+    currentTtsPlayback = playback;
+    currentTtsAudio = playback.audio;
+}
+
+/** Natural end: free this playback's resources, then notify only if it was
+ *  still the current, valid playback. */
+function finishTtsPlayback(playback, onEnded) {
+    const wasCurrent = currentTtsPlayback === playback;
+    releaseTtsPlayback(playback);
+    if (wasCurrent && ttsTokenCurrent(playback.token)) onEnded?.();
+}
+
+async function createAndPlayTtsAudio(blob, onEnded, token) {
+    if (!ttsTokenCurrent(token)) throw ttsAbortError();
     const audioBlob = normalizeTtsBlob(blob);
-    currentTtsBlobUrl = URL.createObjectURL(audioBlob);
     const audio = new Audio();
+    const playback = { token, audio, url: URL.createObjectURL(audioBlob), source: null, ctx: null, released: false };
+    adoptTtsPlayback(playback);
     audio.preload = 'auto';
-    audio.src = currentTtsBlobUrl;
-    currentTtsAudio = audio;
-    audio.addEventListener('ended', onEnded);
+    audio.src = playback.url;
+    audio.addEventListener('ended', () => finishTtsPlayback(playback, onEnded));
     audio.addEventListener('error', () => {
         WARN('tts audio element error', ttsAudioErrorDetails(audio, audioBlob));
     });
     try {
         await waitForTtsAudioReady(audio, audioBlob);
+        if (!ttsTokenCurrent(token)) throw ttsAbortError();
+        // Paused while loading: keep it ready; resume plays this element.
+        if (token.held?.()) return audio;
         await playHtmlAudioWithTimeout(audio);
+        if (!ttsTokenCurrent(token)) throw ttsAbortError();
     } catch (e) {
+        releaseTtsPlayback(playback);
+        if (e?.name === 'AbortError' || !ttsTokenCurrent(token)) throw ttsAbortError();
         WARN('html audio playback failed; trying WebAudio fallback', e?.message || e, ttsAudioErrorDetails(audio, audioBlob));
-        try { audio.pause(); } catch {}
-        try { URL.revokeObjectURL(currentTtsBlobUrl); } catch {}
-        currentTtsBlobUrl = null;
-        return await createAndPlayTtsWebAudio(audioBlob, onEnded, e);
+        return await createAndPlayTtsWebAudio(audioBlob, onEnded, e, token);
     }
     return audio;
 }
@@ -3121,7 +3750,7 @@ async function unlockTtsAudio(reason = 'gesture') {
     }
 }
 
-async function createAndPlayTtsWebAudio(blob, onEnded, originalError) {
+async function createAndPlayTtsWebAudio(blob, onEnded, originalError, token) {
     const AudioCtx = window.AudioContext || window.webkitAudioContext;
     if (!AudioCtx) {
         const err = new Error(`${originalError?.message || originalError} (${blob?.size || 0} bytes; WebAudio unavailable)`);
@@ -3132,27 +3761,31 @@ async function createAndPlayTtsWebAudio(blob, onEnded, originalError) {
         ? ttsUnlockedAudioContext
         : new AudioCtx();
     ttsUnlockedAudioContext = ctx;
-    currentTtsAudioContext = ctx;
     const buffer = await ctx.decodeAudioData(await blob.arrayBuffer());
+    if (!ttsTokenCurrent(token)) throw ttsAbortError();
     const source = ctx.createBufferSource();
     source.buffer = buffer;
     source.connect(ctx.destination);
-    currentTtsAudioSource = source;
-    const playback = {
+    const handle = {
         paused: false,
         pause() {
             this.paused = true;
             try { source.stop(); } catch {}
         },
     };
-    currentTtsAudio = playback;
+    const playback = { token, audio: handle, url: null, source, ctx, released: false };
+    adoptTtsPlayback(playback);
     source.onended = () => {
-        playback.paused = true;
-        if (currentTtsAudio === playback) onEnded?.();
+        handle.paused = true;
+        finishTtsPlayback(playback, onEnded);
     };
     if (ctx.state === 'suspended') await ctx.resume();
+    if (!ttsTokenCurrent(token)) {
+        releaseTtsPlayback(playback);
+        throw ttsAbortError();
+    }
     source.start(0);
-    return playback;
+    return handle;
 }
 
 function ttsSetButtonState(btn, state) {
@@ -3225,29 +3858,19 @@ function paintTtsStreamStatus() {
     if (pauseBtn) pauseBtn.textContent = st === 'paused' ? 'Resume' : 'Pause';
 }
 
-function cleanupCurrentTtsAudioOnly() {
-    try { currentTtsAudioSource?.stop(); } catch {}
-    if (currentTtsAudioContext && currentTtsAudioContext !== ttsUnlockedAudioContext) {
-        try { currentTtsAudioContext.close(); } catch {}
-    }
-    currentTtsAudioSource = null;
-    currentTtsAudioContext = null;
-    try { currentTtsAudio?.pause?.(); } catch {}
-    if (currentTtsBlobUrl) {
-        try { URL.revokeObjectURL(currentTtsBlobUrl); } catch {}
-        currentTtsBlobUrl = null;
-    }
-    currentTtsAudio = null;
-}
-
+/** Skip: cancel the in-flight chunk fetch (its completion is discarded), drop
+ *  the playing chunk, continue with the queue. */
 function skipCurrentTtsChunk() {
     const session = ttsStreamingSession;
     if (!session) { stopTts(); return; }
-    cleanupCurrentTtsAudioOnly();
+    session.activeChunkId = 0;
+    try { session.chunkAbort?.abort(); } catch {}
+    session.heldBlob = null;
+    releaseTtsPlayback(currentTtsPlayback);
     session.playing = false;
     session.currentChunk = '';
     setTtsStreamUiState(session.queue.length ? 'queued' : 'watching', session);
-    if (session.queue.length) playNextTtsStreamChunk(session);
+    if (session.queue.length && !session.paused) playNextTtsStreamChunk(session);
 }
 
 function toggleTtsStreamPause() {
@@ -3255,7 +3878,11 @@ function toggleTtsStreamPause() {
     if (!session) return;
     if (session.paused) {
         session.paused = false;
-        if (currentTtsAudio?.play && currentTtsAudio.paused) {
+        const held = session.heldBlob;
+        session.heldBlob = null;
+        if (held && ttsTokenCurrent(held.token)) {
+            playTtsStreamBlob(session, held.blob, held.token).catch(e => failStreamingTts(session, e, held.token));
+        } else if (currentTtsAudio?.play && currentTtsAudio.paused) {
             currentTtsAudio.play().catch(e => WARN('tts resume failed', e?.message || e));
         } else if (!session.playing && session.queue.length) {
             playNextTtsStreamChunk(session);
@@ -3263,11 +3890,12 @@ function toggleTtsStreamPause() {
         setTtsStreamUiState(streamStatusForSession(session), session);
         return;
     }
+    // A chunk still being fetched is held when it arrives (see playNextTtsStreamChunk).
     session.paused = true;
-    if (currentTtsAudio?.pause) {
+    if (currentTtsAudio?.play) {
         try { currentTtsAudio.pause(); } catch {}
-    } else {
-        cleanupCurrentTtsAudioOnly();
+    } else if (currentTtsAudio) {
+        releaseTtsPlayback(currentTtsPlayback);
         session.playing = false;
         session.currentChunk = '';
         toast('info', 'WebAudio playback cannot pause; skipped current chunk instead.');
@@ -3280,21 +3908,26 @@ function cancelStreamingTts() {
         setTtsStreamUiState(settings().ttsReadStreamingPartials && settings().ttsAutoReadAi ? 'watching' : 'off', null);
         return;
     }
-    ttsStreamingSession.stopped = true;
-    ttsStreamingSession.queue = [];
-    ttsStreamingSession.currentChunk = '';
+    const session = ttsStreamingSession;
+    session.stopped = true;
+    session.queue = [];
+    session.currentChunk = '';
+    session.heldBlob = null;
+    try { session.chunkAbort?.abort(); } catch {}
     ttsStreamingSession = null;
     setTtsStreamUiState(settings().ttsReadStreamingPartials && settings().ttsAutoReadAi ? 'stopped' : 'off', null);
 }
 
+/** Stop everything: invalidates pending fetches/playback starts too. */
 function stopTts() {
+    invalidateTtsPlayback();
     cancelStreamingTts();
-    cleanupCurrentTtsAudioOnly();
+    releaseTtsPlayback(currentTtsPlayback);
+    currentTtsAudio = null;
     if (currentTtsBtn) {
         ttsSetButtonState(currentTtsBtn, 'idle');
         currentTtsBtn = null;
     }
-    currentTtsAudio = null;
 }
 
 /**
@@ -3395,7 +4028,9 @@ function isTtsMessageEl(mesEl) {
     return true;
 }
 
-async function fetchTts(text, voice) {
+/** POST /tts. `signal` cancels it (Stop/skip/chat switch → AbortError); a
+ *  finite deadline turns a hung synth into a reported `tts_timeout`. */
+async function fetchTts(text, voice, signal = null) {
     const cfg = settings();
     const url = `${cfg.serverUrl.replace(/\/+$/, '')}/tts`;
     const cleanText = String(text || '').trim();
@@ -3411,24 +4046,32 @@ async function fetchTts(text, voice) {
     }
     const body = { text: cleanText };
     if (voice) body.voice = voice;
-    const res = await fetch(url, {
-        method: 'POST',
-        mode: 'cors',
-        cache: 'no-store',
-        headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-        let code = `tts_http_${res.status}`;
-        try {
-            const payload = await res.clone().json();
-            if (payload?.code) code = `tts_${payload.code}`;
-        } catch {}
-        const err = new Error(code);
-        err.status = res.status;
+    try {
+        return await fetchWithTimeout(url, {
+            method: 'POST',
+            mode: 'cors',
+            cache: 'no-store',
+            headers: { 'Content-Type': 'application/json', ...authHeaders() },
+            body: JSON.stringify(body),
+        }, TTS_FETCH_TIMEOUT_MS, signal, async (res) => {
+            if (!res.ok) {
+                let code = `tts_http_${res.status}`;
+                try {
+                    const payload = await res.clone().json();
+                    if (payload?.code) code = `tts_${payload.code}`;
+                } catch {}
+                const err = new Error(code);
+                err.status = res.status;
+                throw err;
+            }
+            return await res.blob();
+        });
+    } catch (e) {
+        if (e?.name !== 'AbortError' || signal?.aborted) throw e;
+        const err = new Error('tts_timeout');
+        err.status = 504;
         throw err;
     }
-    return await res.blob();
 }
 
 function currentChatTitle() {
@@ -3627,14 +4270,47 @@ function notifyTtsMissing(reason) {
     LOG('tts unavailable:', reason);
 }
 
+function isTtsCancellation(e) {
+    return e?.name === 'AbortError';
+}
+
+function reportTtsError(e, label) {
+    const status = e?.status || 0;
+    // 404/501/503/network = endpoint or backend not loaded; treat as missing-backend.
+    if (status === 404 || status === 501 || status === 503 || status === 0) {
+        notifyTtsMissing(e?.message || `status_${status}`);
+    } else {
+        WARN(`${label} failed`, e?.message || e);
+        toast('error', `${escapeHtml(label)} failed: ${escapeHtml(e?.message || 'unknown')}`);
+    }
+}
+
+function createTtsStreamSession(mesEl, btn, { mesid = messageIdFromEl(mesEl), spokenUntil = 0, queue = [] } = {}) {
+    return {
+        mesid,
+        mesEl,
+        voice: resolveTtsVoiceForMessage(mesEl),
+        btn,
+        spokenUntil,
+        queue,
+        playing: false,
+        paused: false,
+        currentChunk: '',
+        stopped: false,
+        chunkSeq: 0,
+        activeChunkId: 0,
+        chunkAbort: null,
+        heldBlob: null, // { blob, token } fetched while paused
+    };
+}
+
 async function readMessageAloud(mesEl, btn) {
-    // Toggle: clicking the same playing button stops it.
-    if (currentTtsBtn === btn && currentTtsAudio && !currentTtsAudio.paused) {
+    // Toggle: clicking the same button while it loads or plays stops it.
+    if (currentTtsBtn === btn
+            && (btn?.dataset?.dbbTtsState === 'loading' || (currentTtsAudio && !currentTtsAudio.paused))) {
         stopTts();
         return;
     }
-    // Switching to a new message: stop the prior playback first.
-    if (currentTtsBtn && currentTtsBtn !== btn) stopTts();
 
     const text = extractMessageText(mesEl);
     if (!text) {
@@ -3644,70 +4320,48 @@ async function readMessageAloud(mesEl, btn) {
 
     const chunks = splitTextForTtsRequests(text);
     if (chunks.length > 1) {
-        if (ttsStreamingSession && ttsStreamingSession.mesEl !== mesEl) cancelStreamingTts();
         stopTts();
-        ttsStreamingSession = {
-            mesid: messageIdFromEl(mesEl),
-            mesEl,
-            voice: resolveTtsVoiceForMessage(mesEl),
-            btn,
-            spokenUntil: text.length,
-            queue: chunks,
-            playing: false,
-            paused: false,
-            currentChunk: '',
-            stopped: false,
-        };
+        ttsStreamingSession = createTtsStreamSession(mesEl, btn, { spokenUntil: text.length, queue: chunks });
         currentTtsBtn = btn;
         setTtsStreamUiState('queued', ttsStreamingSession, chunks[0]);
         playNextTtsStreamChunk(ttsStreamingSession);
         return;
     }
 
+    // Invalidates any earlier read that is still fetching.
+    const token = startTtsPlayback();
     ttsSetButtonState(btn, 'loading');
     currentTtsBtn = btn;
 
     let blob;
     try {
-        blob = await fetchTts(text, resolveTtsVoiceForMessage(mesEl));
+        blob = await fetchTts(text, resolveTtsVoiceForMessage(mesEl), token.signal);
+        if (!ttsTokenCurrent(token)) return; // stopped or superseded meanwhile
         ttsBackendAvailable = true;
     } catch (e) {
-        const status = e?.status || 0;
-        // 404/501/503 = endpoint or backend not loaded; treat as missing-backend.
-        if (status === 404 || status === 501 || status === 503 || status === 0) {
-            notifyTtsMissing(e?.message || `status_${status}`);
-        } else {
-            WARN('tts fetch failed', e?.message || e);
-            toast('error', `TTS failed: ${escapeHtml(e?.message || 'unknown')}`);
-        }
+        if (isTtsCancellation(e) || !ttsTokenCurrent(token)) return;
+        reportTtsError(e, 'TTS');
         ttsSetButtonState(btn, 'idle');
         if (currentTtsBtn === btn) currentTtsBtn = null;
         return;
     }
 
     try {
-        try {
-            const audio = await createAndPlayTtsAudio(blob, () => {
-                if (currentTtsAudio === audio) stopTts();
-            });
-            ttsSetButtonState(btn, 'playing');
-        } catch (playErr) {
-            // Autoplay-policy or NotAllowedError: gesture chain broken
-            // by the awaited fetch. Surface the specific reason so users
-            // can grant permission instead of guessing.
-            const name = playErr?.name || 'Error';
-            const msg = playErr?.message || String(playErr);
-            WARN('tts play() rejected', name, msg);
-            if (name === 'NotAllowedError') {
-                toast('error', 'Browser blocked autoplay. Click the 🔊 button again to play (gesture chain expires during fetch).');
-            } else {
-                toast('error', `TTS play failed: ${name} — ${msg}`);
-            }
-            stopTts();
+        await createAndPlayTtsAudio(blob, () => stopTts(), token);
+        ttsSetButtonState(btn, 'playing');
+    } catch (playErr) {
+        if (isTtsCancellation(playErr) || !ttsTokenCurrent(token)) return;
+        // Autoplay-policy or NotAllowedError: gesture chain broken
+        // by the awaited fetch. Surface the specific reason so users
+        // can grant permission instead of guessing.
+        const name = playErr?.name || 'Error';
+        const msg = playErr?.message || String(playErr);
+        WARN('tts play() rejected', name, msg);
+        if (name === 'NotAllowedError') {
+            toast('error', 'Browser blocked autoplay. Click the 🔊 button again to play (gesture chain expires during fetch).');
+        } else {
+            toast('error', `TTS play failed: ${escapeHtml(name)} — ${escapeHtml(msg)}`);
         }
-    } catch (e) {
-        WARN('tts playback setup failed', e?.message || e);
-        toast('error', `TTS playback setup: ${e?.message || 'unknown'}`);
         stopTts();
     }
 }
@@ -3755,35 +4409,50 @@ function sweepInjectTtsButtons() {
 
 function ensureTtsObserver() {
     if (ttsObserver) return;
-    const chatRoot = document.getElementById('chat');
-    if (!chatRoot) {
+    if (!document.getElementById('chat')) {
         setTimeout(ensureTtsObserver, 500);
         return;
     }
     try {
         ttsObserver = new MutationObserver((records) => {
+            const streaming = !!settings().ttsReadStreamingPartials;
             for (const rec of records) {
-                const targetMes = rec.target?.closest?.('.mes') || rec.target?.parentElement?.closest?.('.mes');
-                if (targetMes) handleTtsStreamingMutation(targetMes);
+                if (streaming) {
+                    const targetMes = rec.target?.closest?.('.mes') || rec.target?.parentElement?.closest?.('.mes');
+                    if (targetMes) handleTtsStreamingMutation(targetMes);
+                }
                 rec.addedNodes && rec.addedNodes.forEach(node => {
                     if (!(node instanceof HTMLElement)) return;
                     if (node.classList?.contains('mes')) {
                         injectTtsButtonOn(node);
-                        handleTtsStreamingMutation(node);
+                        if (streaming) handleTtsStreamingMutation(node);
                     }
                     // If a swipe re-renders, .mes_buttons may be replaced inside an existing .mes.
                     const inner = node.querySelector?.('.mes');
                     if (inner) {
                         injectTtsButtonOn(inner);
-                        handleTtsStreamingMutation(inner);
+                        if (streaming) handleTtsStreamingMutation(inner);
                     }
                 });
             }
         });
-        ttsObserver.observe(chatRoot, { childList: true, subtree: true, characterData: true });
+        configureTtsObserver();
     } catch (e) {
         WARN('tts observer setup failed', e?.message || e);
     }
+}
+
+/** Per-token characterData records are only needed while streaming TTS is
+ *  on; otherwise watch structural changes (button injection) only. */
+function configureTtsObserver() {
+    const chatRoot = document.getElementById('chat');
+    if (!ttsObserver || !chatRoot) return;
+    ttsObserver.disconnect();
+    ttsObserver.observe(chatRoot, {
+        childList: true,
+        subtree: true,
+        characterData: !!settings().ttsReadStreamingPartials,
+    });
 }
 
 /**
@@ -3829,53 +4498,63 @@ function queueTtsStreamChunks(session, { final = false } = {}) {
     playNextTtsStreamChunk(session);
 }
 
+async function playTtsStreamBlob(session, blob, token) {
+    session.playing = true;
+    await createAndPlayTtsAudio(blob, () => {
+        session.playing = false;
+        session.currentChunk = '';
+        if (session.queue.length && !session.paused) playNextTtsStreamChunk(session);
+        else {
+            ttsSetButtonState(session.btn, 'idle');
+            setTtsStreamUiState(streamStatusForSession(session), session);
+        }
+    }, token);
+    ttsSetButtonState(session.btn, 'playing');
+}
+
+function failStreamingTts(session, e, token) {
+    if (isTtsCancellation(e) || !ttsTokenCurrent(token)) return;
+    session.stopped = true;
+    session.error = true;
+    if (ttsStreamingSession === session) ttsStreamingSession = null;
+    reportTtsError(e, 'Streaming TTS');
+    ttsSetButtonState(session.btn, 'idle');
+    session.playing = false;
+    setTtsStreamUiState('error', session);
+}
+
+/** Fetch and play the next queued chunk. Each chunk has its own id and abort
+ *  scope: skip/stop discards its completion; pause holds a finished fetch
+ *  until resume so exactly one chunk resumes. */
 async function playNextTtsStreamChunk(session) {
     if (!session || session.stopped || session.paused || session.playing || !session.queue.length) return;
     const chunk = session.queue.shift();
+    const chunkId = ++session.chunkSeq;
+    session.activeChunkId = chunkId;
+    session.chunkAbort = new AbortController();
     session.currentChunk = chunk;
     session.playing = true;
     setTtsStreamUiState('speaking', session, chunk);
     currentTtsBtn = session.btn || currentTtsBtn;
     ttsSetButtonState(currentTtsBtn, 'loading');
+    const token = ttsPlaybackToken({
+        valid: () => !session.stopped && ttsStreamingSession === session && session.activeChunkId === chunkId,
+        held: () => session.paused,
+    });
     try {
-        const blob = await fetchTts(chunk, session.voice);
-        if (session.stopped || ttsStreamingSession !== session) return;
+        const blob = await fetchTts(chunk, session.voice, session.chunkAbort.signal);
+        if (!ttsTokenCurrent(token)) return;
         ttsBackendAvailable = true;
-        const audio = await createAndPlayTtsAudio(blob, () => {
-            if (ttsStreamingSession !== session) return;
-            if (currentTtsAudio === audio) {
-                try { currentTtsAudio.pause?.(); } catch {}
-                if (currentTtsBlobUrl) {
-                    try { URL.revokeObjectURL(currentTtsBlobUrl); } catch {}
-                    currentTtsBlobUrl = null;
-                }
-                currentTtsAudio = null;
-                currentTtsAudioSource = null;
-                currentTtsAudioContext = null;
-            }
+        if (session.paused) {
+            session.heldBlob = { blob, token };
             session.playing = false;
-            session.currentChunk = '';
-            if (session.queue.length && !session.paused) playNextTtsStreamChunk(session);
-            else {
-                ttsSetButtonState(session.btn, 'idle');
-                setTtsStreamUiState(streamStatusForSession(session), session);
-            }
-        });
-        ttsSetButtonState(session.btn, 'playing');
-    } catch (e) {
-        session.stopped = true;
-        session.error = true;
-        ttsStreamingSession = null;
-        const status = e?.status || 0;
-        if (status === 404 || status === 501 || status === 503 || status === 0) {
-            notifyTtsMissing(e?.message || `status_${status}`);
-        } else {
-            WARN('streaming TTS failed', e?.message || e);
-            toast('error', `Streaming TTS failed: ${escapeHtml(e?.message || 'unknown')}`);
+            ttsSetButtonState(session.btn, 'idle');
+            setTtsStreamUiState('paused', session, chunk);
+            return;
         }
-        ttsSetButtonState(session.btn, 'idle');
-        session.playing = false;
-        setTtsStreamUiState('error', session);
+        await playTtsStreamBlob(session, blob, token);
+    } catch (e) {
+        failStreamingTts(session, e, token);
     }
 }
 
@@ -3886,27 +4565,16 @@ function maybeStartStreamingAutoRead(mesid, mesEl) {
     const id = parseInt(mesid, 10);
     if (!Number.isFinite(id) || id < 0 || !isAiMessageId(id)) return false;
     if (id <= ttsLastReadMesid) return true;
-    ttsLastReadMesid = id;
     const el = mesEl || document.querySelector(`#chat .mes[mesid="${id}"]`);
     if (!el) return false;
     injectTtsButtonOn(el);
     const btn = el.querySelector(`.${TTS_BTN_CLASS}`);
     if (!btn) return false;
-    if (ttsStreamingSession && ttsStreamingSession.mesid !== id) cancelStreamingTts();
+    // Only burn the id once the message can actually be read.
+    ttsLastReadMesid = id;
     if (!ttsStreamingSession || ttsStreamingSession.mesid !== id) {
         stopTts();
-        ttsStreamingSession = {
-            mesid: id,
-            mesEl: el,
-            voice: resolveTtsVoiceForMessage(el),
-            btn,
-            spokenUntil: 0,
-            queue: [],
-            playing: false,
-            paused: false,
-            currentChunk: '',
-            stopped: false,
-        };
+        ttsStreamingSession = createTtsStreamSession(el, btn, { mesid: id });
     }
     queueTtsStreamChunks(ttsStreamingSession, { final: false });
     return true;
@@ -3970,7 +4638,6 @@ function maybeAutoReadPersonaQuoted(mesid) {
     const id = parseInt(mesid, 10);
     if (!Number.isFinite(id) || id < 0) return;
     if (id <= ttsLastReadPersonaMesid) return;
-    ttsLastReadPersonaMesid = id;
     const m = chat?.[id];
     if (!m || !m.is_user || m.is_system) return;
     const quoted = extractQuotedDialogueForTts(String(m.mes || ''));
@@ -3983,7 +4650,9 @@ function maybeAutoReadPersonaQuoted(mesid) {
         injectTtsButtonOn(mesEl);
         btn = mesEl.querySelector(`.${TTS_BTN_CLASS}`);
     }
-    if (btn) readMessageAloud(mesEl, btn).catch(err => WARN('autoReadPersona', err?.message || err));
+    if (!btn) return;
+    ttsLastReadPersonaMesid = id;
+    readMessageAloud(mesEl, btn).catch(err => WARN('autoReadPersona', err?.message || err));
 }
 
 function maybeReadDictatedPersonaText(text) {
@@ -3992,21 +4661,40 @@ function maybeReadDictatedPersonaText(text) {
     if (!quoted) return;
     ttsLastDictatedPersonaQuoted = quoted;
     ttsLastDictatedPersonaAt = Date.now();
-    fetchTts(quoted, (settings().ttsVoiceProfiles || {})[normalizeVoiceProfileKey(currentPersonaTtsProfileName())] || settings().ttsVoice || 'af_heart')
+    // Stop/chat switch while synthesis is pending invalidates this read-back.
+    const pending = ttsPlaybackToken();
+    fetchTts(quoted, (settings().ttsVoiceProfiles || {})[normalizeVoiceProfileKey(currentPersonaTtsProfileName())] || settings().ttsVoice || 'af_heart', pending.signal)
         .then(blob => {
+            if (!ttsTokenCurrent(pending)) return null;
             ttsBackendAvailable = true;
-            stopTts();
-            return createAndPlayTtsAudio(blob, () => stopTts());
+            const token = startTtsPlayback();
+            return createAndPlayTtsAudio(blob, () => stopTts(), token);
         })
         .catch(e => {
-            const status = e?.status || 0;
-            if (status === 404 || status === 501 || status === 503 || status === 0) {
-                notifyTtsMissing(e?.message || `status_${status}`);
-            } else {
-                WARN('dictated persona TTS failed', e?.message || e);
-                toast('error', `Persona TTS failed: ${escapeHtml(e?.message || 'unknown')}`);
-            }
+            if (isTtsCancellation(e) || !ttsTokenCurrent(pending)) return;
+            reportTtsError(e, 'Persona TTS');
         });
+}
+
+/** Voice sample for the settings panel: fetch, then play unless something
+ *  else started or Stop was pressed meanwhile. Cleans up when it ends. */
+async function playTtsSample(text, voice) {
+    const pending = ttsPlaybackToken();
+    let blob;
+    try {
+        blob = await fetchTts(text, voice, pending.signal);
+    } catch (e) {
+        if (isTtsCancellation(e)) return;
+        throw e;
+    }
+    if (!ttsTokenCurrent(pending)) return;
+    ttsBackendAvailable = true;
+    const token = startTtsPlayback();
+    try {
+        await createAndPlayTtsAudio(blob, () => stopTts(), token);
+    } catch (e) {
+        if (!isTtsCancellation(e)) throw e;
+    }
 }
 
 /** Read the most recent AI message ("computer: read last"). */
@@ -4047,7 +4735,7 @@ function toggleAutoReadAi() {
 async function fetchTtsVoices() {
     const cfg = settings();
     const url = `${cfg.serverUrl.replace(/\/+$/, '')}/tts/voices`;
-    const res = await fetch(url, {
+    const res = await fetchWithTimeout(url, {
         method: 'GET',
         mode: 'cors',
         cache: 'no-store',
@@ -4070,7 +4758,7 @@ async function fetchJsonStatus(path, opts = {}) {
     const url = `${cfg.serverUrl.replace(/\/+$/, '')}${path}`;
     const started = Date.now();
     try {
-        const res = await fetch(url, {
+        const res = await fetchWithTimeout(url, {
             method: opts.method || 'GET',
             mode: 'cors',
             cache: 'no-store',
@@ -4080,7 +4768,7 @@ async function fetchJsonStatus(path, opts = {}) {
         try { data = await res.json(); } catch {}
         return { ok: res.ok, status: res.status, ms: Date.now() - started, data };
     } catch (e) {
-        return { ok: false, status: 0, ms: Date.now() - started, error: e?.message || String(e) };
+        return { ok: false, status: 0, ms: Date.now() - started, error: e?.name === 'AbortError' ? 'timeout' : (e?.message || String(e)) };
     }
 }
 
@@ -4094,13 +4782,17 @@ function diagnosticsRow(label, state, detail, tone = 'neutral') {
 }
 
 async function buildDiagnosticsHtml() {
-    const health = await fetchJsonStatus('/health', { auth: true });
-    const state = await fetchJsonStatus('/state', { auth: true });
-    const voices = await fetchJsonStatus('/tts/voices', { auth: true });
-    const audit = await fetchAuditNetwork();
+    // Independent probes run concurrently, each with its own deadline.
+    const [health, state, voices, audit] = await Promise.all([
+        fetchJsonStatus('/health', { auth: true }),
+        fetchJsonStatus('/state', { auth: true }),
+        fetchJsonStatus('/tts/voices', { auth: true }),
+        fetchAuditNetwork(),
+    ]);
     const now = Date.now();
     const sseAge = sseStatus.lastEventAt ? Math.round((now - sseStatus.lastEventAt) / 1000) : null;
-    const stateAge = lastStatePayload?.t ? Math.round((now - lastStatePayload.t) / 1000) : null;
+    const stateAge = lastStateSuccess.t ? Math.round((now - lastStateSuccess.t) / 1000) : null;
+    const stateFailedSinceSuccess = lastStateAttemptAt > lastStateSuccess.t && !!lastStateError;
     const tokenState = (() => {
         if (!(settings().serverToken || '').trim()) return 'missing';
         if (state.status === 401 || state.status === 403) return 'invalid';
@@ -4108,7 +4800,7 @@ async function buildDiagnosticsHtml() {
         return tokenStatusLabel();
     })();
     const formatterProvider = health.data?.formatter_provider || '';
-    const formatter = audit?.summary?.llm || formatterProvider || 'see /audit/network';
+    const formatter = formatterProvider || 'see /audit/network';
     // Last-used model attribution (from the most recent dictation-result).
     const lastModel = lastDoneModel ? shortModelLabel(lastDoneModel) : '';
     const modelState = lastModel ? (lastModelFallback ? 'fallback' : 'primary') : (formatterProvider || 'unknown');
@@ -4125,7 +4817,11 @@ async function buildDiagnosticsHtml() {
         diagnosticsRow('Calliope server', health.ok ? 'reachable' : 'unreachable', health.ok ? `/health HTTP ${health.status} · ${health.ms}ms` : (health.error || `HTTP ${health.status}`), health.ok ? 'ok' : 'bad'),
         diagnosticsRow('Bearer token', tokenState, serverAuthStatus.lastError || (state.ok ? `/state HTTP ${state.status}` : `state probe HTTP ${state.status || 'network'}`), tokenState === 'valid' ? 'ok' : (tokenState === 'missing' || tokenState === 'invalid' ? 'bad' : 'warn')),
         diagnosticsRow('SSE', sseStatus.state, sseAge == null ? 'no event received yet' : `last event ${sseAge}s ago${sseStatus.lastError ? ` · ${sseStatus.lastError}` : ''}`, sseStatus.state === 'connected' ? 'ok' : 'warn'),
-        diagnosticsRow('ST state freshness', stateAge == null ? 'unknown' : (stateAge <= 60 ? 'fresh' : 'stale'), stateAge == null ? 'no local state post recorded' : `last local /state payload ${stateAge}s ago`, stateAge != null && stateAge <= 60 ? 'ok' : 'warn'),
+        diagnosticsRow('ST state freshness',
+            stateFailedSinceSuccess ? 'rejected' : (stateAge == null ? 'unknown' : (stateAge <= 60 ? 'fresh' : 'stale')),
+            [stateAge == null ? 'no accepted /state post yet' : `last accepted /state post ${stateAge}s ago`,
+                stateFailedSinceSuccess ? `latest attempt failed (${lastStateError})` : ''].filter(Boolean).join(' · '),
+            !stateFailedSinceSuccess && stateAge != null && stateAge <= 60 ? 'ok' : (stateFailedSinceSuccess ? 'bad' : 'warn')),
         diagnosticsRow('Whisper', health.ok ? 'reported' : 'unknown', typeof whisper === 'string' ? whisper : JSON.stringify(whisper).slice(0, 160), health.ok ? 'ok' : 'warn'),
         diagnosticsRow('Kokoro', voices.ok ? 'available' : 'unavailable', voices.ok ? `/tts/voices HTTP ${voices.status}` : (voices.error || `HTTP ${voices.status}`), voices.ok ? 'ok' : 'bad'),
         diagnosticsRow('TLS cert', certDays == null ? 'unknown' : (certDays < 7 ? 'expiring' : 'valid'), certDetail, certSeverity),
@@ -4424,9 +5120,9 @@ function buildQuickLaunchPanel() {
                 <span class="dbb-ql-brand">Calliope</span>
             </div>
             <div class="dbb-ql-actions">
-                <button id="dbb_ql_open_dictation" type="button" class="menu_button dbb-ql-btn" title="Open the dictation UI (popup or modal — same as the mic button in the send bar)">
+                <button id="dbb_ql_open_dictation" type="button" class="menu_button dbb-ql-btn" title="Open the phone dictation UI, or start/stop a desktop recording in desktop modes">
                     <span class="fa-solid fa-microphone"></span>
-                    <span>Open Dictation</span>
+                    <span id="dbb_ql_open_dictation_label">Open Dictation</span>
                 </button>
                 <button id="dbb_ql_toggle_auto_read" type="button" class="menu_button dbb-ql-btn dbb-ql-toggle" title="Toggle auto-read of new AI messages via Calliope TTS">
                     <span class="fa-solid fa-volume-high"></span>
@@ -4446,7 +5142,7 @@ function buildQuickLaunchPanel() {
                 <span class="dbb-ql-dot" id="dbb_ql_status_dot"></span>
                 <span class="dbb-ql-status-text" id="dbb_ql_status_text">Status: connecting…</span>
                 <span class="dbb-ql-sep">·</span>
-                <span class="dbb-ql-mode" id="dbb_ql_mode">Mode: —</span>
+                <span class="dbb-ql-mode" id="dbb_ql_mode">Last mode: —</span>
                 <span class="dbb-ql-sep">·</span>
                 <span class="dbb-ql-last" id="dbb_ql_last">Last: never</span>
             </div>
@@ -4463,7 +5159,10 @@ function buildQuickLaunchPanel() {
     }
 
     wrap.querySelector('#dbb_ql_open_dictation').addEventListener('click', () => {
-        onMicClick().catch(e => WARN('quick-launch open dictation', e?.message || e));
+        onQuickLaunchDictation().catch((e) => {
+            if ((settings().captureMode || 'phone-popup') === 'phone-popup') WARN('quick-launch open dictation', e?.message || e);
+            else showDesktopCaptureError(e);
+        });
     });
     wrap.querySelector('#dbb_ql_toggle_auto_read').addEventListener('click', () => {
         toggleAutoReadAi();
@@ -4479,14 +5178,27 @@ function buildQuickLaunchPanel() {
     });
 
     paintQuickLaunchAutoReadBtn();
+    paintQuickLaunchDictationBtn();
     paintTtsStreamStatus();
     paintQuickLaunchStatus();
 
-    // Keep "Last: <ago>s" fresh on a 1Hz tick. Cheap; teardown on container
-    // remove via a parent observer would be over-engineering.
+    // Keep "Last: <ago>s" fresh on a 1Hz tick, but only while the card is
+    // actually on screen (tab visible, extensions drawer open).
     if (!quickLaunchTickTimer) {
-        quickLaunchTickTimer = setInterval(paintQuickLaunchStatus, 1000);
+        quickLaunchTickTimer = setInterval(() => {
+            if (document.hidden) return;
+            const card = document.getElementById(QUICK_LAUNCH_ID);
+            if (card && card.offsetParent !== null) paintQuickLaunchStatus();
+        }, 1000);
     }
+}
+
+function paintQuickLaunchDictationBtn() {
+    const label = document.getElementById('dbb_ql_open_dictation_label');
+    if (!label) return;
+    const mode = settings().captureMode || 'phone-popup';
+    if (mode === 'phone-popup') label.textContent = 'Open Dictation';
+    else label.textContent = desktopCapture ? 'Stop desktop dictation' : 'Start desktop dictation';
 }
 
 function paintQuickLaunchAutoReadBtn() {
@@ -4529,6 +5241,9 @@ function paintQuickLaunchStatus() {
     } else if (sseState === 'connecting') {
         color = '#FFB648';
         label = 'SSE connecting';
+    } else if (sseState === 'stale') {
+        color = '#FFB648';
+        label = 'SSE stale — reconnecting';
     } else if (sseState === 'error') {
         color = '#FF5A4E';   // ember
         label = 'SSE error';
@@ -4541,10 +5256,10 @@ function paintQuickLaunchStatus() {
     if (context) bits.push(context);
     txt.textContent = bits.join(' · ');
 
-    // Mode label — last successful dictation mode is the closest signal.
+    // Last successful dictation mode (not the selected mode for this chat).
     if (modeEl) {
         const mode = lastDoneMode || '—';
-        modeEl.textContent = `Mode: ${mode}`;
+        modeEl.textContent = `Last mode: ${mode}`;
     }
 
     if (lastEl) {
@@ -4867,6 +5582,7 @@ function buildSettingsPanel() {
         probeServer().then((ok) => { if (ok) return probeServerAuth(); }).catch(() => {});
         // URL changed — reconnect immediately with a fresh backoff budget.
         if (fresh.sseEnabled) reconnectSSEManually();
+        settingsCatalogReload?.();
     });
     tokenEl.addEventListener('change', () => {
         const fresh = settings();
@@ -4878,6 +5594,7 @@ function buildSettingsPanel() {
         probeServerAuth().catch(() => {});
         // Token changed — bounce SSE immediately with a fresh backoff budget.
         if (fresh.sseEnabled) reconnectSSEManually();
+        settingsCatalogReload?.();
     });
     if (pairOpenEl) pairOpenEl.addEventListener('click', openPairedPhoneUrl);
     if (pairCopyEl) pairCopyEl.addEventListener('click', () => copyPairedPhoneUrl().catch(() => {}));
@@ -4951,8 +5668,8 @@ function buildSettingsPanel() {
     const modelLabel = (model) => modelLabels[model] || model;
     let formatterModels = [];
 
-    const loadFormatterModels = () => fetch(
-        `${s.serverUrl.replace(/\/+$/, '')}/formatter-models`,
+    const loadFormatterModels = () => fetchWithTimeout(
+        `${settings().serverUrl.replace(/\/+$/, '')}/formatter-models`,
         { headers: { ...authHeaders() }, cache: 'no-store', mode: 'cors' },
     ).then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
         .then(data => {
@@ -4960,22 +5677,29 @@ function buildSettingsPanel() {
             return formatterModels;
         });
 
-    if (modelEl) {
-        loadFormatterModels()
+    const populateFormatterModels = () => {
+        if (!modelEl) return Promise.resolve();
+        return loadFormatterModels()
             .then(models => {
+                modelEl.querySelectorAll('option:not([value=""])').forEach(o => o.remove());
                 for (const model of models) {
                     const opt = document.createElement('option');
                     opt.value = model;
                     opt.textContent = modelLabel(model);
                     modelEl.appendChild(opt);
                 }
-                if (s.formatterModel && !models.includes(s.formatterModel)) {
-                    settings().formatterModel = '';
+                const fresh = settings();
+                if (fresh.formatterModel && !models.includes(fresh.formatterModel)) {
+                    fresh.formatterModel = '';
                     saveSettings();
                 }
-                modelEl.value = models.includes(settings().formatterModel) ? settings().formatterModel : '';
+                modelEl.value = models.includes(fresh.formatterModel) ? fresh.formatterModel : '';
                 populateModeModelOptions();
             }).catch(e => WARN('formatter models failed', e?.message || e));
+    };
+
+    if (modelEl) {
+        populateFormatterModels();
         modelEl.addEventListener('change', () => {
             settings().formatterModel = modelEl.value || '';
             saveSettings();
@@ -5000,7 +5724,9 @@ function buildSettingsPanel() {
 
     function reflectModeModel() {
         if (!modeModelEl) return;
-        const modeId = modeEl?.value || '';
+        // The select only speaks for the character it was loaded for.
+        const modeId = (modeEl && !modeEl.disabled && formatterModeElKey === currentModeMemoryKey())
+            ? (modeEl.value || '') : '';
         const mode = cachedModes?.find(m => m.id === modeId);
         const disabled = !modeId || !mode;
         modeModelEl.disabled = disabled;
@@ -5035,7 +5761,8 @@ function buildSettingsPanel() {
 
     if (modeModelEl) {
         modeModelEl.addEventListener('change', async () => {
-            const modeId = modeEl?.value || '';
+            const modeId = (modeEl && !modeEl.disabled && formatterModeElKey === currentModeMemoryKey())
+                ? (modeEl.value || '') : '';
             if (!modeId) {
                 toast('warning', 'Pick a formatter mode first');
                 reflectModeModel();
@@ -5044,7 +5771,7 @@ function buildSettingsPanel() {
             const model = String(modeModelEl.value || '');
             modeModelEl.disabled = true;
             try {
-                const res = await fetch(`${s.serverUrl.replace(/\/+$/, '')}/modes/formatter`, {
+                const res = await fetchWithTimeout(`${settings().serverUrl.replace(/\/+$/, '')}/modes/formatter`, {
                     method: 'POST',
                     mode: 'cors',
                     cache: 'no-store',
@@ -5140,8 +5867,8 @@ function buildSettingsPanel() {
                 opt.textContent = m.label || m.id || '';
                 reformatModeEl.appendChild(opt);
             }
-            if (s.reformatMode && modes.some(m => m.id === s.reformatMode)) {
-                reformatModeEl.value = s.reformatMode;
+            if (settings().reformatMode && modes.some(m => m.id === settings().reformatMode)) {
+                reformatModeEl.value = settings().reformatMode;
             }
         }
     };
@@ -5149,23 +5876,26 @@ function buildSettingsPanel() {
 
     if (modeEl) {
         modeEl.addEventListener('change', async () => {
-            // Keep the per-mode model picker pointed at the newly chosen mode
-            // even if saving the mode itself fails below.
-            reflectModeModel();
             const char = currentModeMemoryKey();
             const modeId = modeEl.value || '';
-            if (!char) {
+            if (!char || formatterModeElKey !== char) {
                 toast('warning', 'No character resolved yet — open a solo character chat to save a mode');
                 return;
             }
+            // What the select shows is what the next capture sends for this
+            // character, even before the server confirms the save.
+            recordLocalModeWrite(char, modeId);
+            // Keep the per-mode model picker pointed at the newly chosen mode
+            // even if saving the mode itself fails below.
+            reflectModeModel();
             const ok = await persistCharMode(char, modeId);
             if (ok) {
-                lastDoneMode = modeId || lastDoneMode;
                 toast('success', modeId
                     ? `Formatter mode set to ${escapeHtml(modeId)}`
                     : 'Formatter mode cleared (server default)');
-                try { paintQuickLaunchStatus(); } catch {}
             } else {
+                // Unsaved: let the next capture ask the server again.
+                recordLocalModeWrite(char, null);
                 toast('error', 'Could not save mode — check server + token');
             }
         });
@@ -5300,9 +6030,7 @@ function buildSettingsPanel() {
                 btn.setAttribute('disabled', 'disabled');
                 try {
                     await unlockTtsAudio('roster-sample');
-                    const blob = await fetchTts('Hello. My voice is ready for your story.', voice);
-                    stopTts();
-                    await createAndPlayTtsAudio(blob, () => {});
+                    await playTtsSample('Hello. My voice is ready for your story.', voice);
                 } catch (e) {
                     toast('error', `Sample failed: ${escapeHtml(e?.message || 'unknown')}`);
                 } finally {
@@ -5350,58 +6078,59 @@ function buildSettingsPanel() {
             fresh.ttsReadStreamingPartials = !!ttsStreamEl.checked;
             saveSettings();
             if (!fresh.ttsReadStreamingPartials) cancelStreamingTts();
+            configureTtsObserver();
         });
     }
 
-    // Populate voice picker — try server, fall back to single hard-coded
-    // entry if /tts/voices isn't there yet (sibling backend may still be in
-    // flight). Don't disable the picker on failure.
+    /** Point the voice picker at the active target's profile (or the global
+     *  fallback), adding an option when the catalog doesn't list it. */
+    const reflectTtsVoiceSelect = () => {
+        if (!ttsVoiceEl) return;
+        const fresh = settings();
+        const profileVoice = (fresh.ttsVoiceProfiles || {})[normalizeVoiceProfileKey(currentTtsProfileName())];
+        const voice = profileVoice || fresh.ttsVoice || 'af_heart';
+        if (![...ttsVoiceEl.options].some(o => o.value === voice)) {
+            const opt = document.createElement('option');
+            opt.value = voice;
+            opt.textContent = voice;
+            ttsVoiceEl.appendChild(opt);
+        }
+        ttsVoiceEl.value = voice;
+    };
+
+    // Populate voice picker — try server, keep the hard-coded af_heart entry
+    // if /tts/voices isn't there (Kokoro may not be installed). Don't disable
+    // the picker on failure.
+    const loadTtsVoices = () => fetchTtsVoices().then(voices => {
+        if (!ttsVoiceEl || !voices || !voices.length) return;
+        const fresh = settings();
+        ttsVoiceEl.innerHTML = '';
+        for (const v of voices) {
+            const opt = document.createElement('option');
+            opt.value = v.id || v.name || '';
+            opt.textContent = v.label || v.id || v.name || '';
+            ttsVoiceEl.appendChild(opt);
+        }
+        const ids = voices.map(v => v.id || v.name);
+        // An unknown global fallback is replaced by the catalog's first voice.
+        if (!ids.includes(fresh.ttsVoice)) {
+            fresh.ttsVoice = voices[0].id || voices[0].name || 'af_heart';
+            saveSettings();
+        }
+        reflectTtsVoiceSelect();
+        paintTtsProfileHint();
+    }).catch(e => {
+        WARN('tts/voices fetch failed (using fallback)', e?.message || e);
+    });
+
     if (ttsVoiceEl) {
-        // Pre-select persisted voice (the markup already has af_heart).
-        if (s.ttsVoice && s.ttsVoice !== 'af_heart') {
-            const opt = document.createElement('option');
-            opt.value = s.ttsVoice;
-            opt.textContent = s.ttsVoice;
-            ttsVoiceEl.appendChild(opt);
-            ttsVoiceEl.value = s.ttsVoice;
-        }
-        const profileVoice = (s.ttsVoiceProfiles || {})[normalizeVoiceProfileKey(currentTtsProfileName())];
-        if (profileVoice && profileVoice !== ttsVoiceEl.value) {
-            const opt = document.createElement('option');
-            opt.value = profileVoice;
-            opt.textContent = profileVoice;
-            ttsVoiceEl.appendChild(opt);
-            ttsVoiceEl.value = profileVoice;
-        }
-        fetchTtsVoices().then(voices => {
-            if (!voices || !voices.length) return;
-            // Replace options with server-provided list. Preserve current
-            // selection if it's in the new list.
-            const prev = ttsVoiceEl.value;
-            const fresh = settings();
-            ttsVoiceEl.innerHTML = '';
-            for (const v of voices) {
-                const opt = document.createElement('option');
-                opt.value = v.id || v.name || '';
-                opt.textContent = v.label || v.id || v.name || '';
-                ttsVoiceEl.appendChild(opt);
-            }
-            ttsVoiceEl.value = voices.some(v => (v.id || v.name) === prev) ? prev : (voices[0].id || voices[0].name || 'af_heart');
-            // Persist global fallback only when no character profile is active.
-            if (!profileVoice && fresh.ttsVoice !== ttsVoiceEl.value) {
-                fresh.ttsVoice = ttsVoiceEl.value;
-                saveSettings();
-            }
-            paintTtsProfileHint();
-        }).catch(e => {
-            // Backend missing — keep the single af_heart fallback. One toast
-            // (deduped via notifyTtsMissing) only on user-initiated calls.
-            WARN('tts/voices fetch failed (using fallback)', e?.message || e);
-        });
+        reflectTtsVoiceSelect();
+        loadTtsVoices();
         ttsVoiceEl.addEventListener('change', () => {
             const fresh = settings();
-            fresh.ttsVoice = ttsVoiceEl.value || 'af_heart';
-            const profileName = rememberTtsVoiceForCurrentProfile(fresh.ttsVoice);
+            const voice = ttsVoiceEl.value || 'af_heart';
+            const profileName = rememberTtsVoiceForCurrentProfile(voice);
+            if (!profileName) fresh.ttsVoice = voice;
             saveSettings();
             paintTtsProfileHint();
             if (profileName) toast('success', `Saved TTS voice for ${escapeHtml(profileName)}`);
@@ -5417,12 +6146,7 @@ function buildSettingsPanel() {
             ttsTestEl.textContent = 'Testing…';
             ttsTestEl.setAttribute('disabled', 'disabled');
             try {
-                const blob = await fetchTts(sample, (settings().ttsVoiceProfiles || {})[normalizeVoiceProfileKey(currentTtsProfileName())] || settings().ttsVoice || 'af_heart');
-                ttsBackendAvailable = true;
-                stopTts();
-                const audio = await createAndPlayTtsAudio(blob, () => {
-                    if (currentTtsAudio === audio) stopTts();
-                });
+                await playTtsSample(sample, (settings().ttsVoiceProfiles || {})[normalizeVoiceProfileKey(currentTtsProfileName())] || settings().ttsVoice || 'af_heart');
             } catch (e) {
                 const status = e?.status || 0;
                 if (status === 404 || status === 501 || status === 503 || status === 0) {
@@ -5454,7 +6178,7 @@ function buildSettingsPanel() {
             if (key && settings().ttsVoiceProfiles?.[key]) {
                 delete settings().ttsVoiceProfiles[key];
                 saveSettings();
-                ttsVoiceEl.value = settings().ttsVoice || 'af_heart';
+                reflectTtsVoiceSelect();
                 paintTtsProfileHint();
                 toast('info', `Reset TTS voice profile for ${escapeHtml(name)}`);
             } else {
@@ -5509,9 +6233,8 @@ function buildSettingsPanel() {
                         btn.textContent = '…';
                         btn.setAttribute('disabled', 'disabled');
                         try {
-                            const blob = await fetchTts('Hello. My voice is ready for your story.', voice);
-                            stopTts();
-                            await createAndPlayTtsAudio(blob, () => {});
+                            await unlockTtsAudio('suggest-sample');
+                            await playTtsSample('Hello. My voice is ready for your story.', voice);
                         } catch (e) {
                             toast('error', `Sample failed: ${escapeHtml(e?.message || 'unknown')}`);
                         } finally {
@@ -5548,7 +6271,6 @@ function buildSettingsPanel() {
     // WOW-2: one-click distinct-voice cast for the active group.
     if (ttsAutocastEl) {
         paintTtsRoster();
-        repaintTtsRoster = paintTtsRoster;
         ttsAutocastEl.addEventListener('click', async () => {
             if (!selected_group) {
                 toast('info', 'Open a group chat to auto-cast voices');
@@ -5600,6 +6322,22 @@ function buildSettingsPanel() {
     // chat when the panel mounts) and on every state-payload event.
     renderAddresseePicker();
 
+    // E7: one repaint for everything that depends on the active chat/target.
+    // Called after the per-character mode fetch settles (refreshContextUi).
+    settingsContextRepaint = () => {
+        reflectModeModel();
+        reflectTtsVoiceSelect();
+        paintTtsProfileHint();
+        paintTtsRoster();
+    };
+    // M17: server URL/token changes reload every server-provided catalog.
+    settingsCatalogReload = () => {
+        resetModeMemoryCache();
+        populateFormatterModels();
+        loadTtsVoices();
+        populateModeSelectors().catch(e => WARN('populateModeSelectors', e?.message || e));
+    };
+
     // MVP-23: privacy badge → audit-log peek modal.
     const privacyBadge = host.querySelector('#dictation_bridge_privacy_badge');
     if (privacyBadge) {
@@ -5622,11 +6360,38 @@ function buildSettingsPanel() {
 
 let initialized = false;
 
+/** E2: when the chat identity actually changes, everything begun in the
+ *  previous chat is cancelled or quarantined: recording/upload aborted, the
+ *  stream dropped without restoring the old draft, queued results and undo
+ *  snapshots discarded, TTS stopped. A same-chat CHAT_CHANGED (ST reload of
+ *  the open chat) is a refresh and keeps in-flight work. */
+function onChatGenerationChanged() {
+    const identity = currentChatIdentity();
+    if (lastChatIdentity !== null && identity === lastChatIdentity) return;
+    lastChatIdentity = identity;
+    desktopPttHeld = false;
+    cancelDesktopCapture();
+    dropStreamingSessionForChatSwitch();
+    chatGeneration++;
+    // The user is acting in this tab: it keeps the state heartbeat.
+    if (document.visibilityState === 'visible') claimStateHeartbeat();
+    pendingCanonicalResults.length = 0;
+    undoStack.length = 0;
+    lastAppliedDictation = null;
+    clearLowConfBanner();
+    clearRepairTrace();
+    stopTts();
+}
+
 export async function init() {
     if (initialized) return;
     initialized = true;
     initializeSettings();
+    rememberChatIdentity();
     window.addEventListener('message', onWindowMessage);
+    // Registered before every other CHAT_CHANGED listener so the generation
+    // is already bumped when they run.
+    if (event_types.CHAT_CHANGED) eventSource.on(event_types.CHAT_CHANGED, onChatGenerationChanged);
     window.addEventListener('pagehide', () => {
         desktopPttHeld = false;
         cancelDesktopCapture();
@@ -5657,17 +6422,18 @@ export async function init() {
         event_types.SETTINGS_UPDATED,
         event_types.APP_READY,
     ];
+    const contextEvents = new Set([event_types.APP_READY, event_types.CHAT_CHANGED, event_types.CHAT_LOADED]);
     for (const evt of stateEvents) {
         if (evt) eventSource.on(evt, () => {
             postState(evt);
-            // POL-6: chat/character switches may flip group status — repaint
-            // the addressee picker (no-op when not in a group).
-            try { renderAddresseePicker(); } catch (e) { WARN('addressee repaint failed', e?.message || e); }
-            if (evt === event_types.APP_READY || evt === event_types.CHAT_CHANGED || evt === event_types.CHAT_LOADED) {
-                refreshFormatterModeForContext().catch(e => WARN('formatter mode refresh failed', e?.message || e));
+            if (contextEvents.has(evt)) {
+                // Mode memory is per character: refetch, then repaint once.
+                refreshContextUi().catch(e => WARN('context refresh failed', e?.message || e));
+            } else {
+                // Card edits / persona switches: repaint without refetching.
+                try { renderAddresseePicker(); settingsContextRepaint?.(); }
+                catch (e) { WARN('context repaint failed', e?.message || e); }
             }
-            // WOW-2: group switch changes the cast — refresh the roster if open.
-            try { if (repaintTtsRoster) repaintTtsRoster(); } catch (e) { WARN('roster repaint failed', e?.message || e); }
         });
     }
     startStateHeartbeat();
@@ -5691,11 +6457,6 @@ export async function init() {
         ttsLastReadPersonaMesid = -1;
         ttsLastDictatedPersonaQuoted = '';
         ttsLastDictatedPersonaAt = 0;
-        stopTts();
-        clearRepairTrace();
-        // Undo snapshots belong to the previous chat's draft; never restore
-        // them into a different conversation.
-        undoStack.length = 0;
         setTimeout(() => {
             sweepInjectTtsButtons();
             // Mark init complete a tick after the chat is fully painted so

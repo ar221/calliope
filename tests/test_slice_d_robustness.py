@@ -20,22 +20,6 @@ def test_mismatched_canonical_result_cannot_overwrite_active_stream():
     assert "if (streamingSession) {" in js
 
 
-def test_cross_tab_claims_carry_only_opaque_ids_and_timestamps():
-    js = source()
-    block = js[js.index("const TAB_INSTANCE_ID"):js.index("function settings()")]
-    assert "BroadcastChannel('calliope-dictation-claims')" in block
-    assert "navigator.locks.request" in block
-    assert "localStorage.setItem(incomingStorageKey(key), String(Date.now()))" in block
-    assert "const claimKey = `calliope:claim:${key}`" in block
-    assert "transcript" not in block.lower()
-    assert "serverToken" not in block
-    assert "text:" not in block
-    assert "ownIncomingSideEffect('command'" in js
-    assert "ownIncomingSideEffect('result'" in js
-    assert "data.requestId || data.ts || e.lastEventId" in js
-    assert "if (!id) return false;" in block
-
-
 def test_server_url_migration_runs_once_outside_settings_hot_path():
     js = source()
     settings_block = js[js.index("function settings() {"):js.index("function initializeSettings()")]

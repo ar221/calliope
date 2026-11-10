@@ -103,6 +103,7 @@ function makeTab(name, initial) {
     const pendingCanonicalResults = [];
     const PENDING_CANONICAL_RESULT_CAP = 16;
     let desktopCapture = null;
+    function rememberChatIdentity() {}
     let lastDoneMode = '', lastDoneModel = '', lastModelFallback = false;
     const cfg = { appendMode: ${JSON.stringify(APPEND_MODE)}, autoSend: false };
     function settings() { return cfg; }

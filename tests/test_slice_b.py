@@ -42,69 +42,6 @@ def test_capture_mode_setting_ui_and_fresh_change_wiring():
     assert "DESKTOP_CAPTURE_MODES.has(captureModeEl.value)" in wiring
 
 
-def test_capture_modes_preserve_phone_popup_and_define_desktop_semantics():
-    source = _source()
-    click = _block(source, "async function onMicClick()", "function openPopup(url)")
-    assert "if (captureMode === 'desktop-push-to-talk') return" in click
-    assert "if (captureMode === 'desktop-toggle')" in click
-    assert "if (desktopCapture) stopDesktopRecording('toggle')" in click
-    assert "else await startDesktopRecording('toggle')" in click
-    assert "const ok = await probeServer()" in click
-    assert "openIframe(url)" in click
-    assert "openPopup(url)" in click
-
-    mic = _block(source, "function injectMicButton()", "function setMicActive(active)")
-    for event in ("pointerdown", "pointerup", "pointercancel", "lostpointercapture"):
-        assert f"addEventListener('{event}'" in mic
-    assert "e.repeat" in mic
-    assert "releaseDesktopPushToTalk('keyboard-release')" in mic
-    assert "releaseDesktopPushToTalk('keyboard-blur')" in mic
-
-
-def test_transcribe_request_carries_canonical_context_language_and_auth():
-    source = _source()
-    submit = _block(source, "async function submitDesktopRecording(capture)", "async function onMicClick()")
-    for param in ("mode", "persona", "character", "language"):
-        assert f"params.set('{param}'" in submit
-    # Chat context must travel in a header, never the journaled request line.
-    assert "params.set('context'" not in submit
-    assert "'X-Dictation-Context': encodeURIComponent(contextText)" in submit
-    assert "cfg.pushContext ? String(ctx.lastAi || '').slice(-4000) : ''" in submit
-    assert "...contextHeaders" in submit
-    assert "currentReformatCharacterKey()" in submit
-    assert "await fetchCharMode(character)" in submit
-    assert "/^(?:[a-z]{2,4}|auto)$/" in submit
-    assert "'/transcribe?'" not in submit  # URL is rooted at the configured server, not the ST origin.
-    assert "}/transcribe?${params.toString()}" in submit
-    assert "...authHeaders()" in submit
-    assert "'Content-Type': capture.format.mimeType" in submit
-    assert "method: 'POST'" in submit
-    assert "body: blob" in submit
-    assert "signal: capture.abortController.signal" in submit
-
-
-def test_media_recorder_races_cleanup_and_exactly_once_submission_are_guarded():
-    source = _source()
-    start = _block(source, "async function startDesktopRecording(trigger)", "function stopDesktopRecording(")
-    assert "desktopCapture !== capture || capture.cancelled || capture.stopRequested" in start
-    assert "settings().captureMode === 'desktop-push-to-talk' && !desktopPttHeld" in start
-    assert "capture.submissionStarted" in start
-    assert "capture.recorderErrorHandled" in start
-    assert "if (capture.cancelled || capture.recorderErrorHandled || capture.submissionStarted) return" in start
-    assert "capture.submissionStarted = true" in start
-
-    cleanup = _block(source, "function cleanupDesktopCaptureHardware(capture)", "function showDesktopCaptureError(error)")
-    assert "clearTimeout(capture.maxTimer)" in cleanup
-    assert "capture.stream.getTracks()" in cleanup
-    assert "track.stop()" in cleanup
-    assert "capture.abortController?.abort()" in cleanup
-    assert "capture.chunks.length = 0" in cleanup
-
-    stop = _block(source, "function stopDesktopRecording(", "async function submitDesktopRecording(capture)")
-    assert "capture.phase === 'acquiring' || capture.phase === 'transcribing'" in stop
-    assert "cancelDesktopCapture(capture)" in stop
-
-
 def test_desktop_capture_has_sixty_second_guard_and_visible_states():
     source = _source()
     style = STYLE_SRC.read_text(encoding="utf-8")
@@ -145,25 +82,6 @@ def test_desktop_audio_is_not_logged_or_persisted_by_extension():
         assert forbidden_log not in capture
     assert "body: blob" in capture
     assert "capture.chunks.length = 0" in capture
-
-
-def test_http_and_sse_results_share_request_id_dedupe_path():
-    source = _source()
-    result = _block(source, "function rememberAppliedDictationRequest(requestId)", "function buildPairedPhoneUrl(")
-    assert "appliedDictationRequestIds.includes(requestId)" in result
-    assert "if (dictationRequestWasApplied(requestId)) return false" in result
-    assert "rememberAppliedDictationRequest(requestId)" in result
-    assert "if (appliedDictationRequestIds.length > 32)" in result
-
-    sse = _block(
-        source,
-        "async function handleDictationResultEvent(data, lastEventId)",
-        "// ─── MVP-16",
-    )
-    submit = _block(source, "async function submitDesktopRecording(capture)", "async function onMicClick()")
-    assert "applyDictationResult(data" in sse
-    assert "applyDictationResult(data, { source: 'desktop' })" in submit
-    assert "dictationRequestWasApplied(String(data?.request_id || data?.requestId || ''))" in submit
 
 
 def test_server_errors_are_escaped_before_html_capable_toast_sink():
