@@ -1,9 +1,10 @@
 # Privacy
 
-**Last updated:** 2026-05-07
+**Last updated:** 2026-11-10
 
-Calliope is built on a simple promise: **your audio never leaves your
-device, and your transcripts never persist longer than you want them to.**
+Calliope is built on a simple promise: **your audio never leaves the
+machines you own — it goes from the capturing device to your own PC and
+no further — and transcripts live in server RAM only.**
 
 This document is a verifiable claim. Every statement here can be
 cross-checked against the source at `server/calliope-server` in this
@@ -16,32 +17,46 @@ code wins — please open an issue.
 
 ### Audio
 
-Captured on your phone (browser `MediaRecorder` over `navigator.mediaDevices.getUserMedia`)
-or your desktop (`pw-record` via PipeWire). Sent over your local network to
-the Calliope server running on your PC. Transcribed by `whisper-server`
-(whisper.cpp) on your local GPU.
+Captured on your phone (browser `MediaRecorder` over
+`navigator.mediaDevices.getUserMedia`), in the SillyTavern extension, or on
+the desktop by an external hotkey client (`pw-record` via PipeWire). Phone
+and extension audio **does leave the capturing device**: it is uploaded over
+HTTPS — loopback, your LAN, or your tailnet — to the Calliope server on your
+PC, and nowhere else. The upload is `POST /transcribe` with the recording as
+the raw body (`audio/webm`, `audio/mp4`, `audio/ogg` or `audio/wav`; capped
+at `DICTATION_MAX_AUDIO_BODY_BYTES`, default 25 MB). The server converts it
+with `ffmpeg` to a 16 kHz mono WAV (a take longer than
+`DICTATION_MAX_AUDIO_SECONDS`, default 600 s, is rejected) and transcribes it with
+whisper.cpp (`whisper-server`, or the `whisper-cli` fallback) on your
+machine.
 
-The audio file is deleted immediately after transcription:
-`tempfile.NamedTemporaryFile` for the upload, explicit `Path(...).unlink(missing_ok=True)`
-in the `finally` block of `/transcribe`. Calliope never uploads audio to
-any cloud service; there is no code path that does so.
+Both temp files (`/tmp/dictation-*`) are deleted in the `finally` block of
+`/transcribe`, on success and on every error path. Calliope never uploads
+audio to any cloud service; there is no code path that does so. The setup
+wizard's self-test recording lives in a private per-run temp directory that
+is removed on every exit path.
 
-If `/tmp` is `tmpfs` (the systemd default on most modern Arch / CachyOS /
-Fedora installs), the audio file never touches a physical disk. Verify
-with `findmnt /tmp`.
+The packaged `dictation-server.service` sets `PrivateTmp=yes`; if `/tmp` is
+`tmpfs` (the default on most modern Arch / CachyOS / Fedora installs), the
+audio never touches a physical disk. Verify with `findmnt /tmp`.
 
 ### Transcripts
 
-Held in memory only — `session_transcript: list[dict]` lives in the server
-process and is never written to disk. Restart the server, the log is gone.
+Held in memory only — `session_transcript` lives in the server process and
+is never written to disk. Restart the server and the log is gone
+(restart-on-failure in the unit does not preserve it). Each entry is tagged
+with the SillyTavern chat it came from.
 
 The phone PWA and the `dictation-bridge` ST extension expose:
 
-- `DELETE /transcript` — clear the entire log.
+- `DELETE /transcript` — clear the log **except starred entries**.
+- `DELETE /transcript?all=1` — clear everything, starred included.
+- `DELETE /transcript?chat=<id>` — clear one chat's unstarred entries
+  (`&all=1` includes its starred ones).
 - `DELETE /transcript/<id>` — clear a single entry.
 
-Restart-on-failure is configured in the systemd unit, but the in-memory
-transcript is not preserved across restarts.
+Starring an entry is how you keep it past an ordinary clear — until the
+server restarts.
 
 ### Vocabulary, modes, character → mode memory
 
@@ -55,10 +70,13 @@ syncs them anywhere.
 Stored in `~/.local/share/dictation-server/`:
 
 - `cert.pem` (mode 0644), `key.pem` (mode 0600) — self-signed TLS cert,
-  90-day validity, auto-renewed at startup.
-- `token` (mode 0600) — 32-byte bearer token. Required on every endpoint
-  except `/health`. `dictation-server --rotate-token` rotates it without
-  printing the new value by default; treat the file contents as a password.
+  90-day validity, regenerated when fewer than 7 days remain (checked at
+  startup and every 12 hours while running). Externally issued certs
+  (Tailscale, your own CA) are never overwritten.
+- `token` (mode 0600) — 32-byte bearer token; see
+  [Authentication](#authentication) for which requests need it.
+  `dictation-server --rotate-token` rotates it without printing the new
+  value; treat the file contents as a password.
 - `cert.fingerprint` — SHA-256, also printed at server startup.
 
 Treat this directory like `~/.ssh/`. Exclude it from cloud backups (Google
@@ -69,23 +87,38 @@ exclusion). The token is a credential.
 
 ## What may leave your machine (only if you opt in)
 
-### Transcribed text — not audio — to OmniRoute
+### Dictated text and RP context — not audio — to OmniRoute
 
-When you select a `grammar_clean`, `rp_format`, `rp_enhance`, `persona_pov`,
-`narrator_past`, or `narrator_present` mode, the transcribed *text* (not
-audio) is sent to the local OmniRoute gateway at `http://127.0.0.1:20128`.
-The request is authenticated with `OMNIROUTE_API_KEY`, and OmniRoute relays
-it to the provider named by the catalog-qualified model ID. That upstream
-provider's privacy policy applies to the text hop. Calliope has no
-direct-provider or unauthenticated fallback. The "last AI message" context
-the clients attach travels in a request header, never in the URL, so it does
-not appear in journaled request lines.
+Formatter modes send *text* (never audio) to the local OmniRoute gateway
+(`DICTATION_OMNIROUTE_URL`, default `http://127.0.0.1:20128/v1`),
+authenticated with `OMNIROUTE_API_KEY`. OmniRoute relays each request to the
+provider named by the catalog-qualified model ID, and that provider's
+privacy policy applies. Calliope has no direct-provider or unauthenticated
+fallback. What each built-in mode puts in the request (a *pass* is one
+formatter step; each pass may try several models — and so several upstream
+providers — down its fallback chain if earlier ones fail):
 
-The `plain` and `command` modes bypass all LLM providers entirely. Pick
-`plain` if you want hard certainty that no text leaves your machine. An
-`OOC:` prefix in one of the formatter modes above reroutes that utterance to
-`grammar_clean` (still OmniRoute, but no persona/chat context); in `plain`
-the prefix is kept verbatim and nothing is sent.
+| Mode | Passes | Text sent upstream |
+|---|---|---|
+| `plain`, `command` | 0 | Nothing. Hallucination filter and voice commands run locally. |
+| `grammar_clean` | 1 (cleanup chain) | The dictation and the grammar prompt only. |
+| `rp_format` | 1 (RP chain) | The dictation; plus the last AI message only if the mode has *use chat context* on (off by default). |
+| `rp_enhance` | 1 (RP chain) | The dictation, and — each only when the matching mode switch is on — the persona description (*use persona*), a condensed character card (*use character*), recent ST chat history read from disk, the last AI message, and this chat's earlier dictations (*use chat context*). A scene contract from a fresh SillyTavern state for the same character/chat. |
+| `persona_pov` | 1–2 | Optional disfluency cleanup (cleanup chain, 12–500 words): the dictation only. Then the RP-chain pass: system prompt = persona description (*use persona*) + condensed character card (*use character*) + ST chat history and scene contract (*use chat context*); user content = the (cleaned) dictation only. If the persona or card is missing or switched off, it falls back to the `rp_enhance` assembly under the same switches. |
+| `narrator_past`, `narrator_present` | 1–2 | Optional disfluency cleanup (dictation only), then an RP-chain pass with the same switch-gated context as `rp_enhance` and a narrator system prompt. |
+
+"Earlier dictations" are limited to entries tagged with the current chat.
+User-defined modes choose their own pipeline and switches; check them in
+the mode editor. Client-supplied context (the last AI message) travels in
+the `X-Dictation-Context` header, never in the URL, so it does not appear in
+journaled request lines. The journal logs lengths, ids and timings, never
+dictated, chat or TTS text.
+
+`plain` and `command` never contact a provider — pick `plain` for hard
+certainty that no text leaves your machine. An `OOC:` prefix in a formatter
+mode reroutes that utterance to `grammar_clean` (dictation only, no
+persona/chat context); in `plain` the prefix is kept verbatim and nothing
+is sent.
 
 ### Active provider visibility
 
@@ -102,13 +135,13 @@ The server's outbound calls are observable:
 - The startup banner pins the configured OmniRoute URL so a misconfigured
   upstream cannot silently re-route.
 
-### No model auto-download
+### Model download only during setup
 
-The Whisper model is downloaded once by you during setup
-(see Quickstart in the README). After that, no calls go to Hugging Face.
-Calliope has no `huggingface_hub`, no `urllib` to `hf.co`, no version-check
-endpoint. Verified by grep: zero matches in 5,900 lines for
-`hf.co|huggingface|model.download`.
+The Whisper model is downloaded once, by you, in stage 2 of
+`dictation-server --setup` (from Hugging Face's `ggml-org/whisper.cpp`
+repository, after a confirmation prompt; `large-v3-turbo` is SHA-256
+pinned, other sizes are size-checked). The running server never downloads
+models and has no version-check endpoint.
 
 ### No phone-home / no auto-update
 
@@ -137,9 +170,33 @@ grep: zero matches for `analytics|telemetry|sentry|posthog|mixpanel|google-analy
   configured allowlist (default: `https://localhost:*`,
   `https://127.0.0.1:*`, your configured ST host). No `Access-Control-Allow-Origin: *`
   in production.
-- **Unauthenticated access.** Every endpoint except `/health` requires
-  `Authorization: Bearer <token>`. Token is generated at first run and
-  stored at `~/.local/share/dictation-server/token` mode 0600.
+- **Unauthenticated remote access.** See [Authentication](#authentication).
+
+---
+
+## Authentication
+
+The bearer token is generated at first run and stored at
+`~/.local/share/dictation-server/token` (mode 0600). The policy
+(`require_auth` in `server/calliope-server`):
+
+| Request | Needs the bearer? |
+|---|---|
+| From loopback (`127.0.0.0/8`, `::1`) with no `Origin`, or an allowlisted `Origin` | No — local tools and the extension are trusted. A loopback request carrying a non-allowlisted `Origin` (a random web page) must authenticate like a remote one. |
+| `GET /`, `/health`, `/manifest.json`, `/icon-*.png` | No, but without the token a remote caller gets only a minimal pairing page / health payload. |
+| `POST /pair/exchange` | No — the one-time pairing code is the credential. |
+| `POST /pair/bootstrap` (mint a pairing code) | Yes, as an `Authorization` header, even from loopback. |
+| `GET /events` (SSE) | `?token=` query parameter (browsers' `EventSource` cannot set headers) or loopback. |
+| `OPTIONS` (CORS preflight) | No. |
+| Everything else | `Authorization: Bearer <token>`. |
+
+Pairing URLs carry a short-lived one-use code, never the durable token. JSON
+API responses (`send_json`, including JSON errors) and the dynamically
+rendered phone page send `Cache-Control: no-store`; the static UI page uses
+`private, no-cache` with an ETag, 401 responses carry no cache header, and
+the SSE stream sends `no-cache, no-transform`. The phone UI pages also send
+`X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and a
+`Content-Security-Policy` `frame-ancestors` restriction.
 
 ---
 

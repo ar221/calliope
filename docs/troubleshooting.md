@@ -130,14 +130,18 @@ ln -sf "$PWD/build/bin/whisper-cli"    ~/.local/bin/whisper-cli
 ln -sf "$PWD/build/bin/whisper-server" ~/.local/bin/whisper-server
 ```
 
-If the binaries are at a non-default path:
+If the binaries are at a non-default path, point the units at them:
 
 ```ini
 # ~/.config/systemd/user/dictation-server.service.d/override.conf
 [Service]
 Environment=WHISPER_BIN=/full/path/to/whisper-cli
-Environment=WHISPER_SERVER_BIN=/full/path/to/whisper-server
 ```
+
+`whisper-server` has no environment override — its path is the
+`ExecStart=` of `whisper-server.service`. Override it with a drop-in that
+clears and restates `ExecStart` (`systemctl --user edit whisper-server`),
+keeping the flags from the shipped unit.
 
 Then `systemctl --user daemon-reload && systemctl --user restart dictation-server`.
 
@@ -309,10 +313,12 @@ pkill -f dictation-server
 # Wait 2s, retry
 systemctl --user restart dictation-server
 
-# If a different service legitimately wants 8384, pick another port:
-# ~/.config/systemd/user/dictation-server.service.d/override.conf
-[Service]
-Environment=DICTATION_PORT=8385
+# If a different service legitimately wants 8384, pick another port. The
+# port is a CLI flag (there is no port environment variable):
+systemctl --user edit dictation-server
+# [Service]
+# ExecStart=
+# ExecStart=%h/.local/bin/dictation-server --port 8385
 ```
 
 `systemctl --user daemon-reload && systemctl --user restart dictation-server`.
@@ -331,11 +337,11 @@ empty response, or every model in the chain failed. The pipeline falls back to
 the previous stage's output and reports `formatting_skipped` with a reason.
 Check `formatting_reason` first; it names the actual failure:
 
-- `RP gateway offline (... not reachable)` — the liveness probe failed. Probe
-  timeout is `DICTATION_FORMATTER_PROBE_TIMEOUT` (default 6s) and the verdict is
-  cached for `DICTATION_FORMATTER_PROBE_TTL` (default 30s). A cold OmniRoute
-  `/v1/models` catalog build can take over 3s, which is why the probe budget is
-  no longer 2s.
+- `RP gateway offline (OmniRoute not reachable)` — a completion request could
+  not connect to OmniRoute (refused / unresolvable). There is no separate
+  liveness probe; the offline verdict is cached for
+  `DICTATION_FORMATTER_OFFLINE_TTL` (default 3s) so the remaining tiers and
+  the next request do not each pay a failed connection.
 - `RP formatting failed: timed out` — a model blew
   `DICTATION_FORMATTER_TIMEOUT` (default 18s per attempt). Timeouts are
   chain-skippable, so the next tier is tried automatically.
@@ -388,23 +394,26 @@ If you still see >30s hangs:
    ```
 2. Look at the timing JSON:
    ```bash
-   journalctl --user -u dictation-server | grep timing | tail -1 | jq
+   journalctl --user -u dictation-server -g 'timing \{' -n 1 -o cat
    ```
-   `stages_ms.whisper` >> 1000 = the model isn't warm. dictation-server
-   starts `whisper-server` on the first request (the unit has no
-   `[Install]` section, so it does not start at login). To keep it warm,
-   leave `WHISPER_IDLE_SHUTDOWN_DISABLED=1` set (the shipped unit does) and
-   run `systemctl --user start whisper-server` once after login.
+   Each `stages_ms` value is milliseconds since the request arrived, in the
+   order the stages finished (`context`, `upload`, `ffmpeg`,
+   `whisper_boot` — only on a cold start —, `whisper`, then formatter keys
+   such as `ttft` and `step_*`); subtract neighbours for per-stage cost.
+   `whisper_cold: true` / a large gap before `whisper` = the model wasn't
+   warm. dictation-server starts `whisper-server` on demand (the unit has no
+   `[Install]` section, so it does not start at login); the clients call
+   `POST /warm` when recording starts so the boot overlaps your speech. To
+   keep it warm, leave `WHISPER_IDLE_SHUTDOWN_DISABLED=1` set (the shipped
+   unit does) and run `systemctl --user start whisper-server` once after login.
 3. Test ROCm / CUDA from the host:
    ```bash
    rocm-smi   # or nvidia-smi
    ```
-   If GPU is missing, fall back to `--no-gpu` for diagnosis:
-   ```ini
-   # override.conf
-   [Service]
-   Environment=WHISPER_NO_GPU=1
-   ```
+   There is no CPU-mode switch for the daemon; for diagnosis, stop
+   `whisper-server` (`systemctl --user stop whisper-server`) and transcribe
+   once with a small model via the CPU-capable `whisper-cli` directly:
+   `whisper-cli -m ~/.local/share/whisper/ggml-base.en.bin -f sample.wav -ng`.
    CPU-mode is ~3-5× realtime on a modern x86. Slow but functional.
 4. Inspect `journalctl --user -u dictation-server -f` during the hang —
    ROCm errors or Python tracebacks usually appear before the timeout

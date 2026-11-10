@@ -1,13 +1,28 @@
 # Desktop hotkey
 
-The `dictate` bash client (`scripts/dictate`, deployed to
-`~/.local/bin/dictate`) is the desktop push-to-talk surface. It records
-via `pw-record`, transcribes either against the local Calliope server
-(`--mode rp_enhance`) or directly via `whisper-cli`, and pastes the
-result via `wtype` (most apps) or `wl-copy + wtype Ctrl+V` (terminals
-that need clipboard paste — kitty / foot / Alacritty / ghostty / wezterm).
+> **Prerequisite — not shipped here.** The `dictate` bash client this page
+> binds is **not part of this repository** and neither `scripts/install-server`
+> nor the packages install it. You need your own copy at
+> `~/.local/bin/dictate`. Without it, use the browser capture surfaces that
+> do ship: the SillyTavern extension's mic button and the phone PWA (which
+> also works in a desktop browser at `https://127.0.0.1:8384`).
 
-The script is the trigger surface; your compositor / desktop environment
+The `dictate` client is the desktop push-to-talk surface. It records via
+`pw-record`, transcribes either against the local Calliope server or
+directly via `whisper-cli`, and pastes the result via `wtype` (most apps) or
+`wl-copy + wtype Ctrl+V` (terminals that need clipboard paste — kitty /
+foot / Alacritty / ghostty / wezterm).
+
+Any client can do the same with the server's public contract: from
+loopback (no `Origin` header, so no bearer needed — see
+[PRIVACY.md → Authentication](../PRIVACY.md#authentication)) optionally
+`POST /warm` when recording starts, then `POST /transcribe?mode=<id>` with
+the recording as the raw body and `Content-Type: audio/wav` (or
+`audio/webm`, `audio/mp4`, `audio/ogg`); the JSON reply carries `text`.
+Desktop capture does not take part in the extension's cross-tab capture
+arbitration.
+
+The client is the trigger surface; your compositor / desktop environment
 binds the hotkey.
 
 ---

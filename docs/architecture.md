@@ -108,9 +108,14 @@ printed). One `DictationHandler` class dispatches by path.
 **Trust boundaries:**
 
 - **Boundary 1: phone / extension → server** — HTTPS, bearer token
-  required on every endpoint except `/health`. CORS allowlist
+  required except for trusted loopback requests and the pairing/bootstrap
+  surfaces (`/`, `/health`, `/manifest.json`, `/pair/exchange`; `/events`
+  takes `?token=`) — full matrix in
+  [PRIVACY.md → Authentication](../PRIVACY.md#authentication). CORS allowlist
   (configurable, defaults to `https://localhost:*`, `https://127.0.0.1:*`,
-  configured ST host). Default bind `127.0.0.1`; LAN bind opt-in.
+  configured ST host). Default bind `127.0.0.1`; LAN bind opt-in. The phone
+  UI is served with `nosniff`, `no-referrer` and a CSP `frame-ancestors`
+  policy; API responses are `Cache-Control: no-store`.
 - **Boundary 2: server → whisper-server** — loopback HTTP, no auth (the
   whisper-server bind is loopback-only; not exposed). Boundary is the
   process boundary, not a network boundary.
@@ -179,11 +184,12 @@ Kokoro proxy:
 phone/extension                server                         whisper-server   LLM proxy
       │                          │                                │                │
       │  POST /transcribe        │                                │                │
-      │  audio/webm + Bearer     │                                │                │
+      │  audio/webm|mp4|ogg|wav  │                                │                │
+      │  (POST /warm at capture start boots whisper-server)       │                │
       ├─────────────────────────▶│                                │                │
       │                          │  validate token + CORS         │                │
-      │                          │  emit dictation-state:listening│                │
-      │                          │  ffmpeg webm→wav 16k mono      │                │
+      │                          │  emit dictation-state          │                │
+      │                          │  ffmpeg any→wav 16k mono       │                │
       │                          │  build_whisper_prompt(char)    │                │
       │                          │  POST /inference (multipart) ─▶│                │
       │                          │                                │  whisper.cpp   │
@@ -195,7 +201,7 @@ phone/extension                server                         whisper-server   L
       │                          │   rp_enhance      ── HTTP ───────────────────▶│
       │                          │  emit dictation-token (SSE) for streaming     │
       │                          │  emit dictation-state:done     │                │
-      │  200 {final, partials}   │                                │                │
+      │  200 {text, raw, cleaned, entry_id, …}                    │                │
       │◀─────────────────────────┤                                │                │
       │                          │  append to session_transcript  │                │
       │  SSE: dictation-result   │  (in-RAM)                      │                │
@@ -207,23 +213,29 @@ phone/extension                server                         whisper-server   L
 
 EventSource subscribers receive a stream of named events. Per-subscriber
 bounded queue (size 50), drop-on-full to avoid backpressure stalling the
-producer.
+producer. `dictation-transcript` is a phase marker that never carries raw
+Whisper text. Other events do carry text: `dictation-token` deltas
+(formatter output), `dictation-result.text`, the `raw`/`cleaned` fields of
+a `/send-to-st` result, and `dictation-command.source_text` / `residual`.
 
 | Event name | Payload | Producer |
 |---|---|---|
-| `dictation-state` | `{state: idle\|listening\|transcribing\|cleaning\|done, mode, ts}` | pipeline transitions |
-| `dictation-transcript` | `{requestId, phase, text, source, latency_ms?}` | raw Whisper preview before formatter work |
+| `dictation-state` | `{requestId, state, ts, details?}` | pipeline transitions (`listening`, `transcribing`, `cleaning`, `done`, …) |
+| `dictation-transcript` | `{requestId, phase, has_text: true, source: "whisper", ts, …}` | Whisper phase marker — **no text** |
 | `dictation-token` | `{requestId, delta, done}` | streaming formatter output (MVP-13), not TTS audio |
-| `dictation-result` | `{requestId, text, raw, cleaned, mode, timing, formatting_skipped?}` | completed dictation payload |
-| `dictation-edit` | `{text, auto_send?}` | phone "Send to ST" button → fan-out |
-| `dictation-command` | `{cmd, args, raw}` | voice-edit grammar (POL-15) |
+| `dictation-result` | `{requestId, text, mode, formatting_skipped, formatting_reason, model, model_fallback, model_tier, is_ooc, mode_override, auto_send, ts, …}` | end of an enhancement-mode `/transcribe` (`has_repair_trace` flag, no trace), and phone **Send to ST** via `POST /send-to-st` (adds `raw`, `cleaned`) |
+| `dictation-command` | `{requestId, intent, args, source_text, residual, ts}` | voice-edit grammar (POL-15) |
+| `ping` | `{ts}` (epoch seconds) | liveness, every 15 s, alongside a `: heartbeat` comment |
+
+Clients treat any event, including `ping`, as liveness; the extension
+reconnects when nothing has arrived for 45 s.
 
 ### `POST /send-to-st` (phone → extension fan-out)
 
 Phone tap of "Send to ST" → server validates token → server emits
-`dictation-edit` event over SSE → all subscribed extension instances
-write into `#send_textarea`. Server is stateless for this path; it just
-fans out.
+`dictation-result` (with a fresh `requestId` and `auto_send`) over SSE → the
+owning extension instance writes into `#send_textarea`. Server is stateless
+for this path; it just fans out.
 
 ## Performance characteristics
 
@@ -240,15 +252,22 @@ fans out.
 | **Total** | **3–7 s** for `rp_enhance` | LLM dominates |
 
 Per-`/transcribe` `timing` JSON is logged at the end of the request
-(MVP-POL-16) — `journalctl --user -u dictation-server | grep timing`
-extracts a per-request stage breakdown.
+(MVP-POL-16): `journalctl --user -u dictation-server -g 'timing \{'`. The
+line carries `req`, `mode`, `audio_s`, `whisper_cold` and `stages_ms`,
+whose values are milliseconds since the request arrived, insertion-ordered:
+`context` (chat context built), `upload` (body read), `ffmpeg`,
+`whisper_boot` (only when whisper-server had to start), `whisper`, then
+formatter stamps — `ttft` (first streamed token), `step_*`. The
+difference between neighbouring keys is that stage's cost. No text is
+logged.
 
 ## What's not in this diagram
 
-- Push-to-talk desktop client (`scripts/dictate`, ~490 lines bash) — when
+- External push-to-talk desktop client (`dictate`, **not in this
+  repository** — see [`desktop-hotkey.md`](desktop-hotkey.md)) — when
   invoked with `--mode`, it POSTs to `/transcribe` like any other client.
   When invoked without, it shells `whisper-cli` directly and bypasses
-  the server. Still useful for offline-only workflows.
+  the server.
 - Footswitch daemon (WOW-7, not yet shipped) — would be another
   push-to-talk client targeting `/transcribe`.
 - AUR / pipx packaging (MVP-25) — distribution-only, no runtime architecture

@@ -1,6 +1,6 @@
 # Calliope Roadmap
 
-Status date: 2026-06-26.
+Status date: 2026-11-10.
 
 ## Shipped / working MVP+
 
@@ -11,7 +11,7 @@ Status date: 2026-06-26.
 - Phone follow mode for fresh ST state.
 - Persistent whisper.cpp HTTP daemon on `127.0.0.1:9001` with fallback paths.
 - Formatter modes: `plain`, `grammar_clean`, `rp_format`, `rp_enhance`, `persona_pov`, `narrator_past`, `narrator_present`, `command`.
-- SSE events for state, raw transcript preview, formatter tokens, final result, edits, and voice commands.
+- SSE events for state, transcript phase markers (no raw text), formatter tokens, final result, voice commands, and a 15 s `ping` liveness event.
 - Privacy badge and `/audit/network` external-destination audit.
 - Token-bearing URL log redaction.
 - Group-chat state payloads: group id, group members, and last speaker.
@@ -21,12 +21,16 @@ Status date: 2026-06-26.
 - MVP-26 first slice: request-scoped in-memory scene contract injected into RP+ and Persona POV prompts; no persistent scene DB.
 - MVP-27 first slice: deterministic local RP eval harness with synthetic fixtures for intent/addressee/privacy/expansion checks.
 - WOW-2 group cast voicing: one-click `Auto-cast group` assigns a distinct Kokoro voice to every group member via the stateless `POST /tts/voices/autocast` endpoint (greedy distinct-voice pick reusing the `_suggest_voices` heuristic), plus an editable name→voice roster (per-row Sample/Remove) in the ST settings panel. Client owns persistence into `ttsVoiceProfiles`; server stays stateless.
+- POL-3 word confidence from whisper `verbose_json`: low-confidence spans with tap-to-correct alternatives in both clients.
+- Canonical character keys shared by vocab, mode memory and card lookup, with a merge migration for older `char-modes.yaml` files.
+- Cross-tab streaming ownership and undo restoration in the ST extension.
+- 2026-11-10 audit fixes: `POST /warm` pre-boots whisper-server at capture start; `/transcribe` accepts webm/mp4/ogg/wav and normalises all through ffmpeg (`DICTATION_MAX_AUDIO_SECONDS`); `/transcribe` returns `entry_id` for exact Regenerate; split `timing` stages; exact-chat context from ST state; per-chat session context; setup wizard pins the chosen Whisper model and never restarts a running service; AUR/pipx packages ship the full runtime package and units.
 
 ## Release-hardening queue
 
 1. **Pairing clarity**
    - Done: distinguish server health, token validity, SSE status, and ST-follow freshness.
-   - Done: ST settings panel can open a fresh paired phone page or copy a tokenized pairing URL.
+   - Done: ST settings panel can open a fresh paired phone page or copy a one-time `?pair=` pairing URL (the bearer never appears in a URL).
    - Done: local settings-panel QR renderer uses vendored Nayuki MIT browser JS and Canvas; no server round-trip or third-party QR service.
 
 2. **Group-chat QA**
@@ -53,17 +57,17 @@ Status date: 2026-06-26.
    - Live sequence: stop service, rotate, update ST bridge token setting, restart, hard-refresh ST, re-pair phone.
 
 6. **Packaging**
-   - Done: AUR `calliope-git` packaging now follows the repo layout, installs the single-file server through package wrappers, includes the adjacent voice catalog, and keeps runtime state/certs/tokens/models out of the package.
-   - Done: pipx packaging remains a thin adapter around the single-file server source; Hatch copies `server/calliope-server` into the wheel as the `calliope-server` entry point without lifting out the embedded PWA.
+   - Done (unpublished): AUR `calliope-git` installs the wrapper, the full `calliope_server/` package and voice catalog under `/usr/lib/calliope/`, the systemd units and learner timer under `/usr/lib/systemd/user/` (plus `/usr/lib/calliope/units/` for `--setup`), with packaged paths rewritten into the units. Runtime state/certs/tokens/models stay out of the package.
+   - Done (unpublished): pipx wheel nests the wrapper, package, catalog and `units/`, and exposes both `calliope-server` and `dictation-server` console scripts. `whisper-server`, the Kokoro venv and the learner checkout remain operator-provided.
    - Pending: publish/tag/release steps remain blocked until a release is explicitly cut.
 
 7. **Docs/publication hygiene**
    - Done: public-path scan completed; generic runtime paths stay as examples and Ayaz-local SillyTavern paths remain documented as local operational defaults.
-   - Done: CI mirrors local gates: pytest, ruff, Python syntax, extension JS syntax, embedded phone UI JS syntax, packaging shell syntax, and systemd unit verification.
+   - Done: CI mirrors local gates: pytest (with Node and NumPy), pinned ruff, Python syntax, extension JS syntax, embedded phone UI JS syntax, packaging shell syntax, and systemd unit verification. The integration smoke (tiny model, non-gating) still needs `tests/fixtures/hello.wav`.
    - Done: `.github/ISSUE_TEMPLATE/` issue forms explicitly forbid audio attachments, tokenized URLs, bearer tokens, certs/keys, cookies, and private chat logs.
 
 ## Known intentional defaults
 
 - Auto-send is off: Ayaz’s preferred workflow is dictate → format → review in ST textarea → click send.
-- Phone URLs may include a token briefly; the page stores it in session storage and scrubs the visible URL afterward.
+- Phone URLs carry only a one-time `?pair=` code; the page exchanges it for the token, keeps that in session storage and scrubs the visible URL.
 - `whisper-server` may idle-shutdown to reclaim VRAM unless `WHISPER_IDLE_SHUTDOWN_DISABLED` is set.

@@ -32,9 +32,12 @@ calliope: cert fingerprint sha256: 8F:23:1C:...:E7:42
 
 It is also written to `~/.local/share/dictation-server/cert.fingerprint`.
 
-**Match this fingerprint before trusting the cert** on any device. If you
-see a different fingerprint in the browser's "view certificate" dialog,
-someone is MITMing your LAN — back out and investigate.
+**Match this fingerprint before trusting the cert** on any device. If the
+browser's "view certificate" dialog shows a different fingerprint, first
+check the current value on the server
+(`openssl x509 -in ~/.local/share/dictation-server/cert.pem -fingerprint -sha256 -noout`)
+— the cert may simply have been renewed. A mismatch against *that* means
+someone may be intercepting your LAN traffic; back out and investigate.
 
 ---
 
@@ -179,8 +182,11 @@ out of screenshots and logs.
 
 ## When the cert rotates
 
-Calliope rotates the cert at server startup if it's within the renewal
-threshold (`CERT_RENEW_THRESHOLD_DAYS`, currently 14). After rotation:
+Calliope regenerates its self-signed cert when fewer than
+`CERT_RENEW_THRESHOLD_DAYS` (7) days remain — checked at startup and every
+12 hours while running (the running server hot-loads the new cert for new
+connections). Externally issued certs (Tailscale, mkcert, your own CA) are
+never regenerated. After a rotation:
 
 1. The fingerprint changes. The startup log shows the new value.
 2. Devices that trusted the *old* cert will see a fresh "your connection

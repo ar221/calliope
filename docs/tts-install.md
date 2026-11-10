@@ -145,10 +145,10 @@ or in Calliope's environment for the proxy side:
 | `KOKORO_SERVER_URL` | `http://127.0.0.1:9002` | calliope | Proxy upstream URL. |
 | `KOKORO_DEFAULT_VOICE` | `af_heart` | calliope | Voice when request omits `voice`. |
 | `KOKORO_IDLE_SHUTDOWN_SECONDS` | `600` | calliope | Idle threshold before stopping the unit. Never fires while a synthesis (including each audiobook segment) is in flight. |
-| `KOKORO_IDLE_SHUTDOWN_DISABLED` | unset | calliope | Set to anything to keep Kokoro warm. |
-| `KOKORO_REQUEST_TIMEOUT` | `10` | calliope | Proxy request timeout. |
-| `TTS_AUDIOBOOK_MAX_MESSAGES` | `50` | calliope | Maximum messages per audiobook export. |
-| `TTS_AUDIOBOOK_MAX_TOTAL_CHARS` | `12000` | calliope | Maximum total text in an audiobook export. |
+| `KOKORO_IDLE_SHUTDOWN_DISABLED` | unset | calliope | `1`/`true`/`yes`/`on` keeps Kokoro warm; any other value (including `0`/`false`) leaves idle shutdown on. |
+| `KOKORO_REQUEST_TIMEOUT` | `240` | calliope | Proxy request timeout (seconds). |
+| `TTS_AUDIOBOOK_MAX_MESSAGES` | `200` | calliope | Maximum messages per audiobook export. |
+| `TTS_AUDIOBOOK_MAX_TOTAL_CHARS` | `60000` | calliope | Maximum total text in an audiobook export. |
 | `TTS_AUDIOBOOK_SILENCE_MS` | `350` | calliope | Gap between audiobook clips. |
 
 ## Sandboxing

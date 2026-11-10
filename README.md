@@ -14,8 +14,8 @@ network.
 ## What it does (60 seconds)
 
 - One mic button in the SillyTavern send bar (via the `dictation-bridge`
-  extension), one hotkey on the desktop (`Mod+Shift+M`), and a phone PWA
-  reachable from any device on your LAN.
+  extension), a phone PWA reachable from any device on your LAN or tailnet,
+  and an optional desktop hotkey via an external `dictate` client.
 - Hold to record on phone or desktop, release to transcribe.
 - Whisper `large-v3-turbo` runs on your local GPU (ROCm or CUDA via
   whisper.cpp).
@@ -49,7 +49,7 @@ network.
 | Persona-aware formatting | Eight-mode pipeline (plain → rp_enhance → persona_pov → narrator/command) | plain transcript only | plain transcript only |
 | Character vocab biasing | per-character `vocab.yaml` → whisper `--prompt` | none | none |
 | Phone push-to-talk | embedded PWA, MediaRecorder + VAD | terminal only | none |
-| Desktop hotkey | `dictate` bash + niri/GNOME/KDE keybinds, smart-paste detection | none | none |
+| Desktop hotkey | external `dictate` client (not shipped) + niri/GNOME/KDE keybind recipes | none | none |
 | Active-chat context | reads ST disk to inject recent messages | none | none |
 | Audio leaves your network? | **No** in `plain` mode; RP modes pass *text* (not audio) to a configured local LLM proxy | self-hosted Extras only | **Yes** by default |
 | License | MIT | GPLv3 | GPLv3 |
@@ -98,10 +98,16 @@ server from the checkout:
 scripts/install-server
 ```
 
-This syncs the `calliope_server/` package (plus `voice_catalog.json` and the
-repo's systemd units, staged under `units/`) into
-`~/.local/share/dictation-server/`, then puts the executable wrapper at
-`~/.local/bin/dictation-server`, which finds the package there at runtime.
+This is the only supported deploy path from a checkout. It syncs the
+`calliope_server/` package (plus `voice_catalog.json` and the repo's systemd
+units and learner timer, staged under `units/`) into
+`~/.local/share/dictation-server/`, puts the executable wrapper at
+`~/.local/bin/dictation-server` (if that is a symlink, the link is kept and its
+target overwritten), and writes `INSTALL_MANIFEST` with the checkout revision
+and SHA-256 of every installed file. The installed wrapper refuses to start
+on a mixed or unverified install; re-run the script to fix it. It restarts
+nothing. `scripts/install-server --check` reports drift between the checkout
+and the installed copy and exits 1 if anything differs.
 
 (AUR `calliope-git` and pipx packaging via `calliope-dictation` are tracked in
 [the roadmap](docs/roadmap.md); neither channel is published yet.)
@@ -129,12 +135,12 @@ ln -s "$PWD/extension" <ST install>/data/default-user/extensions/third-party/dic
 
 Hard-refresh ST. A mic button appears in the send bar.
 
-**7. First desktop hotkey** (niri shown, GNOME / KDE in
-[`docs/desktop-hotkey.md`](docs/desktop-hotkey.md)):
-
-```kdl
-Mod+Shift+M  { spawn "bash" "-c" "$HOME/.local/bin/dictate toggle"; }
-```
+**7. Desktop hotkey (optional, external client).** The desktop push-to-talk
+client `dictate` is **not shipped in this repository**; the hotkey recipes in
+[`docs/desktop-hotkey.md`](docs/desktop-hotkey.md) assume you provide
+`~/.local/bin/dictate` yourself. Without it, dictate on the desktop through
+the SillyTavern extension's mic button or the PWA in a desktop browser
+(`https://127.0.0.1:8384`).
 
 **8. First phone connection.** In ST, open Extensions → Dictation Bridge and
 use **Re-pair this phone**, **Show local QR**, or **Copy pairing URL**. Each
@@ -174,8 +180,9 @@ Full breakdown — endpoints, trust boundaries, SSE event taxonomy — in
 
 Runtime data and config live under `~/.local/share/dictation-server/`:
 
-- `cert.pem` / `key.pem` — self-signed TLS cert (90-day rotation,
-  auto-renewed at startup).
+- `cert.pem` / `key.pem` — self-signed TLS cert (90-day validity,
+  regenerated when fewer than 7 days remain; checked at startup and every
+  12 hours). Externally issued certs are never overwritten.
 - `token` — 32-byte bearer token, mode 0600. Rotate with `dictation-server --rotate-token`; the command prints the token path and live-service next steps, not the token value. Live rotation sequence: stop the user service, rotate, update the ST bridge token setting from the token file, restart the service, hard-refresh SillyTavern, then re-pair the phone. `dictation-server --show-token` prints the current token to stdout for manual re-pairing.
 - `cert.fingerprint` — SHA-256, also printed at startup.
 - `vocab.yaml` — character/term biasing for whisper `--prompt`.
@@ -188,8 +195,11 @@ Environment-variable overrides (set in `~/.config/systemd/user/dictation-server.
   on LAN (token auth still required).
 - Port is currently a CLI option: set `ExecStart=.../dictation-server --port 8385` in the user unit override if you need a non-default port.
 - TLS cert/key live under `~/.local/share/dictation-server/`; Tailscale/mkcert flows should write `cert.pem` and `key.pem` there. See [`docs/tailscale.md`](docs/tailscale.md).
-- `WHISPER_BIN`, `WHISPER_SERVER_BIN`, `WHISPER_MODEL` — override binary
-  and model paths.
+- `WHISPER_BIN` — `whisper-cli` binary for the per-request fallback.
+  `DICTATION_WHISPER_MODEL` — Whisper model name (default `large-v3-turbo`,
+  file `~/.local/share/whisper/ggml-<name>.bin`); `--setup` writes it as a
+  drop-in for both `whisper-server.service` and `dictation-server.service`.
+  The `whisper-server` binary path is the unit's `ExecStart`.
 - `DICTATION_OMNIROUTE_URL`, `DICTATION_OMNIROUTE_RP_CHAIN`,
   `DICTATION_OMNIROUTE_CLEAN_CHAIN`, and `DICTATION_OMNIROUTE_SELECTABLE_MODELS`
   configure the OmniRoute formatter gateway (the only formatter route) and its
@@ -210,7 +220,8 @@ Full reference: [`docs/config.md`](docs/config.md).
 
 See [PRIVACY.md](PRIVACY.md). Short version:
 
-- Audio is captured locally, transcribed locally, deleted immediately.
+- Audio goes only from the capturing device (phone, browser) to the server
+  on your PC, is transcribed there, and its temp files are deleted per request.
 - Transcripts live in RAM only — server restart wipes them.
 - `plain` mode is fully local. RP/formatter modes pass *text* (not audio) to
   authenticated OmniRoute; the chosen gateway model is shown to clients and

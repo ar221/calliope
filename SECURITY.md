@@ -24,8 +24,8 @@ The supported local deployment is:
 
 ## Baseline expectations
 
-- `/health` may be public; protected APIs require bearer auth except loopback exemptions.
+- `/`, `/health`, `/manifest.json` and `/pair/exchange` are reachable without the bearer (remote callers without it get minimal content); `/events` accepts `?token=`; everything else requires the bearer except trusted loopback requests. Full matrix: [PRIVACY.md → Authentication](PRIVACY.md#authentication).
 - Token-bearing query strings are redacted from server logs.
-- Phone pairing tokens are session-scoped in the browser and scrubbed from the visible URL after bootstrap.
-- Token rotation uses `dictation-server --rotate-token`; the safe default prints only the token path and operational next steps, not the token value.
-- External model/provider calls are surfaced through `/audit/network`.
+- Phone pairing URLs carry a short-lived one-use code; the phone keeps the exchanged token in session-scoped browser storage and scrubs the code from the visible URL.
+- Token rotation uses `dictation-server --rotate-token`; the safe default prints only the token path and operational next steps, not the token value. A running server keeps the old token until restarted.
+- `/audit/network` records the server's own outbound connections (host, port, bytes, loopback flag). Formatter traffic goes to the loopback OmniRoute gateway, so the gateway's onward hop to the upstream provider is **not** visible there — only in OmniRoute's own logs.
