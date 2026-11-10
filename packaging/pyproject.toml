@@ -6,8 +6,17 @@
 # and nests the package as `calliope_dictation/calliope_server/`; the
 # wrapper's bootstrap adds its own directory to sys.path, so the nested
 # package resolves, and tts.py finds voice_catalog.json one level above
-# the package dir (`calliope_dictation/voice_catalog.json`). This keeps
-# `pipx install ./packaging` exposing the intended `calliope-server` command.
+# the package dir (`calliope_dictation/voice_catalog.json`). The systemd
+# units ship as `calliope_dictation/units/`, which is where
+# `dictation-server --setup` looks outside a checkout.
+#
+# Console scripts: `calliope-server`, plus `dictation-server` because the
+# shipped dictation-server.service runs `%h/.local/bin/dictation-server`
+# (pipx's default bin dir). Not covered by the wheel: whisper-server.service
+# expects `%h/.local/bin/whisper-server` (symlink your whisper.cpp build),
+# kokoro-server.service expects the venv + script from docs/tts-install.md,
+# and learn-vocab-nightly.service runs `scripts/learn-vocab` from a checkout
+# at `%h/Github/calliope`.
 #
 # Publication note: keep this as a packaging adapter only. Do not move WEB_UI or
 # other runtime assets into a separate browser bundle as part of pipx packaging.
@@ -46,6 +55,7 @@ all = ["pyyaml>=6.0", "wordfreq>=3.0"]
 
 [project.scripts]
 calliope-server = "calliope_dictation._server:main"
+dictation-server = "calliope_dictation._server:main"
 
 [project.urls]
 Homepage = "https://github.com/ar221/calliope"
@@ -58,3 +68,4 @@ packages = ["calliope_dictation"]
 "../server/calliope-server" = "calliope_dictation/_server.py"
 "../server/calliope_server" = "calliope_dictation/calliope_server"
 "../server/voice_catalog.json" = "calliope_dictation/voice_catalog.json"
+"../systemd" = "calliope_dictation/units"

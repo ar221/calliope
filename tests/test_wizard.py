@@ -68,7 +68,7 @@ def _stub_systemctl(monkeypatch):
 def test_stage_4_installs_repo_units_and_enables_only_dictation(monkeypatch):
     calls = _stub_systemctl(monkeypatch)
 
-    wizard._wizard_stage_4(SimpleNamespace(install_systemd=True))
+    wizard._wizard_stage_4(SimpleNamespace(install_systemd=True), {"model_id": "tiny.en"})
 
     for name in wizard.WIZARD_UNITS:
         installed = wizard.WIZARD_UNIT_DIR / name
@@ -82,7 +82,7 @@ def test_stage_4_without_repo_units_stops_and_writes_nothing(monkeypatch, capsys
     monkeypatch.setattr(wizard, "_wizard_repo_unit", lambda _name: None)
 
     with pytest.raises(SystemExit):
-        wizard._wizard_stage_4(SimpleNamespace(install_systemd=True))
+        wizard._wizard_stage_4(SimpleNamespace(install_systemd=True), {"model_id": "tiny.en"})
 
     assert not wizard.WIZARD_UNIT_DIR.exists()
     assert calls == []

@@ -3,6 +3,8 @@
 # Notes:
 #   - python-version pinned to 3.12 (actions floor that covers stdlib needs).
 #     3.14 is the long-term target once GitHub-hosted runners support it.
+#   - ruff is pinned to the version the tree is clean under; bump deliberately.
+#   - Actions use major tags, not commit SHAs (SHAs not verified offline).
 #   - The integration job is best-effort until a fixture WAV ships; it skips
 #     gracefully when `tests/fixtures/hello.wav` is absent (see step gate).
 
@@ -54,7 +56,7 @@ jobs:
             systemd/learn-vocab-nightly.service
       - uses: astral-sh/setup-uv@v3
       - name: Install ruff
-        run: uv tool install ruff
+        run: uv tool install ruff==0.17.4
       - name: Lint
         run: ruff check .
 
@@ -62,11 +64,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: Install test dependencies
-        run: pip install pyyaml pytest wordfreq
+        # numpy: Kokoro HTTP tests (test_kokoro_server_script.py) skip without it.
+        run: pip install pyyaml pytest wordfreq numpy
       - name: Run unit tests
         run: pytest -q
 
@@ -77,13 +83,6 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Install ffmpeg
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y ffmpeg
       - name: Skip if fixture is missing
         id: fixture_check
         run: |
@@ -93,27 +92,44 @@ jobs:
             echo "have_fixture=0" >> "$GITHUB_OUTPUT"
             echo "::notice::tests/fixtures/hello.wav missing — skipping integration smoke."
           fi
-      - name: Build whisper.cpp tiny model
+      - uses: actions/setup-python@v5
+        if: steps.fixture_check.outputs.have_fixture == '1'
+        with:
+          python-version: '3.12'
+      - name: Install ffmpeg
+        if: steps.fixture_check.outputs.have_fixture == '1'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg
+      - name: Build whisper-cli and fetch the tiny model
         if: steps.fixture_check.outputs.have_fixture == '1'
         run: |
           git clone --depth 1 https://github.com/ggerganov/whisper.cpp /tmp/whisper.cpp
           cd /tmp/whisper.cpp
-          make tiny
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j --target whisper-cli
           ./models/download-ggml-model.sh tiny
-      - name: Smoke test transcribe (HTTP, --no-ssl)
+          mkdir -p "$HOME/.local/share/whisper"
+          cp models/ggml-tiny.bin "$HOME/.local/share/whisper/ggml-tiny.bin"
+      - name: Smoke test transcribe (HTTP, --no-ssl, tiny model)
         if: steps.fixture_check.outputs.have_fixture == '1'
+        env:
+          # No user systemd here: whisper-server cannot start, so the server
+          # falls back to the whisper-cli subprocess with this model.
+          WHISPER_BIN: /tmp/whisper.cpp/build/bin/whisper-cli
+          DICTATION_WHISPER_MODEL: tiny
+          OMNIROUTE_API_KEY: ci-dummy
         run: |
-          # calliope-server has a --no-ssl flag (Phase 1). It does not
-          # currently have a CALLIOPE_NO_SSL env var; flag-based invocation
-          # is the supported path. TODO: consider env-var parity for easier
-          # orchestration in containerised tests.
-          export PATH="/tmp/whisper.cpp:$PATH"
           python3 server/calliope-server --no-ssl --port 18384 &
           SERVER_PID=$!
-          # Give the server a moment to mint the bearer token + bind.
-          sleep 3
-          curl -fsS -X POST -H "Content-Type: audio/wav" \
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:18384/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+          TOKEN="$(python3 server/calliope-server --show-token)"
+          OUT="$(curl -fsS -X POST -H "Content-Type: audio/wav" \
+            -H "Authorization: Bearer $TOKEN" \
             --data-binary @tests/fixtures/hello.wav \
-            "http://127.0.0.1:18384/transcribe?mode=plain" || \
-            (kill "$SERVER_PID" 2>/dev/null; exit 1)
-          kill "$SERVER_PID" 2>/dev/null || true
+            "http://127.0.0.1:18384/transcribe?mode=plain&model=tiny")"
+          echo "$OUT" | python3 -c 'import json,sys; t=json.load(sys.stdin)["text"].lower(); print(len(t), "chars"); sys.exit(0 if "fox" in t else 1)'

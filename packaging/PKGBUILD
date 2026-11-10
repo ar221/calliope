@@ -8,10 +8,25 @@
 #     README.md
 #     PRIVACY.md
 #     THIRD_PARTY_NOTICES.md
-#     server/calliope-server          (single-file Python script, stdlib + optional deps)
-#     server/voice_catalog.json       (optional TTS voice suggestion catalog)
-#     systemd/*.service
+#     server/calliope-server          (executable wrapper / composition root)
+#     server/calliope_server/         (the importable runtime package)
+#     server/voice_catalog.json       (TTS voice suggestion catalog)
+#     scripts/learn-vocab, scripts/kokoro-server.py
+#     systemd/*.service, systemd/*.timer
 #     docs/*.md
+#
+# Installed layout. The wrapper resolves its package "alongside itself"
+# (server/calliope-server bootstrap, search order step 1) after resolving
+# symlinks, and tts.py reads voice_catalog.json one level above the package:
+#   /usr/lib/calliope/calliope-server
+#   /usr/lib/calliope/calliope_server/
+#   /usr/lib/calliope/voice_catalog.json
+#   /usr/lib/calliope/learn-vocab
+#   /usr/lib/calliope/units/           (what `dictation-server --setup` copies)
+#   /usr/lib/systemd/user/             (same units, usable without --setup)
+#   /usr/share/calliope/kokoro-server.py
+# The whisper unit expects /usr/bin/whisper-server (whisper.cpp package); the
+# Kokoro unit still runs the user-created venv from docs/tts-install.md.
 #
 # Backward-compat: pkgname renamed to calliope-git. The old `dictation-server`
 # namespace is kept via provides/conflicts so existing AUR users on the old
@@ -61,39 +76,45 @@ pkgver() {
 package() {
   cd "$srcdir/$_pkgname"
 
-  # Server script + adjacent runtime catalog. Keep the Python source as the
-  # canonical single-file artifact; the /usr/bin entries are tiny wrappers so
-  # Path(__file__).with_name("voice_catalog.json") resolves under /usr/lib/calliope.
-  install -Dm755 "server/calliope-server" "$pkgdir/usr/lib/calliope/calliope-server"
-  install -Dm644 "server/voice_catalog.json" "$pkgdir/usr/lib/calliope/voice_catalog.json"
-  install -Dm755 "scripts/learn-vocab" "$pkgdir/usr/lib/calliope/learn-vocab"
+  local lib="$pkgdir/usr/lib/calliope"
+  install -Dm755 "server/calliope-server" "$lib/calliope-server"
+  install -dm755 "$lib/calliope_server"
+  local mod
+  for mod in server/calliope_server/*.py; do
+    install -Dm644 "$mod" "$lib/calliope_server/$(basename "$mod")"
+  done
+  install -Dm644 "server/voice_catalog.json" "$lib/voice_catalog.json"
+  install -Dm755 "scripts/learn-vocab" "$lib/learn-vocab"
   install -Dm644 "scripts/kokoro-server.py" "$pkgdir/usr/share/calliope/kokoro-server.py"
-  install -Dm755 /dev/stdin "$pkgdir/usr/bin/calliope-server" <<'EOF'
-#!/bin/sh
-exec /usr/lib/calliope/calliope-server "$@"
-EOF
-  ln -s calliope-server "$pkgdir/usr/bin/dictation-server"
+  install -dm755 "$pkgdir/usr/bin"
+  ln -s ../lib/calliope/calliope-server "$pkgdir/usr/bin/calliope-server"
+  ln -s ../lib/calliope/calliope-server "$pkgdir/usr/bin/dictation-server"
 
   # systemd user units. Names retained (dictation-server / whisper-server) for
-  # backward compat with existing user installs and roadmap docs. The packaged
-  # dictation unit points at the packaged wrapper; repo-local/live units remain
-  # untouched and continue to use their operator-managed ExecStart paths.
-  install -Dm644 "systemd/dictation-server.service" \
-    "$pkgdir/usr/lib/systemd/user/dictation-server.service"
+  # backward compat with existing user installs. Rewrite the user-local paths
+  # the repo units use to the packaged locations, then install the same files
+  # as the --setup source (units/) and in the systemd user search path.
+  local units="$srcdir/units"
+  rm -rf "$units"
+  install -dm755 "$units"
+  cp systemd/*.service systemd/*.timer "$units/"
   sed -i 's#^ExecStart=.*#ExecStart=/usr/bin/calliope-server#' \
-    "$pkgdir/usr/lib/systemd/user/dictation-server.service"
-  install -Dm644 "systemd/whisper-server.service" \
-    "$pkgdir/usr/lib/systemd/user/whisper-server.service"
-  install -Dm644 "systemd/kokoro-server.service" \
-    "$pkgdir/usr/lib/systemd/user/kokoro-server.service"
-  install -Dm644 "systemd/learn-vocab-nightly.service" \
-    "$pkgdir/usr/lib/systemd/user/learn-vocab-nightly.service"
+    "$units/dictation-server.service"
+  sed -i 's#%h/\.local/bin/whisper-server#/usr/bin/whisper-server#' \
+    "$units/whisper-server.service"
+  sed -i 's# %h/\.local/share/calliope-tts/kokoro-server\.py# /usr/share/calliope/kokoro-server.py#' \
+    "$units/kokoro-server.service"
   sed -i \
     -e 's#^Documentation=.*#Documentation=https://github.com/ar221/calliope#' \
     -e 's#^WorkingDirectory=.*#WorkingDirectory=%h#' \
     -e 's#^ExecStart=.*#ExecStart=/usr/lib/calliope/learn-vocab --min-freq 10 --cap 8 --apply --merge-characters --quiet#' \
     -e 's#%h/Github/calliope#/usr/lib/calliope#g' \
-    "$pkgdir/usr/lib/systemd/user/learn-vocab-nightly.service"
+    "$units/learn-vocab-nightly.service"
+  local unit
+  for unit in "$units"/*; do
+    install -Dm644 "$unit" "$lib/units/$(basename "$unit")"
+    install -Dm644 "$unit" "$pkgdir/usr/lib/systemd/user/$(basename "$unit")"
+  done
 
   # Licensing.
   install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"

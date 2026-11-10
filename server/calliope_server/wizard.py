@@ -11,12 +11,12 @@ import hashlib
 import json
 import logging
 import os
-import secrets
 import shutil
 import ssl
 import subprocess
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -201,9 +201,11 @@ def _wizard_stage_1(args) -> dict:
     for mid, vmin, size, label, _sha in WIZARD_MODELS:
         marker = " ← recommended" if mid == rec_model else ""
         print(f"    {mid:20s}  {size} MB  ({label}){marker}")
-    chosen_model = _wizard_prompt(
-        "  Which model to use?", default=rec_model,
-    )
+    known = [m[0] for m in WIZARD_MODELS]
+    chosen_model = _wizard_prompt("  Which model to use?", default=rec_model)
+    while chosen_model not in known:
+        _wizard_warn(f"unknown model {chosen_model!r}; pick one of: {', '.join(known)}")
+        chosen_model = _wizard_prompt("  Which model to use?", default=rec_model)
 
     devices = []
     if shutil.which("ffmpeg"):
@@ -456,12 +458,151 @@ def _wizard_wait_health(url: str, timeout_s: int) -> bool:
     return False
 
 
-def _wizard_stage_4(args) -> None:
+WIZARD_MODEL_DROPIN = "calliope-model.conf"
+# Units that read DICTATION_WHISPER_MODEL: whisper-server loads that model file,
+# dictation-server uses it as config.DEFAULT_MODEL (CLI fallback + mode default).
+WIZARD_MODEL_UNITS = ("whisper-server.service", "dictation-server.service")
+
+
+def _wizard_service_active(unit: str) -> bool:
+    """True when the user unit is currently active. Never starts/stops anything."""
+    if not shutil.which("systemctl"):
+        return False
+    try:
+        res = subprocess.run(["systemctl", "--user", "is-active", "--quiet", unit],
+                             check=False, capture_output=True, text=True)
+    except Exception:
+        return False
+    return res.returncode == 0
+
+
+def _wizard_model_dropin(unit: str) -> Path:
+    return WIZARD_UNIT_DIR / f"{unit}.d" / WIZARD_MODEL_DROPIN
+
+
+def _wizard_write_model_dropins(model: str) -> None:
+    """Pin DICTATION_WHISPER_MODEL for both units (rewrite only on change)."""
+    content = (
+        "# Written by `dictation-server --setup` (stage 1 model choice).\n"
+        "[Service]\n"
+        f"Environment=DICTATION_WHISPER_MODEL={model}\n"
+    )
+    for unit in WIZARD_MODEL_UNITS:
+        dst = _wizard_model_dropin(unit)
+        if dst.is_file() and dst.read_text(encoding="utf-8") == content:
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(content, encoding="utf-8")
+        _wizard_ok(f"wrote {dst} (model {model})")
+
+
+def _wizard_effective_model() -> str:
+    """Model the installed services will load: wizard drop-in, else the default."""
+    prefix = "Environment=DICTATION_WHISPER_MODEL="
+    try:
+        lines = _wizard_model_dropin("whisper-server.service").read_text(
+            encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        if line.startswith(prefix) and line[len(prefix):].strip():
+            return line[len(prefix):].strip()
+    return config.DEFAULT_MODEL
+
+
+def _wizard_unit_started_at(unit: str) -> float | None:
+    """Wall-clock time an active user unit entered `active`; None if inactive/unknown."""
+    if not shutil.which("systemctl"):
+        return None
+    try:
+        res = subprocess.run(
+            ["systemctl", "--user", "show", unit,
+             "-p", "ActiveState", "-p", "ActiveEnterTimestampMonotonic"],
+            check=False, capture_output=True, text=True)
+    except Exception:
+        return None
+    props = dict(line.split("=", 1) for line in (res.stdout or "").splitlines() if "=" in line)
+    if props.get("ActiveState") != "active":
+        return None
+    try:
+        mono_us = int(props.get("ActiveEnterTimestampMonotonic", "0"))
+    except ValueError:
+        return None
+    if mono_us <= 0:
+        return None
+    return time.time() - (time.clock_gettime(time.CLOCK_MONOTONIC) - mono_us / 1e6)
+
+
+def _wizard_pending_restarts() -> tuple[list[str], list[str]]:
+    """Units whose running process predates their unit/drop-ins or credentials.
+
+    Derived from live state (start time vs file mtimes), so a re-run before
+    the operator restarts still reports the restart as pending.
+    """
+    watched: dict[str, list[tuple[Path, str]]] = {}
+    for unit in ("dictation-server", "whisper-server"):
+        unit_file = WIZARD_UNIT_DIR / f"{unit}.service"
+        paths = [(unit_file, "unit file")]
+        paths += [(p, f"drop-in {p.name}")
+                  for p in sorted((WIZARD_UNIT_DIR / f"{unit}.service.d").glob("*.conf"))]
+        watched[unit] = paths
+    watched["dictation-server"].append((config.TOKEN_FILE, "bearer token / TLS cert"))
+
+    units: list[str] = []
+    reasons: list[str] = []
+    for unit, paths in watched.items():
+        started = _wizard_unit_started_at(unit)
+        if started is None:
+            continue
+        changed = []
+        for path, label in paths:
+            try:
+                if path.stat().st_mtime > started:
+                    changed.append(label)
+            except OSError:
+                continue
+        if changed:
+            units.append(unit)
+            reasons.append(f"{unit}: {', '.join(changed)} changed since it started")
+    return units, reasons
+
+
+def _wizard_mode_model_pins(model: str) -> list[tuple[str, str]]:
+    """Saved modes whose explicit `whisper_model` differs from `model`."""
+    if not config.MODES_FILE.is_file():
+        return []
+    from . import formatter  # local: the wizard otherwise has no formatter dependency
+    try:
+        parsed = formatter._parse_config(config.MODES_FILE.read_bytes())
+    except Exception:
+        return []
+    pins = []
+    for mode in parsed if isinstance(parsed, list) else []:
+        if not isinstance(mode, dict):
+            continue
+        mode_id = str(mode.get("id", "?"))
+        pinned = str(mode.get("whisper_model") or "").strip()
+        # Same rule as formatter._normalize_mode: "" and the legacy seeded
+        # value on a built-in mode inherit DICTATION_WHISPER_MODEL.
+        if not pinned or (mode_id in formatter._BUILTIN_MODE_IDS
+                          and pinned == formatter._LEGACY_SEEDED_WHISPER_MODEL):
+            continue
+        if pinned != model:
+            pins.append((mode_id, pinned))
+    return pins
+
+
+def _wizard_stage_4(args, state: dict) -> None:
+    """Install units + model drop-ins, enable dictation-server. Never restarts."""
     _wizard_say(4, "systemd unit")
+    model = state.get("model_id", "")
     if not args.install_systemd:
         _wizard_warn("--no-install-systemd — printing intent only")
         for name in WIZARD_UNITS:
             print(f"  WOULD WRITE: {WIZARD_UNIT_DIR / name}")
+        for name in WIZARD_MODEL_UNITS:
+            print(f"  WOULD WRITE: {_wizard_model_dropin(name)}  "
+                  f"(DICTATION_WHISPER_MODEL={model})")
         print("  WOULD RUN:   systemctl --user daemon-reload && enable --now "
               "dictation-server")
         print("  ASSUMING:    server is already reachable on https://127.0.0.1:8384/health")
@@ -483,6 +624,15 @@ def _wizard_stage_4(args) -> None:
     for src in sources.values():
         _wizard_install_unit(src)
 
+    if model in {m[0] for m in WIZARD_MODELS} and (
+            config.MODEL_DIR / f"ggml-{model}.bin").is_file():
+        _wizard_write_model_dropins(model)
+        state["model_applied"] = True
+    else:
+        _wizard_warn(f"model {model!r} is not downloaded — services keep "
+                     f"{_wizard_effective_model()}")
+
+    was_active = _wizard_service_active("dictation-server")
     try:
         subprocess.run(["systemctl", "--user", "daemon-reload"],
                        check=True, capture_output=True, text=True)
@@ -494,10 +644,13 @@ def _wizard_stage_4(args) -> None:
         subprocess.run(["systemctl", "--user", "enable", "--now",
                         "dictation-server"],
                        check=True, capture_output=True, text=True)
-        _wizard_ok("dictation-server enabled + started")
     except subprocess.CalledProcessError as e:
         _wizard_warn(f"enable --now failed: {e.stderr.strip()}")
         raise SystemExit(2)
+    if was_active:
+        _wizard_ok("dictation-server enabled (already running — not restarted)")
+    else:
+        _wizard_ok("dictation-server enabled + started")
 
     health_url = f"https://127.0.0.1:{config.DEFAULT_PORT}/health"
     print(f"  waiting for {health_url} (timeout {WIZARD_HEALTH_TIMEOUT_S}s)...")
@@ -509,46 +662,51 @@ def _wizard_stage_4(args) -> None:
         raise SystemExit(2)
 
 
-# ----- Stage 5: self-test --------------------------------------------
-def _wizard_multipart_post(url: str, audio_path: Path, token: str,
-                           extra_fields: dict | None = None) -> tuple[int, dict]:
-    """Stdlib multipart/form-data POST. Returns (status, parsed_json_or_empty)."""
-    boundary = "----calliope-setup-" + secrets.token_hex(8)
-    audio_bytes = audio_path.read_bytes()
-    parts = []
-    for k, v in (extra_fields or {}).items():
-        parts.append(
-            f"--{boundary}\r\n"
-            f"Content-Disposition: form-data; name=\"{k}\"\r\n\r\n"
-            f"{v}\r\n".encode()
-        )
-    parts.append(
-        (f"--{boundary}\r\n"
-         f"Content-Disposition: form-data; name=\"audio\"; "
-         f"filename=\"{audio_path.name}\"\r\n"
-         f"Content-Type: audio/wav\r\n\r\n").encode()
-    )
-    parts.append(audio_bytes)
-    parts.append(f"\r\n--{boundary}--\r\n".encode())
-    body = b"".join(parts)
+def _wizard_restart_pending(state: dict) -> bool:
+    return bool(state.get("restart_units"))
 
+
+def _wizard_print_restart(state: dict) -> None:
+    units = state.get("restart_units") or []
+    _wizard_warn(f"restart pending — the running {' and '.join(units)} "
+                 "still use the previous settings:")
+    for reason in state.get("restart_reasons") or []:
+        print(f"    - {reason}")
+    print("  The wizard never restarts a running service. When convenient run:")
+    print(f"    systemctl --user restart {' '.join(units)}")
+    print("  then self-test and pair with:")
+    print("    dictation-server --setup --skip-stage-1 --skip-stage-2 "
+          "--skip-stage-3 --skip-stage-4")
+
+
+# ----- Stage 5: self-test --------------------------------------------
+def _wizard_post_wav(url: str, audio_path: Path, token: str) -> tuple[int, dict]:
+    """POST the recorded WAV as the raw request body, exactly like the clients.
+
+    Returns (status, parsed_json_or_raw); HTTP error statuses are returned,
+    not raised.
+    """
     req = urllib.request.Request(
-        url, data=body, method="POST",
+        url, data=audio_path.read_bytes(), method="POST",
         headers={
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Type": "audio/wav",
             "Authorization": f"Bearer {token}",
         },
     )
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
-        status = resp.status
-        raw = resp.read().decode("utf-8", errors="replace")
-        try:
-            return status, json.loads(raw)
-        except Exception:
-            return status, {"raw": raw}
+    try:
+        with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+            status = resp.status
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        status = e.code
+        raw = e.read().decode("utf-8", errors="replace")
+    try:
+        return status, json.loads(raw)
+    except Exception:
+        return status, {"raw": raw}
 
 
 def _wizard_stage_5(args, deps: WizardDeps) -> None:
@@ -564,12 +722,16 @@ def _wizard_stage_5(args, deps: WizardDeps) -> None:
         _wizard_skip(5, "user declined")
         return
 
-    wav = Path(tempfile.gettempdir()) / "calliope-selftest.wav"
+    # Private (0700) per-run directory: the recording is voice data and must
+    # not outlive this stage on any path.
+    tmp_dir = Path(tempfile.mkdtemp(prefix="calliope-selftest-"))
     try:
-        wav.unlink(missing_ok=True)
-    except Exception:
-        pass
+        _wizard_self_test(tmp_dir / "selftest.wav", deps)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
+
+def _wizard_self_test(wav: Path, deps: WizardDeps) -> None:
     print("  recording...")
     t_cap_0 = time.monotonic()
     try:
@@ -590,11 +752,12 @@ def _wizard_stage_5(args, deps: WizardDeps) -> None:
         return
 
     token = deps.get_token()
-    url = f"https://127.0.0.1:{config.DEFAULT_PORT}/transcribe"
+    # Plain mode: Whisper only, no formatter provider sees the test phrase.
+    url = f"https://127.0.0.1:{config.DEFAULT_PORT}/transcribe?mode=plain"
     print("  transcribing...")
     t_xc_0 = time.monotonic()
     try:
-        status, body = _wizard_multipart_post(url, wav, token)
+        status, body = _wizard_post_wav(url, wav, token)
     except Exception as e:
         _wizard_warn(f"POST /transcribe failed: {e}")
         print("  diagnostics:")
@@ -604,10 +767,10 @@ def _wizard_stage_5(args, deps: WizardDeps) -> None:
         raise SystemExit(2)
     t_xc = time.monotonic() - t_xc_0
     if status != 200:
-        _wizard_warn(f"server returned {status}: {body}")
+        _wizard_warn(f"server returned {status}: {body.get('error') or body.get('raw', '')}")
         raise SystemExit(2)
 
-    text = (body.get("text") or body.get("raw") or "").strip().lower()
+    text = (body.get("text") or "").strip().lower()
     if not text:
         _wizard_warn("server returned empty transcription")
         raise SystemExit(2)
@@ -626,11 +789,6 @@ def _wizard_stage_5(args, deps: WizardDeps) -> None:
         # Don't bail — caller may want to push through. Stage 6 still useful.
     else:
         _wizard_ok("self-test passed")
-
-    try:
-        wav.unlink(missing_ok=True)
-    except Exception:
-        pass
 
 
 # ----- Stage 6: phone pairing ---------------------------------------
@@ -706,12 +864,26 @@ def _wizard_stage_6(args, fingerprint: str, deps: WizardDeps) -> None:
 def _wizard_stage_7(state: dict, fingerprint: str) -> None:
     _wizard_say(7, "summary")
     lan_ip = _wizard_lan_ip()
-    print("  ✓ You're set.")
+    effective = _wizard_effective_model()
+    if _wizard_restart_pending(state):
+        print("  ! Not finished — restart pending (see stage 4). Self-test and")
+        print("    pairing were skipped because the running server still holds")
+        print("    the previous settings.")
+    else:
+        print("  ✓ You're set.")
     print("    Hotkey:       Mod+Shift+M (configure in your WM)")
     print(f"    Phone URL:    https://{lan_ip}:{config.DEFAULT_PORT}")
     print(f"    Bearer token: {config.TOKEN_FILE}")
     print(f"    Cert FP:      {fingerprint or '(none)'}")
-    print(f"    Model:        {state.get('model_id', '?')}")
+    pending_units = state.get("restart_units") or []
+    after = " (after the pending restart)" if "whisper-server" in pending_units else ""
+    print(f"    Model:        {effective}{after}")
+    chosen = state.get("model_id", "")
+    if chosen and chosen != effective:
+        print(f"    (chosen {chosen} was not applied — download it and re-run setup)")
+    for mode_id, pinned in _wizard_mode_model_pins(effective):
+        print(f"    ! mode {mode_id!r} pins whisper_model={pinned} in {config.MODES_FILE.name};")
+        print("      its requests ask for that model (the whisper-cli fallback loads it).")
     print()
     print("  Next steps:")
     print("    docs/cert-trust.md       — trusting the self-signed cert on phone")
@@ -721,12 +893,17 @@ def _wizard_stage_7(state: dict, fingerprint: str) -> None:
 
 # ----- Driver --------------------------------------------------------
 def run_setup_wizard(args, deps: WizardDeps) -> int:
-    """Top-level wizard driver. Returns process exit code."""
+    """Top-level wizard driver. Returns process exit code (1 = restart pending)."""
     print("=" * 64)
     print("  Calliope dictation-server — first-run setup")
     print("=" * 64)
 
-    state: dict = {"model_id": "large-v3-turbo"}
+    state: dict = {
+        "model_id": _wizard_effective_model(),
+        "model_applied": False,
+        "restart_units": [],
+        "restart_reasons": [],
+    }
     fingerprint = ""
 
     if not args.skip_stage_1:
@@ -746,20 +923,29 @@ def run_setup_wizard(args, deps: WizardDeps) -> int:
         fingerprint = deps.cert_fingerprint_sha256() or ""
 
     if not args.skip_stage_4:
-        _wizard_stage_4(args)
+        _wizard_stage_4(args, state)
     else:
         _wizard_skip(4, "--skip-stage-4")
 
-    if not args.skip_stage_5:
+    state["restart_units"], state["restart_reasons"] = _wizard_pending_restarts()
+    pending = _wizard_restart_pending(state)
+    if pending:
+        _wizard_print_restart(state)
+
+    if pending:
+        _wizard_skip(5, "restart pending")
+    elif not args.skip_stage_5:
         _wizard_stage_5(args, deps)
     else:
         _wizard_skip(5, "--skip-stage-5")
 
-    if not args.skip_stage_6:
+    if pending:
+        _wizard_skip(6, "restart pending — the running server would reject the new token")
+    elif not args.skip_stage_6:
         _wizard_stage_6(args, fingerprint, deps)
     else:
         _wizard_skip(6, "--skip-stage-6")
 
     if not args.skip_stage_7:
         _wizard_stage_7(state, fingerprint)
-    return 0
+    return 1 if pending else 0
