@@ -98,14 +98,25 @@ def test_missing_speed_defaults_to_one(server):
     assert server.fake.calls[0]["speed"] == 1.0
 
 
-@pytest.mark.parametrize("voice,lang", [
-    ("af_heart", "en-us"),
-    ("bf_emma", "en-gb"),
-    ("ff_siwis", "fr-fr"),
-    ("zf_xiaobei", "cmn"),
+@pytest.mark.parametrize("voice,text,lang", [
+    ("af_heart", "The keeper climbed the stairs.", "en-us"),
+    # Same language, regional accent: the voice's variant wins.
+    ("bf_emma", "The keeper climbed the stairs.", "en-gb"),
+    # English text read by a non-English voice stays on the content language.
+    ("ff_siwis", "The keeper climbed the stairs and she was not afraid.", "en-us"),
+    ("jf_alpha", "The keeper climbed the stairs.", "en-us"),
+    ("zf_xiaobei", "The keeper climbed the stairs.", "en-us"),
+    ("ef_dora", "hello", "en-us"),
+    # Text in the voice's own language uses it.
+    ("ff_siwis", "Le gardien est dans la tour avec nous.", "fr-fr"),
+    ("ef_dora", "El guardián está en la torre con los otros.", "es"),
+    ("jf_alpha", "こんにちは、灯台守です。", "ja"),
+    ("zf_xiaobei", "你好，我是灯塔看守人。", "cmn"),
 ])
-def test_voice_prefix_selects_language(server, voice, lang):
-    status, _ = server.post({"text": "hello", "voice": voice})
+def test_g2p_language_follows_the_text_not_just_the_voice(server, voice, text, lang):
+    server.module._voice_ids = [voice]
+    server.fake.tokenizer.unsupported = set()
+    status, _ = server.post({"text": text, "voice": voice})
     assert status == 200
     assert {c["lang"] for c in server.fake.calls} == {lang}
 
@@ -113,11 +124,27 @@ def test_voice_prefix_selects_language(server, voice, lang):
 def test_unavailable_language_falls_back_to_en_us(server, caplog):
     caplog.set_level("WARNING", logger="kokoro-server")
     for _ in range(2):
-        status, _ = server.post({"text": "hello", "voice": "jf_alpha"})
+        status, _ = server.post({"text": "こんにちは", "voice": "jf_alpha"})
         assert status == 200
     assert {c["lang"] for c in server.fake.calls} == {"en-us"}
     warnings = [r for r in caplog.records if "unavailable for G2P" in r.getMessage()]
     assert len(warnings) == 1
+
+
+def test_phoneme_overflow_splits_the_chunk_instead_of_failing(server):
+    """Kokoro raises IndexError when a chunk's phoneme count exceeds its limit."""
+    original = server.fake.create
+
+    def create(text, voice, speed, lang):
+        if len(text) > 12:
+            raise IndexError("index 510 is out of bounds")
+        return original(text, voice, speed, lang)
+
+    server.fake.create = create
+    text = "one two three four five six seven eight"
+    status, _ = server.post({"text": text, "voice": "af_heart"})
+    assert status == 200
+    assert " ".join(c["text"] for c in server.fake.calls) == text
 
 
 def test_lang_mapping_table(monkeypatch):

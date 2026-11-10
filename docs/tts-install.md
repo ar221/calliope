@@ -144,7 +144,7 @@ or in Calliope's environment for the proxy side:
 | `KOKORO_PORT` | `9002` | unit | Loopback bind port. |
 | `KOKORO_MODEL` | `…/models/onnx/model_fp16.onnx` | unit | ONNX model path. |
 | `KOKORO_VOICES` | `…/models/voices-v1.0.bin` | unit | Voices file path. |
-| `KOKORO_LANG` | `en-us` | unit | Language for voices whose ID prefix isn't mapped. Mapped prefixes pick their own: `a` en-us, `b` en-gb, `e` es, `f` fr-fr, `h` hi, `i` it, `j` ja, `p` pt-br, `z` cmn. A language the phonemizer can't load falls back to en-us (logged once). |
+| `KOKORO_LANG` | `en-us` | unit | Content language: the pronunciation (G2P) language for all text unless the text itself is in the voice's native language. A voice's ID prefix names its native language (`a` en-us, `b` en-gb, `e` es, `f` fr-fr, `h` hi, `i` it, `j` ja, `p` pt-br, `z` cmn); it is used only when the chunk is written in it (kana/kanji for `j`, Han for `z`, Devanagari for `h`, a function-word majority for `e`/`f`/`i`/`p`) or is a regional variant of `KOKORO_LANG` (`b` with en-us). So English text read by `jf_alpha` or `ff_siwis` is pronounced as English in that voice. A language the phonemizer can't load falls back to en-us (logged once). espeak-ng reads kana but not kanji; real Japanese needs a Japanese G2P that this install does not ship. |
 | `KOKORO_SERVER_URL` | `http://127.0.0.1:9002` | calliope | Proxy upstream URL. |
 | `KOKORO_DEFAULT_VOICE` | `af_heart` | calliope | Voice when request omits `voice`. |
 | `KOKORO_IDLE_SHUTDOWN_SECONDS` | `600` | calliope | Idle threshold before stopping the unit. Never fires while a synthesis (including each audiobook segment) is in flight. |

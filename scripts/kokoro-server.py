@@ -53,7 +53,11 @@ PORT = int(os.environ.get("KOKORO_PORT", "9002"))
 DEFAULT_LANG = os.environ.get("KOKORO_LANG", "en-us")
 
 # Kokoro voice IDs are `<lang><gender>_<name>` (e.g. `bf_emma`); the first
-# letter picks the espeak-ng language used for G2P.
+# letter names the voice's native language. It is used for G2P only when the
+# text is actually in that language (see _lang_for_chunk): espeak-ng's `ja`
+# spells Latin words letter by letter and other languages inject switch
+# markers, so English text read by a non-English voice must stay on
+# KOKORO_LANG.
 _VOICE_PREFIX_LANG = {
     "a": "en-us",
     "b": "en-gb",
@@ -72,9 +76,61 @@ _lang_support: dict[str, bool] = {}
 
 
 def _lang_for_voice(voice: str) -> str:
-    """espeak-ng language for a Kokoro voice ID, by its one-letter prefix."""
+    """Native espeak-ng language of a Kokoro voice ID, by its one-letter prefix."""
     prefix = voice[:1].lower() if len(voice) > 2 and voice[2:3] == "_" else ""
     return _VOICE_PREFIX_LANG.get(prefix, DEFAULT_LANG)
+
+
+# Unambiguous function words; words that are also common English words
+# ("no", "come", "son", "pour", "do", single letters) are left out on purpose.
+_FUNCTION_WORDS = {
+    "en": frozenset("the and of to is was with that this for you her his she he they it are "
+                    "were not but from have had at on in be what".split()),
+    "es": frozenset("el la los las de que en un una es por con para se su lo como más pero "
+                    "sus le ya este sí porque esta cuando muy".split()),
+    "fr": frozenset("le la les de des du et est un une que qui dans pas sur ne se ce il elle "
+                    "je vous nous au avec mais où ou".split()),
+    "it": frozenset("il lo la gli le di che un una non con si da sono del della nel più anche "
+                    "questo io tu lui lei".split()),
+    "pt": frozenset("os de que em um uma para com não se por mais como mas foi ao ele ela dos "
+                    "das seu sua você".split()),
+}
+_WORD_RE = __import__("re").compile(r"[^\W\d_]+")
+
+
+def _lang_for_chunk(voice: str, chunk: str) -> str:
+    """G2P language for `chunk` spoken by `voice`.
+
+    The voice's native language applies only when the text is in it: by script
+    for ja/cmn/hi, by function-word majority for Latin-script languages.
+    Everything else uses DEFAULT_LANG, the operator's content language.
+    """
+    voice_lang = _lang_for_voice(voice)
+    if voice_lang == DEFAULT_LANG:
+        return DEFAULT_LANG
+    voice_base, default_base = voice_lang.split("-")[0], DEFAULT_LANG.split("-")[0]
+    if voice_base == default_base:
+        return voice_lang  # same language, regional accent (en-gb vs en-us)
+
+    kana = han = deva = latin = 0
+    for ch in chunk:
+        cp = ord(ch)
+        if 0x3040 <= cp <= 0x30FF:
+            kana += 1
+        elif 0x3400 <= cp <= 0x4DBF or 0x4E00 <= cp <= 0x9FFF:
+            han += 1
+        elif 0x0900 <= cp <= 0x097F:
+            deva += 1
+        elif cp < 0x250 and ch.isalpha():
+            latin += 1
+    native = {"ja": kana + han, "cmn": han, "hi": deva}.get(voice_base)
+    if native is not None:
+        return voice_lang if native > latin else DEFAULT_LANG
+
+    words = _WORD_RE.findall(chunk.lower())
+    voice_hits = sum(w in _FUNCTION_WORDS.get(voice_base, ()) for w in words)
+    default_hits = sum(w in _FUNCTION_WORDS.get(default_base, ()) for w in words)
+    return voice_lang if voice_hits > default_hits else DEFAULT_LANG
 
 
 def _parse_speed(raw) -> float:
@@ -249,12 +305,12 @@ def _split_for_synth(text: str, max_chars: int = 100) -> list[str]:
     return chunks
 
 
-def _effective_lang(k, voice: str) -> str:
-    """Language to synthesize `voice` with. Each mapped language is checked
+def _effective_lang(k, voice: str, chunk: str) -> str:
+    """Language to synthesize `chunk` with. Each mapped language is checked
     once against the phonemizer; one it can't handle (missing espeak-ng data
     or G2P extras) falls back to FALLBACK_LANG, logged once. Caller holds
     _kokoro_lock."""
-    lang = _lang_for_voice(voice)
+    lang = _lang_for_chunk(voice, chunk)
     if lang == FALLBACK_LANG:
         return lang
     supported = _lang_support.get(lang)
@@ -273,8 +329,28 @@ def _effective_lang(k, voice: str) -> str:
 
 
 def _synth_one(k, chunk: str, voice: str, speed: float):
-    """One model call -> mono float32 array (may be size 0). Caller holds _kokoro_lock."""
-    audio, sr = k.create(chunk, voice=voice, speed=speed, lang=_effective_lang(k, voice))
+    """Mono float32 array for `chunk` (may be size 0). Caller holds _kokoro_lock.
+
+    Kokoro indexes the voice style by phoneme count and raises IndexError past
+    its limit; verbose G2P output can exceed it for a chunk that is short in
+    characters, so halve and retry instead of failing the request.
+    """
+    try:
+        audio, sr = k.create(chunk, voice=voice, speed=speed,
+                             lang=_effective_lang(k, voice, chunk))
+    except IndexError:
+        if len(chunk) < 2:
+            raise
+        cut = chunk.rfind(" ", 1, len(chunk) // 2 + 1)
+        if cut <= 0:
+            cut = len(chunk) // 2
+        halves = [part for part in (chunk[:cut].strip(), chunk[cut:].strip()) if part]
+        pieces, sr = [], 24000
+        for part in halves:
+            arr, sr = _synth_one(k, part, voice, speed)
+            if arr.size:
+                pieces.append(arr)
+        return (np.concatenate(pieces) if pieces else np.zeros(0, dtype=np.float32)), sr
     arr = np.asarray(audio, dtype=np.float32)
     if arr.ndim > 1:
         arr = np.squeeze(arr)
@@ -304,7 +380,7 @@ def _synth_recover(k, chunk: str, voice: str, speed: float):
             pieces.append(sub_arr)
     if not pieces:
         log.warning("kokoro empty audio, unrecoverable chunk (len=%d voice=%s lang=%s)",
-                    len(chunk), voice, _lang_for_voice(voice))
+                    len(chunk), voice, _lang_for_chunk(voice, chunk))
     return pieces, sr
 
 
