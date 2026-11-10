@@ -78,3 +78,23 @@ def test_install_through_symlink_updates_the_mirror_and_keeps_the_link(tmp_path)
     subprocess.run([str(INSTALL)], env=env, check=True, capture_output=True)
     assert (tmp_path / "bin" / "dictation-server").is_symlink()
     assert (mirror / "dictation-server").read_bytes() == (REPO / "server" / "calliope-server").read_bytes()
+
+
+def test_kokoro_script_is_deployed_and_checked_when_the_tts_runtime_exists(tmp_path):
+    tts = tmp_path / "calliope-tts"
+    tts.mkdir()
+    (tts / "kokoro-server.py").write_text("# stale copy\n")
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "BINDIR": str(tmp_path / "bin"),
+        "DATADIR": str(tmp_path / "data"),
+        "TTSDIR": str(tts),
+    }
+    subprocess.run([str(INSTALL)], env=env, check=True, capture_output=True)
+    assert (tts / "kokoro-server.py").read_bytes() == (REPO / "scripts" / "kokoro-server.py").read_bytes()
+
+    (tts / "kokoro-server.py").write_text("# drifted\n")
+    check = subprocess.run([str(INSTALL), "--check"], env=env, capture_output=True, text=True)
+    assert check.returncode == 1
+    assert "DIFF  calliope-tts/kokoro-server.py" in check.stdout

@@ -251,10 +251,12 @@ Under `~/.local/share/dictation-server/` by default (`$XDG_DATA_HOME/dictation-s
 syncs the package, catalog and units into the data dir, installs the wrapper
 as `$BINDIR/dictation-server` (default `~/.local/bin`; if that is a symlink,
 the link is kept and its target is overwritten), writes `INSTALL_MANIFEST`,
-and restarts nothing. `scripts/install-server --check` compares the checkout
-with the installed copy (`SAME`/`DIFF`/`EXTRA` per file, manifest validity,
-installed vs checkout revision) and exits 1 on any drift. Overrides:
-`BINDIR`, `DATADIR`.
+and restarts nothing. When the TTS runtime dir `~/.local/share/calliope-tts/`
+exists it also installs `scripts/kokoro-server.py` there (effective at the
+next `kokoro-server` start). `scripts/install-server --check` compares the
+checkout with the installed copy (`SAME`/`DIFF`/`EXTRA` per file, manifest
+validity, installed vs checkout revision) and exits 1 on any drift. Overrides:
+`BINDIR`, `DATADIR`, `TTSDIR`.
 
 ## Pairing and state freshness
 

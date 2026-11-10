@@ -72,11 +72,14 @@ The TTS install lives at `~/.local/share/calliope-tts/`:
 
    Optional: `curl -L -o onnx/model.onnx ...` for full-precision.
 
-3. **Install the bundled server script** (copied from this repo):
+3. **Install the bundled server script.** Once `~/.local/share/calliope-tts/`
+   exists, `scripts/install-server` copies `scripts/kokoro-server.py` there on
+   every deploy and `scripts/install-server --check` reports it when it
+   drifts. The running Kokoro process keeps the old script until its next
+   start (it is stopped after 10 idle minutes and started on demand).
 
    ```sh
-   cp scripts/kokoro-server.py ~/.local/share/calliope-tts/kokoro-server.py
-   chmod +x ~/.local/share/calliope-tts/kokoro-server.py
+   scripts/install-server
    ```
 
 4. **Install the systemd unit:**

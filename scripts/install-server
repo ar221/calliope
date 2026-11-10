@@ -7,6 +7,8 @@
 #   systemd/*.service, *.timer    -> $DATADIR/units/                 (synced)
 #   server/calliope-server        -> $BINDIR/dictation-server        (mode 755)
 #   sha256 of everything above    -> $DATADIR/INSTALL_MANIFEST
+#   scripts/kokoro-server.py      -> $TTSDIR/kokoro-server.py        (only when
+#                                    the TTS runtime dir exists; docs/tts-install.md)
 #
 # This is the only deploy path. If $BINDIR/dictation-server is a symlink (a
 # mirror-managed bin dir, e.g. a dotfiles checkout), the link is kept and its
@@ -25,7 +27,7 @@
 #   scripts/install-server --check   report drift between this checkout and
 #                                    the installed copy; exit 1 on any DIFF
 #
-# Overrides (mainly for tests): BINDIR, DATADIR.
+# Overrides (mainly for tests): BINDIR, DATADIR, TTSDIR.
 # Idempotent: safe to re-run; only the calliope_server/ and units/ subtrees
 # are sync-deleted — cert.pem/key.pem/token in $DATADIR are never touched.
 
@@ -35,9 +37,12 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 src_wrapper="$repo_root/server/calliope-server"
 src_pkg="$repo_root/server/calliope_server"
 src_catalog="$repo_root/server/voice_catalog.json"
+src_kokoro="$repo_root/scripts/kokoro-server.py"
 
 BINDIR="${BINDIR:-$HOME/.local/bin}"
 DATADIR="${DATADIR:-${CALLIOPE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/dictation-server}}"
+# kokoro-server.service runs this copy with the venv next to it.
+TTSDIR="${TTSDIR:-$HOME/.local/share/calliope-tts}"
 
 [[ -f "$src_wrapper" && -d "$src_pkg" ]] || {
     echo "error: run from a calliope checkout ($src_wrapper / $src_pkg missing)" >&2
@@ -71,6 +76,9 @@ if [[ "${1:-}" == "--check" ]]; then
     for f in "$repo_root"/systemd/*.service "$repo_root"/systemd/*.timer; do
         report "$f" "$DATADIR/units/$(basename "$f")" "units/$(basename "$f")"
     done
+    if [[ -d "$TTSDIR" ]]; then
+        report "$src_kokoro" "$TTSDIR/kokoro-server.py" "calliope-tts/kokoro-server.py"
+    fi
     # Same rules the wrapper applies at startup: manifest present, covering
     # the executable, with every checksum matching what is on disk.
     if [[ ! -f "$manifest" ]]; then
@@ -111,6 +119,11 @@ echo "staged    $DATADIR/units/ (installed by dictation-server --setup)"
 
 install -m 755 "$src_wrapper" "$dest_wrapper"
 echo "installed $dest_wrapper"
+
+if [[ -d "$TTSDIR" ]]; then
+    install -m 755 "$src_kokoro" "$TTSDIR/kokoro-server.py"
+    echo "installed $TTSDIR/kokoro-server.py (takes effect at the next kokoro-server start)"
+fi
 
 # Written last and atomically: a wrapper that starts mid-install sees the old
 # manifest, fails verification and is restarted by systemd after the sync.
