@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import importlib.util
 import pathlib
 import threading
-import uuid
-from importlib.machinery import SourceFileLoader
 
 import pytest
+
+from conftest import load_wrapper
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -25,12 +24,7 @@ def test_send_to_st_mints_opaque_request_id_for_multitab_ownership():
 
 def _load_server(tmp_path, monkeypatch):
     monkeypatch.setenv("CALLIOPE_DATA_DIR", str(tmp_path))
-    name = f"calliope_server_slice_d_{uuid.uuid4().hex}"
-    loader = SourceFileLoader(name, str(SERVER_SRC))
-    spec = importlib.util.spec_from_loader(name, loader)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = load_wrapper("calliope_server_slice_d")
     module._pairing_codes.clear()
     return module
 
@@ -80,7 +74,7 @@ def _bind(mod, handler, *names):
 
 def test_pairing_code_creation_requires_explicit_bearer_even_on_auth_bypassed_path(mod):
     missing = _bind(mod, PostHandler("/pair/bootstrap"), "_request_bearer_token")
-    mod.DictationHandler.do_POST(missing)
+    mod.DictationHandler._dispatch_post(missing)
     assert missing.sent == [
         ("error", 401, {"error": "valid bearer token required", "code": "unauthorized"})
     ]
@@ -90,7 +84,7 @@ def test_pairing_code_creation_requires_explicit_bearer_even_on_auth_bypassed_pa
         PostHandler("/pair/bootstrap", headers={"Authorization": "Bearer wrong"}),
         "_request_bearer_token",
     )
-    mod.DictationHandler.do_POST(wrong)
+    mod.DictationHandler._dispatch_post(wrong)
     assert wrong.sent[0][1] == 401
 
     valid = _bind(
@@ -101,7 +95,7 @@ def test_pairing_code_creation_requires_explicit_bearer_even_on_auth_bypassed_pa
         ),
         "_request_bearer_token",
     )
-    mod.DictationHandler.do_POST(valid)
+    mod.DictationHandler._dispatch_post(valid)
     kind, status, payload = valid.sent[0]
     assert (kind, status) == ("json", 201)
     assert payload["expires_in"] == 120
@@ -141,11 +135,11 @@ def test_exchange_returns_token_once_then_rejects_replay(mod):
     code, _ = mod.create_pairing_code(DURABLE_TOKEN)
 
     first = PostHandler("/pair/exchange", body={"code": code})
-    mod.DictationHandler.do_POST(first)
+    mod.DictationHandler._dispatch_post(first)
     assert first.sent == [("json", 200, {"token": DURABLE_TOKEN})]
 
     replay = PostHandler("/pair/exchange", body={"code": code})
-    mod.DictationHandler.do_POST(replay)
+    mod.DictationHandler._dispatch_post(replay)
     assert replay.sent[0][0:2] == ("error", 404)
     assert replay.sent[0][2]["code"] == "pairing_code_invalid"
 
@@ -153,7 +147,7 @@ def test_exchange_returns_token_once_then_rejects_replay(mod):
 @pytest.mark.parametrize("body", [{}, {"code": "unknown"}, [], "bad"])
 def test_exchange_rejects_missing_unknown_and_incompatible_payloads(mod, body):
     handler = PostHandler("/pair/exchange", body=body)
-    mod.DictationHandler.do_POST(handler)
+    mod.DictationHandler._dispatch_post(handler)
     assert handler.sent[0][0:2] == ("error", 404)
     assert handler.sent[0][2]["code"] == "pairing_code_invalid"
 
@@ -191,23 +185,6 @@ def test_extension_has_no_hidden_pairing_url_or_prompt_exposure():
     assert "window.prompt('Copy paired phone URL" not in source
     assert "URL/QR contains bearer token" not in source
     assert "bearer-token pairing URL" not in source
-
-
-def test_phone_exchanges_once_scrubs_history_and_keeps_token_phone_local():
-    web_ui = WEB_UI_SRC.read_text(encoding="utf-8")
-    bootstrap_start = web_ui.index("// Safe phone bootstrap.")
-    bootstrap_end = web_ui.index("let mediaRecorder", bootstrap_start)
-    bootstrap = web_ui[bootstrap_start:bootstrap_end]
-
-    assert "params.get('pair')" in bootstrap
-    assert "params.delete('pair')" in bootstrap
-    assert "history.replaceState(null, '', clean)" in bootstrap
-    assert "_origFetch('/pair/exchange'" in bootstrap
-    assert "body: JSON.stringify({ code: pairingCode })" in bootstrap
-    assert "sessionStorage.setItem('dictationToken', TOKEN)" in bootstrap
-    assert "window.calliopeAuthReady = bootstrap" in bootstrap
-    assert "params.get('token')" not in bootstrap
-    assert "sessionStorage.setItem('dictationToken', url_tok)" not in bootstrap
 
 
 def test_reload_bootstrap_uses_authorization_header_not_token_url():

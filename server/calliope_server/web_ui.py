@@ -2,8 +2,8 @@
 
 Pure data: no config reads, no runtime state. Extracted from the executable
 `calliope-server` script (Stage 2 split). The CI gate
-`scripts/check-web-ui-js` extracts the <script> blocks from WEB_UI in THIS
-file and runs `node --check` over them.
+`scripts/check-web-ui-js` loads THIS file and runs `node --check` over every
+<script> block of WEB_UI and PAIRING_BOOTSTRAP_HTML plus all inline handlers.
 """
 
 import json
@@ -13,7 +13,7 @@ WEB_UI = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#0E0B08">
@@ -126,6 +126,7 @@ WEB_UI = r"""<!DOCTYPE html>
     white-space: nowrap;
     flex-shrink: 0;
   }
+  button.chip { font-family: inherit; }
   .chip.active {
     background: var(--primary-dim);
     border-color: var(--primary);
@@ -672,6 +673,10 @@ WEB_UI = r"""<!DOCTYPE html>
     font-size: 12px;
     cursor: pointer;
     padding: 2px 8px;
+    background: none;
+    border: 0;
+    font: inherit;
+    font-size: 12px;
   }
   .log-toggle .log-header-actions {
     margin-left: auto;
@@ -1282,7 +1287,7 @@ WEB_UI = r"""<!DOCTYPE html>
   <h1>Dictate</h1>
   <div class="status">
     <span class="status-dot" id="statusDot"></span>
-    <span id="statusText">Ready</span>
+    <span id="statusText" role="status" aria-live="polite">Connecting…</span>
   </div>
   <!-- MVP-23: privacy indicator. Tap opens the audit modal; flips to
        .alert (red border, ember pulse) if /audit/network reports a
@@ -1366,7 +1371,9 @@ WEB_UI = r"""<!DOCTYPE html>
     <span class="st-follow-text" id="stFollowText">Following ST</span>
   </div>
   <div class="st-follow-actions">
-    <button class="st-follow-btn" id="stResyncBtn" onclick="resyncWithST()" style="display:none">Re-sync</button>
+    <button class="st-follow-btn" id="stForgetModeBtn" type="button" onclick="forgetCharMode()" style="display:none"
+            title="Forget the mode remembered for this character">Forget mode</button>
+    <button class="st-follow-btn" id="stResyncBtn" type="button" onclick="resyncWithST()" style="display:none">Re-sync</button>
   </div>
 </div>
 
@@ -1418,13 +1425,14 @@ WEB_UI = r"""<!DOCTYPE html>
   <select class="chip" id="personaSelect" onchange="onPersonaChange(this.value)">
     <option value="none">No Persona</option>
   </select>
-  <div class="chip" id="rulesChip" onclick="toggleRules()">Rules</div>
-  <div class="chip" id="proseChip" onclick="toggleProse()">Prose</div>
+  <button type="button" class="chip" id="rulesChip" aria-pressed="false" onclick="toggleRules()">Rules</button>
+  <button type="button" class="chip" id="proseChip" aria-pressed="false" onclick="toggleProse()">Prose</button>
 </div>
 
 <!-- Chat Source section -->
 <div class="context-section" id="chatSourceSection">
-  <div class="context-toggle" id="chatSourceToggle" onclick="toggleChatSource()">
+  <div class="context-toggle" id="chatSourceToggle" role="button" tabindex="0" aria-expanded="false"
+       onclick="toggleChatSource()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleChatSource()}">
     <svg viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></svg>
     Chat Context
     <span class="badge" id="chatSourceBadge">Manual</span>
@@ -1458,7 +1466,8 @@ WEB_UI = r"""<!DOCTYPE html>
 <div class="main">
   <div class="duration" id="duration">0:00</div>
 
-  <button class="record-btn" id="recordBtn" onclick="toggleRecord()">
+  <button class="record-btn" id="recordBtn" type="button" aria-label="Start recording"
+          aria-pressed="false" aria-busy="false" aria-describedby="recordLabel">
     <svg id="micIcon" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
       <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z"/>
       <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
@@ -1473,7 +1482,7 @@ WEB_UI = r"""<!DOCTYPE html>
 
   <canvas class="vu-meter" id="vuMeter" width="160" height="32" aria-hidden="true"></canvas>
 
-  <div class="record-label" id="recordLabel">Tap or hold to record</div>
+  <div class="record-label" id="recordLabel" aria-live="polite">Tap or hold to record</div>
   <div class="record-sub" id="recordSub"></div>
 
   <div class="result-area" id="resultArea">
@@ -1586,7 +1595,7 @@ WEB_UI = r"""<!DOCTYPE html>
       <button type="button" class="download-log" id="starFilterBtn"
               onclick="event.stopPropagation(); toggleStarFilter()"
               aria-label="Show starred only" title="Toggle starred-only filter">&#9733;</button>
-      <span class="clear-log" onclick="event.stopPropagation(); clearSession(event)" title="Clear unstarred. Shift+click to clear all.">Clear</span>
+      <button type="button" class="clear-log" onclick="event.stopPropagation(); clearSession(event)" title="Clear unstarred in the current view. Shift+click to clear everything.">Clear</button>
     </span>
   </div>
   <div class="log-body" id="logBody">
@@ -1604,7 +1613,7 @@ WEB_UI = r"""<!DOCTYPE html>
 <script>
 // Safe phone bootstrap. Pairing URLs carry only a short-lived one-time code;
 // the durable bearer is returned once to this same-origin page and kept in
-// sessionStorage for the existing authenticated fetch/EventSource behavior.
+// sessionStorage for the authenticated fetch wrapper below.
 (function () {
   const params = new URLSearchParams(location.search);
   const pairingCode = params.get('pair') || '';
@@ -1616,6 +1625,7 @@ WEB_UI = r"""<!DOCTYPE html>
     unauthorized: false,
     lastStatus: 0,
     lastError: '',
+    reachable: null,     // null = unknown, false = last request failed in transport
   };
   if (pairingCode) {
     try {
@@ -1653,36 +1663,40 @@ WEB_UI = r"""<!DOCTYPE html>
       init.headers = headers;
       return _origFetch(input, init).then((resp) => {
         window.calliopeAuthStatus.lastStatus = resp.status;
+        window.calliopeAuthStatus.reachable = true;
         if (resp.status === 401) {
           window.calliopeAuthStatus.unauthorized = true;
           window.calliopeAuthStatus.lastError = 'unauthorized';
           try { sessionStorage.removeItem('dictationToken'); } catch (e) {}
         }
         return resp;
+      }, (err) => {
+        window.calliopeAuthStatus.reachable = false;
+        window.calliopeAuthStatus.lastError = 'network';
+        throw err;
       });
     });
   };
-  const _OrigES = window.EventSource;
-  window.EventSource = function (url, opts) {
-    try {
-      const u = new URL(url, location.origin);
-      if (TOKEN && !u.searchParams.has('token')) u.searchParams.set('token', TOKEN);
-      url = u.toString();
-    } catch (e) { /* fall through with original url */ }
-    return new _OrigES(url, opts);
-  };
 })();
 
-let mediaRecorder = null;
-let audioChunks = [];
-let recording = false;
+// Capture lifecycle: exactly one take at a time. `activeTake` owns the stream,
+// recorder, chunks and timers of the current capture; late async completions
+// compare themselves against it and dispose their resources when it moved on.
+let captureState = 'idle';     // idle | starting | recording | processing
+let activeTake = null;
+let takeSeq = 0;
+const RECORDER_MIME_TYPES = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/ogg;codecs=opus'];
+const RECORDER_BITS_PER_SECOND = 32000;
+// Server default body limit is 25 MB. Ten minutes stays far below it even when
+// a browser ignores audioBitsPerSecond (128 kbps Opus ≈ 9.6 MB).
+const MAX_RECORDING_MS = 10 * 60 * 1000;
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 let rpMode = 0;                // derived legacy numeric mode (kept for any lingering callers)
 let currentMode = '';          // active mode id (e.g. 'rp_enhance')
 let currentFormatterModel = '';
 let lastUsedMode = '';         // mode id used for last transcription
 let availableModes = [];       // [{id, label, icon, whisper_model, use_persona, use_character, use_chat_context, pipeline}, ...]
-let durationInterval = null;
-let recordStart = 0;
+let lastEntryId = '';          // transcript entry id written for the last take ('' if none)
 let lastRawText = '';          // raw whisper output (before RP formatting)
 let lastWasOoc = false;        // last utterance carried an `OOC:` prefix (server stripped it)
 let sessionLog = [];           // local mirror of server transcript
@@ -1705,9 +1719,12 @@ let recentChats = [];
 let stState = null;            // last /state snapshot from server
 let stStateFresh = false;      // whether ST state is currently fresh
 let stFollow = true;           // auto-adopt ST state; user override sets this false
-let statePollTimer = null;     // poll /state every STATE_POLL_MS when visible
-let statePollVisible = true;
-let statePollLifecycleBound = false;
+let statePollTimer = null;     // poll /state every STATE_POLL_MS while visible
+let stateFetchInFlight = null; // coalesces concurrent /state requests
+let stReachable = true;        // false after a transport failure / 5xx; pairing is kept
+let _lastSeenChatId = '';      // ST chatId the preview last reflected
+let _lastAdoptedMode = '';     // ST mode preference last applied (user chip survives polls)
+let modeSource = 'default';    // who set currentMode: 'user' chip | 'st' adoption | 'default'
 const STATE_POLL_MS = 10_000;
 const FOLLOW_ST_FROM_URL = new URLSearchParams(location.search).get('follow') !== '0';
 
@@ -1728,9 +1745,34 @@ const embedConfig = window.DICTATION_EMBED_CONFIG || {};
 const transcriptionLanguage = String(
   embedConfig.language || new URLSearchParams(location.search).get('language') || 'auto'
 ).trim().toLowerCase() || 'auto';
-const embedParentOrigin = (() => {
-  try { return new URL(document.referrer).origin || ''; }
-  catch { return ''; }
+// Parent frames are trusted only when their origin is same-origin or matches
+// the server's CORS allowlist (scheme + host, any port; ["*"] = any).
+const embedAllowedOrigins = Array.isArray(embedConfig.allowedOrigins)
+  ? embedConfig.allowedOrigins.map(String) : [];
+
+function isTrustedEmbedOrigin(origin) {
+  if (!origin || origin === 'null') return false;
+  if (origin === location.origin) return true;
+  let u;
+  try { u = new URL(origin); } catch { return false; }
+  return embedAllowedOrigins.some(entry => {
+    if (entry === '*') return true;
+    try {
+      const allowed = new URL(entry);
+      return allowed.protocol === u.protocol && allowed.hostname === u.hostname;
+    } catch { return false; }
+  });
+}
+
+// Concrete origin of the validated parent. The referrer only seeds it when it
+// passes the allowlist; postMessage then delivers only if the parent really is
+// that origin. A validated inbound message updates it.
+let embedParentOrigin = (() => {
+  if (!isEmbed || window.parent === window) return '';
+  try {
+    const origin = new URL(document.referrer).origin;
+    return isTrustedEmbedOrigin(origin) ? origin : '';
+  } catch { return ''; }
 })();
 
 function postToEmbedParent(payload) {
@@ -1787,7 +1829,7 @@ const ICONS = {
 };
 
 function iconSvg(name) {
-  const paths = ICONS[name] || ICONS.circle;
+  const paths = Object.prototype.hasOwnProperty.call(ICONS, name) ? ICONS[name] : ICONS.circle;
   return `<svg class="chip-icon" viewBox="0 0 24 24" aria-hidden="true">${paths}</svg>`;
 }
 
@@ -1901,7 +1943,9 @@ async function loadModes() {
     if (availableModes.some(m => m.id === id)) { initial = id; break; }
   }
   if (!initial) initial = availableModes[0].id;
-  setMode(initial, { persist: false });
+  setMode(initial, { persist: false, source: 'default' });
+  // /state may have landed before the modes existed: re-apply it now.
+  if (stFollow && stStateFresh && stState) applyStateIfFresh(stState);
 
   // Signal readiness to parent window (if embedded).
   postToEmbedParent({ type: 'dictation-ready' });
@@ -1917,7 +1961,7 @@ function renderModeChips() {
     chip.setAttribute('role', 'button');
     chip.setAttribute('tabindex', '0');
     chip.setAttribute('aria-label', m.label || m.id);
-    chip.innerHTML = iconSvg(m.icon || 'mic') + escHtml(m.label || m.id);
+    chip.innerHTML = iconSvg(m.icon || 'mic') + escapeHtml(m.label || m.id);
     chip.addEventListener('click', () => setMode(m.id));
     chip.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setMode(m.id); }
@@ -1942,6 +1986,7 @@ function setMode(id, opts) {
     id = mode.id;
   }
   currentMode = id;
+  modeSource = opts.source || 'user';
   rpMode = MODE_TO_RP[id] ?? 0;
 
   // Persist (skip during initial load).
@@ -1987,12 +2032,16 @@ function flashRawBadge() {
 
 function toggleRules() {
   useRules = !useRules;
-  document.getElementById('rulesChip').classList.toggle('active', useRules);
+  const chip = document.getElementById('rulesChip');
+  chip.classList.toggle('active', useRules);
+  chip.setAttribute('aria-pressed', useRules ? 'true' : 'false');
 }
 
 function toggleProse() {
   proseFormat = !proseFormat;
-  document.getElementById('proseChip').classList.toggle('active', proseFormat);
+  const chip = document.getElementById('proseChip');
+  chip.classList.toggle('active', proseFormat);
+  chip.setAttribute('aria-pressed', proseFormat ? 'true' : 'false');
 }
 
 async function loadPersonas() {
@@ -2046,40 +2095,56 @@ function hideCharDropdown() {
   }, 200);
 }
 
+function makeCharOption(text, extraClass, onPick) {
+  const opt = document.createElement('div');
+  opt.className = extraClass ? 'char-opt ' + extraClass : 'char-opt';
+  opt.textContent = text;
+  if (onPick) opt.addEventListener('click', onPick);
+  return opt;
+}
+
+// Character names are untrusted filename stems: build nodes with textContent
+// and closures, never markup or inline handlers.
 function filterCharacters() {
   const query = document.getElementById('characterSearch').value.toLowerCase();
   const dropdown = document.getElementById('charDropdown');
   const matches = query
-    ? allCharacters.filter(c => c.name.toLowerCase().includes(query)).slice(0, 30)
+    ? allCharacters.filter(c => String(c.name).toLowerCase().includes(query)).slice(0, 30)
     : allCharacters.slice(0, 30);
 
-  let html = '<div class="char-opt char-none" onclick="selectCharacter(\'none\',\'No Character\')">No Character</div>';
+  dropdown.textContent = '';
+  dropdown.appendChild(makeCharOption('No Character', 'char-none', () => pickCharacter('none', '')));
   matches.forEach(c => {
-    const esc = c.name.replace(/'/g, "\\'").replace(/"/g, '&quot;');
-    html += `<div class="char-opt" onclick="selectCharacter('${esc}','${esc}')">${c.name.replace(/</g,'&lt;')}</div>`;
+    const name = String(c.name);
+    const id = String(c.id || c.name);
+    dropdown.appendChild(makeCharOption(name, '', () => pickCharacter(id, name)));
   });
   if (allCharacters.length > 30 && !query) {
-    html += '<div class="char-opt char-none">Type to search ' + allCharacters.length + ' characters...</div>';
+    dropdown.appendChild(makeCharOption(`Type to search ${allCharacters.length} characters...`, 'char-none', null));
   }
-  dropdown.innerHTML = html;
   dropdown.style.display = 'block';
 }
 
 function onPersonaChange(val) {
-  if (stStateFresh && stState && val && val !== stState.personaId) {
+  if (stState && val !== (stState.personaId || 'none')) {
     markOverride('persona');
   }
   selectedPersona = val;
   personaPinned = true;
 }
 
+// User pick from the dropdown. Differing from ST's character is a manual
+// override regardless of state freshness, so later polls cannot undo it.
+function pickCharacter(id, name) {
+  const stCharacter = (stState && stState.characterId) || 'none';
+  if (FOLLOW_ST_FROM_URL && id !== stCharacter) markOverride('character');
+  selectCharacter(id, name);
+}
+
+// Programmatic selection (ST state, embed config, chat preview); never an override.
 function selectCharacter(id, name) {
-  // Phase 1: if user picks a character that differs from fresh ST state, mark override.
-  if (stStateFresh && stState && id !== 'none' && id !== stState.characterId) {
-    markOverride('character');
-  }
   selectedCharacter = id;
-  document.getElementById('characterSearch').value = (id === 'none') ? '' : name;
+  document.getElementById('characterSearch').value = (id === 'none') ? '' : (name || id);
   document.getElementById('characterValue').value = id;
   document.getElementById('charDropdown').style.display = 'none';
   // Visual feedback
@@ -2116,8 +2181,9 @@ function setIcon(name) {
 function toggleChatSource() {
   const toggle = document.getElementById('chatSourceToggle');
   const body = document.getElementById('chatSourceBody');
-  toggle.classList.toggle('open');
-  body.classList.toggle('open');
+  const open = toggle.classList.toggle('open');
+  body.classList.toggle('open', open);
+  toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
 }
 
 // ─── Chat Source ──────────────────────────────────────
@@ -2172,35 +2238,42 @@ function setChatSource(source) {
   }
 }
 
+let chatContextSeq = 0;
+
+// Auto + following ST resolves the exact chat ST has open (the same chat the
+// upload's use_state=1 resolves), not the newest-modified chat file.
 async function loadChatContext() {
   const preview = document.getElementById('chatPreview');
   const label = document.getElementById('chatPreviewLabel');
+  const seq = ++chatContextSeq;
   preview.innerHTML = '<div style="color:var(--text-dim);text-align:center;padding:12px">Loading...</div>';
 
   try {
     let url;
+    const following = chatSource === 'auto' && isFollowingSt();
     if (chatSource === 'auto') {
-      url = '/active-chat';
+      url = following ? '/active-chat?use_state=1' : '/active-chat';
     } else {
       const [type, ...nameParts] = chatSource.split(':');
       const name = nameParts.join(':');
-      url = `/chat-context?name=${encodeURIComponent(name)}&type=${type}&last=8`;
+      url = `/chat-context?name=${encodeURIComponent(name)}&type=${encodeURIComponent(type)}&last=8`;
     }
 
     const resp = await fetch(url);
     const data = await resp.json();
+    if (seq !== chatContextSeq) return;  // a newer preview request superseded this one
 
     if (data.error) {
-      preview.innerHTML = `<div style="color:var(--error);text-align:center;padding:12px">${escHtml(data.error)}</div>`;
+      preview.innerHTML = `<div style="color:var(--error);text-align:center;padding:12px">${escapeHtml(data.error)}</div>`;
       chatContextText = '';
       return;
     }
 
     const messages = data.messages || [];
     chatContextText = data.context_text || '';
-    label.textContent = `${data.name || 'Chat'} \u2014 ${messages.length} messages`;
+    label.textContent = `${following ? 'Following ST: ' : ''}${data.name || 'Chat'} \u2014 ${messages.length} messages`;
 
-    if (data.name && data.type === 'individual') {
+    if (!following && data.name && data.type === 'individual') {
       autoSelectCharacter(data.name);
     }
 
@@ -2212,12 +2285,14 @@ async function loadChatContext() {
     preview.innerHTML = messages.map(m => {
       const cls = m.is_user ? 'user-msg' : 'partner';
       const sender = m.name || (m.is_user ? 'You' : 'Partner');
-      const text = m.text.length > 300 ? m.text.slice(0, 300) + '...' : m.text;
-      return `<div class="chat-msg ${cls}"><div class="chat-sender">${escHtml(sender)}</div><div class="chat-text">${escHtml(text)}</div></div>`;
+      const full = String(m.text || '');
+      const text = full.length > 300 ? full.slice(0, 300) + '...' : full;
+      return `<div class="chat-msg ${cls}"><div class="chat-sender">${escapeHtml(sender)}</div><div class="chat-text">${escapeHtml(text)}</div></div>`;
     }).join('');
 
     preview.scrollTop = preview.scrollHeight;
   } catch (err) {
+    if (seq !== chatContextSeq) return;
     preview.innerHTML = `<div style="color:var(--error);text-align:center;padding:12px">Failed to load</div>`;
     chatContextText = '';
   }
@@ -2250,11 +2325,218 @@ function getContext() {
 }
 
 // ─── Recording ────────────────────────────────────────
-async function toggleRecord() {
-  if (recording) {
-    stopRecording();
-  } else {
-    await startRecording();
+const READY_LABEL = 'Tap or hold to record';
+
+function setCaptureState(state) {
+  captureState = state;
+  btn.classList.toggle('recording', state === 'recording');
+  btn.classList.toggle('processing', state === 'processing');
+  setIcon(state === 'recording' ? 'stop' : state === 'processing' ? 'spinner' : 'mic');
+  btn.setAttribute('aria-pressed', state === 'recording' ? 'true' : 'false');
+  btn.setAttribute('aria-busy', state === 'starting' || state === 'processing' ? 'true' : 'false');
+  btn.setAttribute('aria-label',
+    state === 'recording' ? 'Stop recording and transcribe'
+      : state === 'processing' ? 'Transcribing'
+      : state === 'starting' ? 'Starting microphone'
+      : 'Start recording');
+  durationEl.classList.toggle('recording-dur', state === 'recording');
+  if (state !== 'recording') {
+    recordSub.textContent = '';
+    recordSub.classList.remove('visible');
+  }
+}
+
+function toggleRecord() {
+  if (captureState === 'recording') stopRecording();
+  else if (captureState === 'idle') startRecording();
+  // starting / processing: ignore repeated activation.
+}
+
+// Fire-and-forget: boots whisper while the user is still speaking. Older
+// servers 404; every failure is irrelevant to the capture.
+function postWarm() {
+  try { fetch('/warm', { method: 'POST' }).catch(() => {}); } catch {}
+}
+
+// First supported container in preference order; '' lets the browser choose
+// when it cannot be asked; null means MediaRecorder is unusable here.
+function pickRecorderMime() {
+  if (typeof MediaRecorder === 'undefined') return null;
+  if (typeof MediaRecorder.isTypeSupported !== 'function') return '';
+  for (const type of RECORDER_MIME_TYPES) {
+    if (MediaRecorder.isTypeSupported(type)) return type;
+  }
+  return null;
+}
+
+function captureError(name) {
+  const err = new Error(name);
+  err.name = name;
+  return err;
+}
+
+function captureErrorLabel(err) {
+  switch (err && err.name) {
+    case 'NotAllowedError':
+    case 'SecurityError': return 'Microphone access denied';
+    case 'InsecureContextError': return 'Microphone needs a secure (HTTPS) page';
+    case 'NotFoundError':
+    case 'OverconstrainedError': return 'No microphone found — pick another input';
+    case 'NotReadableError':
+    case 'AbortError': return 'Microphone is busy or unavailable';
+    case 'NotSupportedError':
+    case 'UnsupportedCodecError': return 'This browser cannot record audio here';
+    default: return 'Could not start recording';
+  }
+}
+
+// Stops everything a take owns. Analysis is torn down only if this take set it
+// up, so a late, superseded take never kills the active take's meter.
+function releaseTake(take) {
+  if (take.durationTimer) { clearInterval(take.durationTimer); take.durationTimer = null; }
+  if (take.maxTimer) { clearTimeout(take.maxTimer); take.maxTimer = null; }
+  if (take.analysisRunning) { teardownAudioAnalysis(); take.analysisRunning = false; }
+  if (take.stream) {
+    take.stream.getTracks().forEach(t => { try { t.stop(); } catch {} });
+  }
+}
+
+// Discard a take without uploading (gesture cancelled, recorder error).
+function abortTake(take, message) {
+  take.cancelled = true;
+  take.finished = true;
+  try { if (take.recorder && take.recorder.state !== 'inactive') take.recorder.stop(); } catch {}
+  releaseTake(take);
+  if (activeTake !== take) return;
+  activeTake = null;
+  setCaptureState('idle');
+  if (message) showError(message);
+  else label.textContent = READY_LABEL;
+}
+
+async function startRecording() {
+  if (captureState !== 'idle') return false;
+  const take = {
+    id: ++takeSeq, cancelled: false, finished: false, stream: null, recorder: null,
+    chunks: [], mimeType: '', startedAt: 0, stoppedAt: 0,
+    durationTimer: null, maxTimer: null, analysisRunning: false, analysisAvailable: false,
+  };
+  activeTake = take;
+  setCaptureState('starting');
+  label.textContent = 'Starting microphone…';
+  postWarm();
+  // Refresh ST context in the background (coalesced) — never a forced adoption
+  // and never on the critical path to opening the microphone.
+  if (FOLLOW_ST_FROM_URL) loadStateAndApply();
+  try {
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+      throw captureError(window.isSecureContext === false ? 'InsecureContextError' : 'NotSupportedError');
+    }
+    const mimeType = pickRecorderMime();
+    if (mimeType === null) throw captureError('UnsupportedCodecError');
+    take.stream = await navigator.mediaDevices.getUserMedia({ audio: recordingAudioConstraints() });
+    if (take.cancelled || activeTake !== take) {
+      releaseTake(take);
+      return false;
+    }
+    const options = { audioBitsPerSecond: RECORDER_BITS_PER_SECOND };
+    if (mimeType) options.mimeType = mimeType;
+    const recorder = new MediaRecorder(take.stream, options);
+    take.recorder = recorder;
+    take.mimeType = recorder.mimeType || mimeType || 'audio/webm';
+    recorder.ondataavailable = e => {
+      if (e.data && e.data.size > 0) take.chunks.push(e.data);
+    };
+    // Fires for our stop() and for browser-initiated stops alike.
+    recorder.onstop = () => { finishTake(take); };
+    recorder.onerror = (ev) => {
+      WARN_UI('recorder error', ev && ev.error);
+      abortTake(take, 'Recording failed — try again');
+    };
+    take.stream.getAudioTracks().forEach(track => {
+      track.addEventListener('ended', () => {
+        if (activeTake === take && captureState === 'recording') stopRecording();
+      });
+    });
+    recorder.start(250);
+    take.startedAt = Date.now();
+    peakInputDb = -Infinity;
+
+    // Hook up VAD + VU meter on the same stream.
+    take.analysisRunning = take.analysisAvailable = setupAudioAnalysis(take.stream);
+
+    setCaptureState('recording');
+    label.textContent = 'Tap to stop';
+    const audioTrack = take.stream.getAudioTracks()[0];
+    const activeMicLabel = audioTrack?.label || microphoneSelect?.selectedOptions?.[0]?.textContent || '';
+    recordSub.textContent = activeMicLabel ? `Using ${activeMicLabel}` : '';
+    recordSub.classList.toggle('visible', !!activeMicLabel);
+
+    let shownSeconds = -1;
+    durationEl.textContent = formatDuration(0);
+    take.durationTimer = setInterval(() => {
+      const seconds = Math.floor((Date.now() - take.startedAt) / 1000);
+      if (seconds !== shownSeconds) {
+        shownSeconds = seconds;
+        durationEl.textContent = formatDuration(seconds);
+      }
+    }, 250);
+    take.maxTimer = setTimeout(() => {
+      if (activeTake === take && captureState === 'recording') {
+        showToast('Maximum recording length reached — sending', 4000);
+        stopRecording();
+      }
+    }, MAX_RECORDING_MS);
+
+    // Device labels become readable after permission; refresh off the critical path.
+    loadMicrophones();
+    return true;
+  } catch (err) {
+    WARN_UI('startRecording failed', err);
+    releaseTake(take);
+    if (activeTake === take) {
+      activeTake = null;
+      setCaptureState('idle');
+      showError(captureErrorLabel(err));
+    }
+    return false;
+  }
+}
+
+function stopRecording() {
+  const take = activeTake;
+  if (!take || captureState !== 'recording' || !take.recorder) return;
+  take.stoppedAt = Date.now();
+  setCaptureState('processing');
+  label.textContent = 'Transcribing...';
+  try {
+    if (take.recorder.state !== 'inactive') take.recorder.stop();
+    else finishTake(take);
+  } catch (err) {
+    WARN_UI('recorder stop failed', err);
+    abortTake(take, 'Recording failed — try again');
+  }
+}
+
+// Recorder has stopped (by us or by the browser): release the microphone,
+// upload once, and return to idle.
+async function finishTake(take) {
+  if (take.finished) return;
+  take.finished = true;
+  if (!take.stoppedAt) take.stoppedAt = Date.now();
+  releaseTake(take);
+  if (take.cancelled || activeTake !== take) return;
+  if (captureState !== 'processing') {
+    setCaptureState('processing');
+    label.textContent = 'Transcribing...';
+  }
+  try {
+    await sendAudio(take);
+  } finally {
+    if (activeTake === take) {
+      activeTake = null;
+      setCaptureState('idle');
+    }
   }
 }
 
@@ -2264,119 +2546,72 @@ async function toggleRecord() {
 // Then on touchend decide: short press = "tap" (leave recording on, wait for
 // next tap to stop) / long press = "hold" (stop now on release).
 //
-// Desktop mouse: ignored here, click handler uses toggleRecord() as before.
+// Desktop mouse/keyboard: the click handler uses toggleRecord().
+//
+// MVP-11 / ADR-4: never await inside touchstart. startRecording() claims the
+// take synchronously, so touchend/touchcancel can act on it while the OS
+// permission prompt is still open.
 const HOLD_THRESHOLD_MS = 350;
 let touchStartTs = 0;
-let touchActive = false;       // a touch-initiated recording is in flight
-let touchRecordingStarted = false;  // did this touch actually trigger startRecording()
-let suppressNextClick = false; // block the synthetic click after a hold release
-let pendingTouchHeldMs = 0;    // captured at touchend so the late-resolving
-                                // startRecording().then() can honour the user's
-                                // gesture intent if they released before the
-                                // OS permission prompt resolved.
+let touchActive = false;       // a touch sequence on the record button is in progress
+let touchTake = null;          // take started by the current touch, if any
+let suppressNextClick = false; // block the synthetic click after a touch release
 
-// MVP-11 / ADR-4 — hold-to-record race fix.
-//
-// Diagnosis (vds-agent-2-audio §2): `await startRecording()` inside touchstart
-// suspended while the OS showed the mic prompt; the user lifted their finger;
-// touchend fired while `recording === false`, so the hold-release branch's
-// `if (recording) stopRecording()` no-op'd; the await resolved later with the
-// mic stuck hot. Tap-toggle worked (no race) but hold did not.
-//
-// Fix: don't await inside touchstart. Fire-and-forget startRecording(); record
-// the user's gesture intent in pendingTouchHeldMs at touchend; let the .then()
-// honour that intent when the mic actually opens. The user-gesture flag
-// survives the first microtask of an async function in Chromium [4], so kicking
-// off the promise synchronously preserves getUserMedia eligibility.
 function onRecordTouchStart(ev) {
   // Only single-finger touches.
-  if (ev.touches.length > 1) return;
-  // If already recording from a previous tap, treat this touch as a stop gesture.
-  if (recording) {
-    touchActive = true;
-    touchRecordingStarted = false;  // we did NOT start recording this touch
-    touchStartTs = Date.now();
-    pendingTouchHeldMs = 0;
-    return;
-  }
+  if (ev.touches && ev.touches.length > 1) return;
   touchActive = true;
   touchStartTs = Date.now();
-  pendingTouchHeldMs = 0;
+  touchTake = null;
+  // While recording, this touch is a stop gesture (acted on at touchend);
+  // while starting/processing it is ignored.
+  if (captureState !== 'idle') return;
   btn.classList.add('holding');
   // Haptic hint so user knows the press registered.
   if (navigator.vibrate) { try { navigator.vibrate(15); } catch {} }
-  // Fire-and-forget. Critical: returning quickly from touchstart lets touchend
-  // fire with accurate state if the user releases during the OS prompt.
-  startRecording().then(() => {
-    touchRecordingStarted = true;
-    if (!touchActive) {
-      // touchend already fired while we were awaiting permission.
-      // Honour the gesture intent recorded at release time.
-      if (pendingTouchHeldMs >= HOLD_THRESHOLD_MS) {
-        // Long hold + late mic → user expected hold-to-record. Stop now.
-        if (recording) stopRecording();
-      }
-      // Short tap + late mic → leave recording on (existing tap-toggle UX).
-    }
-  }).catch(err => {
-    touchRecordingStarted = false;
-    btn.classList.remove('holding');
-    WARN_UI('startRecording failed', err);
-    // Surface to user — silent failure was a major QoL bug pre-MVP-11.
-    if (label) {
-      const prev = label.textContent;
-      label.textContent = 'Microphone access denied';
-      label.classList.add('error-text');
-      setTimeout(() => {
-        label.textContent = prev || 'Tap or hold to record';
-        label.classList.remove('error-text');
-      }, 3000);
-    }
+  startRecording().then(started => {
+    if (!started) btn.classList.remove('holding');
   });
+  touchTake = activeTake;
 }
 
 function onRecordTouchEnd(ev) {
   if (!touchActive) return;
-  const heldMs = Date.now() - touchStartTs;
-  pendingTouchHeldMs = heldMs;
   touchActive = false;
+  const heldMs = Date.now() - touchStartTs;
   btn.classList.remove('holding');
   // Suppress the synthetic click that browsers fire after touchend.
   suppressNextClick = true;
-  // Clear the suppress flag on the next tick in case no click arrives.
   setTimeout(() => { suppressNextClick = false; }, 400);
+  try { ev.preventDefault(); } catch {}
 
-  // MVP-11: if recording hasn't started yet, we're racing the OS permission
-  // prompt. Don't no-op stopRecording() — record the intent and let the
-  // startRecording().then() above act on it when the mic actually opens.
-  if (!recording && !touchRecordingStarted) {
-    try { ev.preventDefault(); } catch {}
+  const take = touchTake;
+  touchTake = null;
+  if (!take) {
+    // Touch began during a recording: tap or hold release both stop it.
+    if (captureState === 'recording') stopRecording();
     return;
   }
-
-  if (heldMs >= HOLD_THRESHOLD_MS) {
-    // Hold gesture → stop recording now.
-    if (recording) stopRecording();
-    try { ev.preventDefault(); } catch {}
-  } else {
-    // Short tap.
-    if (touchRecordingStarted) {
-      // We just started on touchstart — leave it running, user will tap to stop.
-      // (Existing tap-to-stop behavior.)
-    } else {
-      // We were already recording (this touch was intended as a tap-to-stop).
-      if (recording) stopRecording();
-      try { ev.preventDefault(); } catch {}
-    }
+  if (activeTake !== take || heldMs < HOLD_THRESHOLD_MS) return;  // tap: keep recording
+  if (captureState === 'recording') {
+    stopRecording();
+  } else if (captureState === 'starting') {
+    // Released a hold before the microphone opened: nothing was captured.
+    abortTake(take, 'Released before the microphone opened — hold again');
   }
 }
 
+// A cancelled gesture (scroll hijack, system interruption) discards its take,
+// including one still waiting on the permission prompt; it never submits.
 function onRecordTouchCancel() {
   if (!touchActive) return;
   touchActive = false;
   btn.classList.remove('holding');
-  // A cancel usually means scroll hijack — stop recording to avoid leaving mic hot.
-  if (recording && touchRecordingStarted) stopRecording();
+  const take = touchTake;
+  touchTake = null;
+  if (take && activeTake === take && (captureState === 'starting' || captureState === 'recording')) {
+    abortTake(take, 'Recording cancelled');
+  }
 }
 
 function onRecordClick(ev) {
@@ -2397,110 +2632,46 @@ function WARN_UI(...args) { try { console.warn('[dictation]', ...args); } catch 
 
 (function wireHoldToRecord() {
   if (!btn) return;
-  // Strip the inline onclick so our gated click handler is the only click path.
-  btn.removeAttribute('onclick');
   btn.addEventListener('click', onRecordClick);
-  // touchstart must NOT be passive — we need to preventDefault() if we want
-  // to suppress the synthetic mousedown-click chain on some browsers.
+  // touchstart must NOT be passive so touchend's preventDefault() can
+  // suppress the synthetic mousedown-click chain on some browsers.
   btn.addEventListener('touchstart', onRecordTouchStart, { passive: false });
   btn.addEventListener('touchend', onRecordTouchEnd);
   btn.addEventListener('touchcancel', onRecordTouchCancel, { passive: true });
 })();
 
-async function startRecording() {
-  try {
-    // Mobile tab switching can leave the phone UI with a stale snapshot. Pull
-    // once at the moment of capture so context is current without manual refresh.
-    if (FOLLOW_ST_FROM_URL) await loadStateAndApply({ force: true });
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: recordingAudioConstraints() });
-    const audioTrack = stream.getAudioTracks()[0];
-    await loadMicrophones();
-
-    const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-      ? 'audio/webm;codecs=opus' : 'audio/webm';
-
-    mediaRecorder = new MediaRecorder(stream, { mimeType });
-    audioChunks = [];
-
-    mediaRecorder.ondataavailable = e => {
-      if (e.data.size > 0) audioChunks.push(e.data);
-    };
-
-    mediaRecorder.onstop = async () => {
-      stream.getTracks().forEach(t => t.stop());
-      clearInterval(durationInterval);
-      teardownAudioAnalysis();
-      await sendAudio();
-    };
-
-    mediaRecorder.start(100);
-    recording = true;
-    recordStart = Date.now();
-    peakInputDb = -Infinity;
-
-    // Hook up VAD + VU meter on the same stream.
-    setupAudioAnalysis(stream);
-
-    btn.classList.add('recording');
-    btn.classList.remove('processing');
-    setIcon('stop');
-    label.textContent = 'Tap to stop';
-    const activeMicLabel = audioTrack?.label || microphoneSelect?.selectedOptions?.[0]?.textContent || '';
-    recordSub.textContent = activeMicLabel ? `Using ${activeMicLabel}` : '';
-    recordSub.classList.toggle('visible', !!activeMicLabel);
-    durationEl.classList.add('recording-dur');
-
-    durationInterval = setInterval(() => {
-      durationEl.textContent = formatDuration((Date.now() - recordStart) / 1000);
-    }, 200);
-
-  } catch (err) {
-    console.error('Mic access error:', err);
-    label.textContent = 'Microphone access denied';
-    label.classList.add('error-text');
-    setTimeout(() => {
-      label.textContent = 'Tap to record';
-      label.classList.remove('error-text');
-    }, 3000);
-  }
-}
-
-function stopRecording() {
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-    recording = false;
-    mediaRecorder.stop();
-    btn.classList.remove('recording');
-    btn.classList.add('processing');
-    setIcon('spinner');
-    label.textContent = 'Transcribing...';
-    recordSub.textContent = '';
-    recordSub.classList.remove('visible');
-  }
-}
-
 // ─── VAD + VU meter ───────────────────────────────────
+let levelBuf = null;           // reused time-domain buffer for computeDb()
+
+// Returns true when level analysis is running for this stream.
 function setupAudioAnalysis(stream) {
   try {
     const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return;
+    if (!Ctx) return false;
     audioContext = new Ctx();
+    if (audioContext.state === 'suspended' && audioContext.resume) {
+      audioContext.resume().catch(() => {});
+    }
     micSourceNode = audioContext.createMediaStreamSource(stream);
     analyserNode = audioContext.createAnalyser();
     analyserNode.fftSize = 512;
     analyserNode.smoothingTimeConstant = 0.7;
     micSourceNode.connect(analyserNode);
+    levelBuf = new Uint8Array(analyserNode.fftSize);
 
     // Show VU meter with fade-in.
     vuCanvas.classList.add('visible');
     startVuDraw();
 
-    // Start VAD silence polling.
+    // Level polling runs for the whole take regardless of the auto-stop
+    // setting, so silent Bluetooth routing is always detectable.
     silenceStartTs = 0;
-    // Always sample input level so silent Bluetooth routing is detectable,
-    // even when the user disables automatic silence stopping.
     vadCheckInterval = setInterval(checkSilence, 100);
+    return true;
   } catch (err) {
     console.warn('Audio analysis setup failed:', err);
+    teardownAudioAnalysis();
+    return false;
   }
 }
 
@@ -2521,26 +2692,26 @@ function teardownAudioAnalysis() {
   }
   analyserNode = null;
   micSourceNode = null;
+  levelBuf = null;
   vuCanvas.classList.remove('visible');
   clearVuMeter();
 }
 
 function computeDb() {
-  if (!analyserNode) return -Infinity;
-  const buf = new Uint8Array(analyserNode.fftSize);
-  analyserNode.getByteTimeDomainData(buf);
+  if (!analyserNode || !levelBuf) return -Infinity;
+  analyserNode.getByteTimeDomainData(levelBuf);
   let sum = 0;
-  for (let i = 0; i < buf.length; i++) {
-    const v = buf[i] - 128;
+  for (let i = 0; i < levelBuf.length; i++) {
+    const v = levelBuf[i] - 128;
     sum += v * v;
   }
-  const rms = Math.sqrt(sum / buf.length);
+  const rms = Math.sqrt(sum / levelBuf.length);
   if (rms < 0.0001) return -Infinity;
   return 20 * Math.log10(rms / 128);
 }
 
 function checkSilence() {
-  if (!recording || !analyserNode) return;
+  if (captureState !== 'recording' || !analyserNode) return;
   const db = computeDb();
   if (Number.isFinite(db)) peakInputDb = Math.max(peakInputDb, db);
   if (!vadEnabled) return;
@@ -2617,61 +2788,96 @@ function startVuDraw() {
   draw();
 }
 
-async function sendAudio() {
-  // Re-check right before formatting/transcription too; this covers hold-to-record
-  // and long recordings where ST context changed while the phone page was open.
-  if (FOLLOW_ST_FROM_URL) await loadStateAndApply({ force: true });
-  const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType });
-
-  // MediaRecorder can create a non-empty container around total silence.
-  // Catch Bluetooth routing failure before sending it to Whisper.
-  const recordedForMs = Date.now() - recordStart;
-  if (recordedForMs >= 700 && peakInputDb < -56) {
-    btn.classList.remove('processing');
-    setIcon('mic');
-    durationEl.classList.remove('recording-dur');
-    showError('No microphone signal — choose another mic or reconnect Bluetooth');
-    showToast('⚠ Silent input detected. Pick the Fold microphone in the microphone menu.', 6000);
-    return;
-  }
-
+// Query params for /transcribe. A genuine follow (ST state fresh, no manual
+// override, Auto chat source) sends `use_state=1` and lets the server resolve
+// chat, cast and an ST-adopted mode from ONE state snapshot; the phone's cached
+// copies could lag a chat switch. Anything the user chose explicitly (a chat,
+// manual context, a pinned persona, a mode chip) is sent, and an explicit chat
+// is never combined with use_state.
+function buildTranscribeParams() {
   const model = document.getElementById('modelSelect').value;
-  const context = getContext();
   const mode = getMode(currentMode);
   const params = new URLSearchParams({ model });
   if (currentFormatterModel) params.set('formatter_model', currentFormatterModel);
   params.set('language', transcriptionLanguage);
-  if (currentMode) params.set('mode', currentMode);
+
+  // Only send cast/chat params when the current mode actually uses them.
+  const useCast = mode && (mode.use_persona || mode.use_character);
+  const useChat = !!(mode && mode.use_chat_context);
+  const follow = isFollowingSt() && (!useChat || chatSource === 'auto');
+
+  if (currentMode && !(follow && modeSource === 'st')) params.set('mode', currentMode);
+  if (useCast) {
+    if (follow) {
+      if (personaPinned && selectedPersona !== 'none') params.set('persona', selectedPersona);
+    } else {
+      if (selectedPersona !== 'none') params.set('persona', selectedPersona);
+      if (selectedCharacter !== 'none') params.set('character', selectedCharacter);
+    }
+    if (useRules) params.set('rules', '1');
+    if (proseFormat) params.set('prose', '1');
+  }
+  if (follow) {
+    params.set('use_state', '1');
+    // Modes without chat context must not pull ST history in via state.
+    if (!useChat) params.set('chat_source', 'manual');
+  } else if (useChat && chatSource !== 'manual') {
+    params.set('chat_source', chatSource);
+  }
+  return params;
+}
+
+// chat_source for /reformat (which has no use_state): the followed chat as a
+// state-derived `type:chatId`, so the server resolves the same exact chat.
+function regenChatSource() {
+  if (chatSource === 'manual') return '';
+  if (chatSource === 'auto' && isFollowingSt()) {
+    return `${stState.chatType || 'solo'}:${stState.chatId}`;
+  }
+  return chatSource;
+}
+
+async function sendAudio(take) {
+  const blob = new Blob(take.chunks, { type: take.mimeType });
+
+  // MediaRecorder can create a non-empty container around total silence.
+  // Catch Bluetooth routing failure before sending it to Whisper — but only
+  // when level analysis actually ran; unavailable analysis is not silence.
+  const recordedForMs = take.stoppedAt - take.startedAt;
+  if (take.analysisAvailable && recordedForMs >= 700 && peakInputDb < -56) {
+    showError('No microphone signal — choose another mic or reconnect Bluetooth');
+    showToast('⚠ Silent input detected. Pick the Fold microphone in the microphone menu.', 6000);
+    return;
+  }
+  if (!blob.size) {
+    showError('Nothing was recorded — try again');
+    return;
+  }
+  if (blob.size > MAX_UPLOAD_BYTES) {
+    showError('Recording too large to upload — keep takes shorter');
+    return;
+  }
+
+  const params = buildTranscribeParams();
+  const context = getContext();
   // Chat context goes in a header, never the URL (request lines are journaled).
   const contextHeaders = context
     ? { 'X-Dictation-Context': encodeURIComponent(String(context).slice(-4000)) } : {};
 
-  // Only send cast/chat params when the current mode actually uses them.
-  const useCast = mode && (mode.use_persona || mode.use_character);
-  const useChat = mode && mode.use_chat_context;
-  if (useCast) {
-    if (selectedPersona !== 'none') params.set('persona', selectedPersona);
-    if (selectedCharacter !== 'none') params.set('character', selectedCharacter);
-    if (useRules) params.set('rules', '1');
-    if (proseFormat) params.set('prose', '1');
-  }
-  if (useChat && chatSource !== 'manual') {
-    params.set('chat_source', chatSource);
-  }
-
   try {
     const resp = await fetch(`/transcribe?${params}`, {
       method: 'POST',
-      headers: { 'Content-Type': mediaRecorder.mimeType, ...contextHeaders },
+      headers: { 'Content-Type': take.mimeType, ...contextHeaders },
       body: blob,
     });
 
-    const data = await resp.json();
+    const data = await resp.json().catch(() => ({}));
 
-    if (data.error) {
-      showError(data.error);
+    if (!resp.ok || data.error) {
+      showError(data.error || `Transcription failed (HTTP ${resp.status})`);
     } else {
       lastRawText = data.raw || data.text;
+      lastEntryId = typeof data.entry_id === 'string' ? data.entry_id : '';
       // Backend echoes the resolved mode id; fall back if missing.
       lastUsedMode = data.mode || currentMode;
       lastWasOoc = data.is_ooc === true;
@@ -2699,12 +2905,8 @@ async function sendAudio() {
     }
   } catch (err) {
     console.error('Transcription error:', err);
-    showError('Connection error');
+    showError("Can't reach the server — recording not sent");
   }
-
-  btn.classList.remove('processing');
-  setIcon('mic');
-  durationEl.classList.remove('recording-dur');
 }
 
 // ─── Regenerate ───────────────────────────────────────
@@ -2730,12 +2932,11 @@ function withOocPrefix(text) {
 }
 
 async function regenerate() {
-  if (!lastRawText) return;
+  if (!lastRawText || captureState !== 'idle') return;
 
   regenBtn.disabled = true;
+  setCaptureState('processing');
   label.textContent = 'Regenerating...';
-  btn.classList.add('processing');
-  setIcon('spinner');
 
   const context = getContext();
   // Preserve a formatter-capable prior mode; Plain cannot regenerate prose.
@@ -2749,10 +2950,12 @@ async function regenerate() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         text: lastRawText,
+        // Replace exactly this take's transcript entry, not "the latest one".
+        entry_id: lastEntryId || undefined,
         formatter_model: currentFormatterModel,
         mode: regenMode,
         context: context,
-        chat_source: chatSource !== 'manual' ? chatSource : '',
+        chat_source: regenChatSource(),
         persona: selectedPersona,
         character: selectedCharacter,
         rules: useRules,
@@ -2767,6 +2970,7 @@ async function regenerate() {
     } else {
       const resolvedMode = data.mode || regenMode;
       lastUsedMode = resolvedMode;
+      if (typeof data.entry_id === 'string' && data.entry_id) lastEntryId = data.entry_id;
       showResult(withOocPrefix(data.text), { raw: lastRawText, cleaned: data.cleaned || '',
                               repair_trace: data.repair_trace || null,
                               mode: resolvedMode,
@@ -2786,16 +2990,14 @@ async function regenerate() {
   }
 
   regenBtn.disabled = false;
-  btn.classList.remove('processing');
-  setIcon('mic');
-  label.textContent = 'Tap to record';
+  setCaptureState('idle');
 }
 
 // ─── Result display ───────────────────────────────────
 function showResult(text, meta) {
   resultText.value = text;
   resultArea.classList.add('visible');
-  label.textContent = 'Tap to record';
+  label.textContent = READY_LABEL;
   lastRepairTrace = (meta && meta.repair_trace && meta.repair_trace.persistence === 'in_ram_only')
     ? meta.repair_trace : null;
 
@@ -2864,7 +3066,8 @@ function showError(msg) {
   label.textContent = msg;
   label.classList.add('error-text');
   setTimeout(() => {
-    label.textContent = 'Tap to record';
+    // Only restore if nothing (e.g. a new recording) has replaced the message.
+    if (label.textContent === msg) label.textContent = READY_LABEL;
     label.classList.remove('error-text');
   }, 3000);
 }
@@ -2887,6 +3090,7 @@ function clearResult() {
   durationEl.textContent = '0:00';
   regenBtn.style.display = 'none';
   lastRawText = '';
+  lastEntryId = '';
   const rows = document.getElementById('resultRows');
   if (rows) rows.style.display = 'none';
   const resultMeta = document.getElementById('resultMeta');
@@ -2895,8 +3099,10 @@ function clearResult() {
   renderRepairTrace();
 }
 
+// The one escaper for markup built from strings: safe in text and in quoted
+// attribute values. Never use it to build inline JS handlers.
 function escapeHtml(s) {
-  return String(s || '').replace(/[&<>"']/g, c => ({
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   }[c]));
 }
@@ -2994,6 +3200,8 @@ const LOG_ICONS = {
   starFilled: '<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>',
 };
 
+let renderedLogHtml = null;     // last markup written; unchanged polls skip DOM + scroll
+
 function renderLog() {
   const entries = document.getElementById('logEntries');
   const empty = document.getElementById('logEmpty');
@@ -3006,14 +3214,13 @@ function renderLog() {
   if (sessionLog.length === 0) {
     empty.style.display = '';
     entries.innerHTML = '';
+    renderedLogHtml = '';
     return;
   }
 
   empty.style.display = 'none';
   const filterStarred = localStorage.getItem('dictation.log.filterStarred') === '1';
-  const filterChatActive = !!(stStateFresh && stState && stState.chatId
-                              && localStorage.getItem('dictation.log.filterChat') !== '0');
-  const currentChatId = filterChatActive ? stState.chatId : null;
+  const currentChatId = activeLogChatFilter();
 
   // Phase 1: show/hide the "filtered to current chat" strip.
   const strip = document.getElementById('logFilterStrip');
@@ -3038,7 +3245,7 @@ function renderLog() {
   if (filterStarred) displayed = displayed.filter(e => e.starred);
   if (currentChatId) displayed = displayed.filter(e => !e.chat_id || e.chat_id === currentChatId);
 
-  entries.innerHTML = displayed.map(e => {
+  const html = displayed.map(e => {
     const isUser = e.role === 'user';
     const isStarred = isUser && !!e.starred;
     const cls = [e.role === 'context' ? 'context' : 'user', isStarred ? 'starred' : ''].filter(Boolean).join(' ');
@@ -3048,22 +3255,25 @@ function renderLog() {
     const starCls = isStarred ? 'star active' : 'star';
     const starIcon = isStarred ? LOG_ICONS.starFilled : LOG_ICONS.starEmpty;
     const starBtn = isUser
-      ? `<button type="button" class="log-action-btn ${starCls}" aria-label="${isStarred ? 'Unstar' : 'Star'}" data-action="star" data-id="${escHtml(id)}">${starIcon}</button>`
+      ? `<button type="button" class="log-action-btn ${starCls}" aria-label="${isStarred ? 'Unstar' : 'Star'}" data-action="star" data-id="${escapeHtml(id)}">${starIcon}</button>`
       : '';
     const actions = [
       starBtn,
-      `<button type="button" class="log-action-btn copy" aria-label="Copy" data-action="copy" data-id="${escHtml(id)}">${LOG_ICONS.copy}</button>`,
+      `<button type="button" class="log-action-btn copy" aria-label="Copy" data-action="copy" data-id="${escapeHtml(id)}">${LOG_ICONS.copy}</button>`,
       isUser
-        ? `<button type="button" class="log-action-btn regen" aria-label="Regenerate" data-action="regen" data-id="${escHtml(id)}">${LOG_ICONS.regen}</button>`
+        ? `<button type="button" class="log-action-btn regen" aria-label="Regenerate" data-action="regen" data-id="${escapeHtml(id)}">${LOG_ICONS.regen}</button>`
         : '',
-      `<button type="button" class="log-action-btn delete" aria-label="Delete" data-action="delete" data-id="${escHtml(id)}">${LOG_ICONS.delete}</button>`,
+      `<button type="button" class="log-action-btn delete" aria-label="Delete" data-action="delete" data-id="${escapeHtml(id)}">${LOG_ICONS.delete}</button>`,
     ].filter(Boolean).join('');
-    return `<div class="log-entry ${cls}" data-id="${escHtml(id)}">
-      <div class="log-role"><span>${roleLabel}</span>${ts ? `<span class="log-role-ts">${escHtml(ts)}</span>` : ''}</div>
-      <div class="log-text" role="button" tabindex="0" aria-expanded="false" data-action="toggle">${escHtml(e.text)}</div>
+    return `<div class="log-entry ${cls}" data-id="${escapeHtml(id)}">
+      <div class="log-role"><span>${roleLabel}</span>${ts ? `<span class="log-role-ts">${escapeHtml(ts)}</span>` : ''}</div>
+      <div class="log-text" role="button" tabindex="0" aria-expanded="false" data-action="toggle">${escapeHtml(e.text)}</div>
       <div class="log-entry-actions">${actions}</div>
     </div>`;
   }).join('');
+  if (html === renderedLogHtml) return;
+  renderedLogHtml = html;
+  entries.innerHTML = html;
 
   // Scroll to bottom
   const body = document.getElementById('logBody');
@@ -3161,7 +3371,7 @@ async function regenLogEntry(id, btn) {
         formatter_model: currentFormatterModel,
         mode: regenMode,
         context: context,
-        chat_source: chatSource !== 'manual' ? chatSource : '',
+        chat_source: regenChatSource(),
         persona: selectedPersona,
         character: selectedCharacter,
         rules: useRules,
@@ -3205,10 +3415,27 @@ async function deleteLogEntry(id) {
   }
 }
 
-function downloadSession() {
+// Navigation would not carry the bearer header, so fetch the export through
+// the authenticated wrapper and save it from a Blob URL.
+async function downloadSession() {
   if (!sessionLog.length) return;
-  // Server's Content-Disposition header triggers save-as.
-  window.open('/transcript/export.md', '_blank');
+  try {
+    const resp = await fetch('/transcript/export.md', { cache: 'no-store' });
+    if (!resp.ok) { showToast(`Download failed (HTTP ${resp.status})`); return; }
+    const blob = await resp.blob();
+    const disposition = resp.headers.get('Content-Disposition') || '';
+    const match = /filename="?([^";]+)"?/i.exec(disposition);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = match ? match[1] : 'dictation-session.md';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch {
+    showToast('Download failed — server unreachable');
+  }
 }
 
 function toggleStarFilter() {
@@ -3235,30 +3462,37 @@ function toggleChatFilter() {
   }
 })();
 
-function escHtml(s) {
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
+// Chat id the session log is currently filtered to, or null when showing all.
+function activeLogChatFilter() {
+  const active = !!(stStateFresh && stState && stState.chatId
+                    && localStorage.getItem('dictation.log.filterChat') !== '0');
+  return active ? stState.chatId : null;
 }
 
+// Plain Clear honours the visible scope: the filtered chat (its tagged,
+// unstarred entries) or every chat when unfiltered. Shift+Clear is the explicit
+// global wipe of every chat including starred.
 async function clearSession(ev) {
-  const wipeAll = ev && ev.shiftKey;
-  if (wipeAll && !confirm('Clear everything including starred takes?')) return;
+  const wipeAll = !!(ev && ev.shiftKey);
+  const chatId = wipeAll ? null : activeLogChatFilter();
+  if (wipeAll && !confirm('Clear EVERY entry from ALL chats, including starred takes?')) return;
   try {
-    const url = wipeAll ? '/transcript?all=1' : '/transcript';
+    let url = '/transcript';
+    if (wipeAll) url += '?all=1';
+    else if (chatId) url += '?chat=' + encodeURIComponent(chatId);
     const resp = await fetch(url, { method: 'DELETE' });
     const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) { showToast('⚠ ' + (data.error || 'Failed to clear'), 3000); return; }
     await loadTranscript();
     if (wipeAll) {
       showToast('All entries cleared');
     } else {
       const kept = data.kept_starred || 0;
       const cleared = data.cleared || 0;
-      if (kept > 0) {
-        showToast(`Cleared ${cleared} entries, kept ${kept} starred`);
-      } else {
-        showToast('Session cleared');
-      }
+      const scope = chatId ? ' from this chat (untagged entries kept)' : '';
+      showToast(kept > 0
+        ? `Cleared ${cleared} entries${scope}, kept ${kept} starred`
+        : `Cleared ${cleared} entries${scope}`, 3000);
     }
   } catch {
     showToast('Failed to clear');
@@ -3309,10 +3543,10 @@ function loadVadSettings() {
     vadEnabled = enabledEl.checked;
     try { localStorage.setItem('dictation.vad.enabled', vadEnabled ? '1' : '0'); } catch {}
     badge.textContent = vadEnabled ? 'auto-stop' : 'off';
-    // If currently recording and user toggled off, kill the interval.
-    if (!vadEnabled && vadCheckInterval) {
-      clearInterval(vadCheckInterval);
-      vadCheckInterval = null;
+    // Level polling keeps running for the whole take (silent-input check);
+    // only the auto-stop decision follows this toggle.
+    silenceStartTs = 0;
+    if (!vadEnabled) {
       recordSub.textContent = '';
       recordSub.classList.remove('visible');
     }
@@ -3353,10 +3587,10 @@ function renderVocab(entries) {
   }
 
   list.innerHTML = entries.map(e => {
-    const correct = escHtml(e.correct || '');
-    const aliases = (e.aliases || []).map(escHtml).join(', ');
+    const correct = escapeHtml(e.correct);
+    const aliases = (e.aliases || []).map(a => escapeHtml(a)).join(', ');
     const chars = (e.characters && e.characters.length)
-      ? `<div style="font-size:11px;color:var(--text-dim);margin-top:2px">scope: ${e.characters.map(escHtml).join(', ')}</div>` : '';
+      ? `<div style="font-size:11px;color:var(--text-dim);margin-top:2px">scope: ${e.characters.map(c => escapeHtml(c)).join(', ')}</div>` : '';
     return `<div class="vocab-row">
       <div class="vocab-correct">${correct}${chars}</div>
       <div class="vocab-aliases">${aliases || '<span style="opacity:0.5">—</span>'}</div>
@@ -3420,48 +3654,62 @@ async function deleteVocabEntry(correct) {
 function setupEmbedMessaging() {
   if (!isEmbed) return;
 
-  // Live-mirror textarea edits to parent (debounced).
+  // Live-mirror textarea edits to the validated parent only (debounced).
   resultText.addEventListener('input', () => {
     if (resultInputDebounce) clearTimeout(resultInputDebounce);
     resultInputDebounce = setTimeout(() => {
-      try {
-        window.parent.postMessage({
-          type: 'dictation-edit',
-          text: resultText.value,
-        }, '*');
-      } catch {}
+      postToEmbedParent({ type: 'dictation-edit', text: resultText.value });
     }, 300);
   });
 
-  window.addEventListener('message', (e) => {
-    const msg = e.data || {};
-    if (!msg || typeof msg !== 'object') return;
-    switch (msg.type) {
-      case 'dictation-set-context': {
-        // Drop the pushed context into the manual textarea; surface it.
-        const ta = document.getElementById('contextInput');
-        if (typeof msg.context === 'string') {
-          ta.value = msg.context;
-          // Ensure user sees it: switch to manual source + open the section.
-          setChatSource('manual');
-          const body = document.getElementById('chatSourceBody');
-          const toggle = document.getElementById('chatSourceToggle');
-          body.classList.add('open');
-          toggle.classList.add('open');
-        }
-        break;
+  window.addEventListener('message', handleEmbedMessage);
+}
+
+function handleEmbedMessage(e) {
+  // Only our direct parent frame, from a trusted origin, may drive the UI.
+  if (!isEmbed || window.parent === window || e.source !== window.parent) return;
+  if (!isTrustedEmbedOrigin(e.origin)) return;
+  embedParentOrigin = e.origin;
+  const msg = e.data;
+  if (!msg || typeof msg !== 'object') return;
+  switch (msg.type) {
+    case 'dictation-set-context': {
+      // Drop the pushed context into the manual textarea; surface it.
+      const ta = document.getElementById('contextInput');
+      if (typeof msg.context === 'string') {
+        ta.value = msg.context;
+        // Ensure user sees it: switch to manual source + open the section.
+        setChatSource('manual');
+        const body = document.getElementById('chatSourceBody');
+        const toggle = document.getElementById('chatSourceToggle');
+        body.classList.add('open');
+        toggle.classList.add('open');
       }
-      case 'dictation-set-mode': {
-        if (typeof msg.mode === 'string' && getMode(msg.mode)) {
-          setMode(msg.mode);
-        }
-        break;
-      }
-      default:
-        // Ignore unknown types.
-        break;
+      break;
     }
-  });
+    case 'dictation-set-mode': {
+      if (typeof msg.mode === 'string' && getMode(msg.mode)) {
+        setMode(msg.mode);
+      }
+      break;
+    }
+    default:
+      // Ignore unknown types.
+      break;
+  }
+}
+
+const CERT_WARN_DAYS = 14;
+const CERT_URGENT_DAYS = 7;
+
+// Expiry of the server's own TLS certificate, as reported by /health. Browser
+// trust failures never reach this code (the fetch itself fails).
+function certWarning(days) {
+  if (typeof days !== 'number' || !Number.isFinite(days) || days > CERT_WARN_DAYS) return null;
+  const text = days < 0
+    ? 'Server TLS certificate has expired — renew it on the PC and re-pair.'
+    : `Server TLS certificate expires in ${Math.floor(days)} day${Math.floor(days) === 1 ? '' : 's'} — renew it on the PC.`;
+  return { text, urgent: days < CERT_URGENT_DAYS };
 }
 
 async function checkCertHealth() {
@@ -3469,15 +3717,13 @@ async function checkCertHealth() {
     const resp = await fetch('/health');
     if (!resp.ok) return;
     const data = await resp.json();
-    if (!data.cert_warning) return;
+    const warning = certWarning(data.cert_expires_days);
     const banner = document.getElementById('certBanner');
     if (!banner) return;
-    banner.textContent = '⚠ ' + data.cert_warning;
-    banner.classList.add('show');
-    if (typeof data.cert_expires_days === 'number' && data.cert_expires_days < 7) {
-      banner.classList.add('urgent');
-    }
-  } catch (_) { /* network flakes — silent */ }
+    banner.classList.toggle('show', !!warning);
+    banner.classList.toggle('urgent', !!(warning && warning.urgent));
+    banner.textContent = warning ? '⚠ ' + warning.text : '';
+  } catch (_) { /* reachability is surfaced by the follow banner */ }
 }
 
 // ─── Init ───────────────────────────────────────────────
@@ -3513,21 +3759,38 @@ function formatStContext(s) {
 function authProblemText() {
   const auth = window.calliopeAuthStatus || {};
   if (auth.unauthorized) return 'Not paired — stale token. Reopen from SillyTavern.';
-  if (!auth.hasToken) return 'Not paired — open this page from SillyTavern.';
+  if (!auth.hasToken) {
+    if (auth.tokenSource === 'pairing' && auth.lastError) {
+      return 'Pairing link expired or already used — pair again from SillyTavern.';
+    }
+    return 'Not paired — open this page from SillyTavern.';
+  }
   return '';
+}
+
+function renderHeaderStatus() {
+  const dot = document.getElementById('statusDot');
+  const text = document.getElementById('statusText');
+  if (!dot || !text) return;
+  const problem = authProblemText() ? 'Not paired' : (!stReachable ? 'Offline' : '');
+  dot.classList.toggle('offline', !!problem);
+  text.textContent = problem || 'Ready';
 }
 
 function renderFollowBanner() {
   // Keep Send-to-ST button enable state in sync with ST connection status.
   updateSendToStButton();
   updatePillActions();
+  renderHeaderStatus();
   const el = document.getElementById('stFollowBanner');
   const icon = document.getElementById('stFollowIcon');
   const text = document.getElementById('stFollowText');
   const resync = document.getElementById('stResyncBtn');
+  const forget = document.getElementById('stForgetModeBtn');
   if (!el) return;
   el.style.display = '';
   el.classList.remove('fresh', 'stale', 'override');
+  if (forget) forget.style.display = 'none';
 
   const authText = authProblemText();
   if (authText) {
@@ -3535,6 +3798,15 @@ function renderFollowBanner() {
     icon.textContent = '🔐';
     text.textContent = authText;
     resync.style.display = 'none';
+    return;
+  }
+
+  if (!stReachable) {
+    el.classList.add('stale');
+    icon.textContent = '📵';
+    text.textContent = "Can't reach the Calliope server — retrying. This device is still paired.";
+    resync.style.display = '';
+    resync.textContent = 'Retry';
     return;
   }
 
@@ -3558,6 +3830,7 @@ function renderFollowBanner() {
     icon.textContent = '📡';
     text.textContent = `Paired + following ST — ${formatStContext(stState) || 'context live'}`;
     resync.style.display = 'none';
+    if (forget && stState.characterId && stState.rememberedMode) forget.style.display = '';
   } else {
     el.classList.add('stale');
     icon.textContent = '⚠';
@@ -3567,44 +3840,46 @@ function renderFollowBanner() {
   }
 }
 
+// Returns { ok, snap }. Transport failures and 5xx mark the server unreachable
+// without touching pairing; a 401 is recorded by the fetch wrapper.
 async function fetchState() {
   try {
     const r = await fetch('/state', { cache: 'no-store' });
-    if (window.calliopeAuthStatus) {
-      window.calliopeAuthStatus.lastStatus = r.status;
-      if (r.status === 401) window.calliopeAuthStatus.unauthorized = true;
-    }
-    if (!r.ok) return null;
-    return await r.json();
+    stReachable = r.status < 500;
+    if (!r.ok) return { ok: false, snap: null };
+    return { ok: true, snap: await r.json() };
   } catch (e) {
-    if (window.calliopeAuthStatus) window.calliopeAuthStatus.lastError = e?.message || 'network';
-    return null;
+    stReachable = false;
+    return { ok: false, snap: null };
   }
 }
 
-async function applyStateIfFresh(snap, { force = false } = {}) {
-  // Only auto-adopt if following and data is fresh (or forced by manual re-sync).
+// True when requests should be resolved against the live ST chat.
+function isFollowingSt() {
+  return !!(FOLLOW_ST_FROM_URL && stFollow && stStateFresh && stState && stState.chatId);
+}
+
+function applyStateIfFresh(snap, { force = false } = {}) {
+  // Only auto-adopt if following and data is fresh, or on explicit Re-sync.
   if (!snap) return false;
   const canAdopt = force || (stFollow && snap.fresh);
   if (!canAdopt) return false;
 
-  // Character
-  if (snap.characterId) {
-    const charEl = document.getElementById('characterValue');
-    const searchEl = document.getElementById('characterSearch');
-    if (charEl && charEl.value !== snap.characterId) {
-      charEl.value = snap.characterId;
-      selectedCharacter = snap.characterId;
-      if (searchEl) searchEl.value = snap.characterName || snap.characterId;
-    }
+  // A key present with an empty value is ST saying "none"; a missing key means
+  // ST never reported it.
+  if ('characterId' in snap) {
+    const id = String(snap.characterId || '');
+    const target = id || 'none';
+    if (selectedCharacter !== target) selectCharacter(target, snap.characterName || id);
   }
-  // Persona
-  if (snap.personaId && !personaPinned) {
+  if ('personaId' in snap && !personaPinned) {
     const pEl = document.getElementById('personaSelect');
-    if (pEl && pEl.value !== snap.personaId) {
-      // Only set if option exists; otherwise ignore (persona file may not be loaded)
-      const opt = Array.from(pEl.options).find(o => o.value === snap.personaId);
-      if (opt) { pEl.value = snap.personaId; selectedPersona = snap.personaId; }
+    const id = String(snap.personaId || '');
+    // Only adopt personas the picker knows (the file may not be loaded yet).
+    const target = id && pEl && Array.from(pEl.options).some(o => o.value === id) ? id : (id ? null : 'none');
+    if (target && selectedPersona !== target) {
+      selectedPersona = target;
+      if (pEl) pEl.value = target;
     }
   }
   // Chat context — adopt last AI message if chatSource is manual (don't clobber user-picked chats)
@@ -3612,29 +3887,54 @@ async function applyStateIfFresh(snap, { force = false } = {}) {
     const ci = document.getElementById('contextInput');
     if (ci && !ci.value.trim()) ci.value = snap.lastAiMessage;
   }
-  // Auto/individual/group: refresh chat context preview when ST emits a new message.
-  if (snap.lastAiMessage && snap.lastAiMessage !== _lastSeenAiMessage &&
-      (chatSource === 'auto' || chatSource.includes(':'))) {
-    _lastSeenAiMessage = snap.lastAiMessage;
+  // Auto/picked chat: refresh the preview when ST switches chat or emits a new message.
+  const chatChanged = (snap.chatId || '') !== _lastSeenChatId;
+  const messageChanged = !!snap.lastAiMessage && snap.lastAiMessage !== _lastSeenAiMessage;
+  _lastSeenChatId = snap.chatId || '';
+  if (snap.lastAiMessage) _lastSeenAiMessage = snap.lastAiMessage;
+  if ((chatChanged || messageChanged) && chatSource !== 'manual') {
     try { loadChatContext(); } catch {}
   }
-  // Mode — prefer remembered per-char mode, else snap.mode
-  const preferredMode = snap.rememberedMode || snap.mode;
-  if (preferredMode && preferredMode !== currentMode && getMode(preferredMode)) {
-    setMode(preferredMode, { silent: true });
+  // Mode — prefer remembered per-char mode, else snap.mode. Adopt only when ST's
+  // preference changed (or on Re-sync) so a chip the user picked survives polls.
+  const preferredMode = snap.rememberedMode || snap.mode || '';
+  // Recorded only once applied, so a /state that lands before /modes is
+  // adopted when loadModes() re-applies the latest fresh snapshot.
+  if (preferredMode && (force || preferredMode !== _lastAdoptedMode) && getMode(preferredMode)) {
+    if (preferredMode !== currentMode) setMode(preferredMode, { silent: true, source: 'st' });
+    else modeSource = 'st';
+    _lastAdoptedMode = preferredMode;
   }
   return true;
 }
 
-async function loadStateAndApply({ force = false } = {}) {
-  const snap = await fetchState();
-  stState = snap;
-  stStateFresh = !!(snap && snap.fresh);
-  if (stStateFresh || force) await applyStateIfFresh(snap, { force });
+// Background refreshes share one in-flight request; only Re-sync forces a
+// fresh fetch and adoption over a manual override.
+function loadStateAndApply({ force = false } = {}) {
+  if (force) return refreshState(true);
+  if (!stateFetchInFlight) {
+    stateFetchInFlight = refreshState(false).finally(() => { stateFetchInFlight = null; });
+  }
+  return stateFetchInFlight;
+}
+
+async function refreshState(force) {
+  const { ok, snap } = await fetchState();
+  if (ok) {
+    stState = snap;
+    stStateFresh = !!(snap && snap.fresh);
+    if (stStateFresh || force) applyStateIfFresh(snap, { force });
+  } else if (!stReachable) {
+    // Keep the last snapshot for display, but it can no longer be vouched for.
+    stStateFresh = false;
+  } else {
+    stState = null;
+    stStateFresh = false;
+  }
   renderFollowBanner();
-  // Re-render log with chat filter if chatId available.
+  // Re-render log with chat filter if chatId available (no-op when unchanged).
   renderLog();
-  return snap;
+  return stState;
 }
 
 function markOverride(reason) {
@@ -3647,7 +3947,7 @@ async function resyncWithST() {
   stFollow = true;
   personaPinned = false;
   await loadStateAndApply({ force: true });
-  showToast('Re-synced with ST');
+  showToast(stReachable ? 'Re-synced with ST' : "Can't reach the server");
 }
 
 // ─── Phase 2: Send-to-ST ──────────────────────────────
@@ -3815,42 +4115,46 @@ async function sendToST() {
   }
 }
 
-function refreshStateFromLifecycle() {
-  statePollVisible = !document.hidden;
-  if (statePollVisible) loadStateAndApply();
+// Poll /state only while the page is visible; lifecycle events refresh at once.
+function syncStatePolling() {
+  if (document.hidden) {
+    if (statePollTimer) { clearInterval(statePollTimer); statePollTimer = null; }
+    return;
+  }
+  loadStateAndApply();
+  if (!statePollTimer) statePollTimer = setInterval(() => loadStateAndApply(), STATE_POLL_MS);
 }
 
 function startStatePolling() {
-  stopStatePolling();
   if (!FOLLOW_ST_FROM_URL) return;
-  statePollTimer = setInterval(() => {
-    if (statePollVisible) loadStateAndApply();
-  }, STATE_POLL_MS);
-  document.addEventListener('visibilitychange', refreshStateFromLifecycle);
-  window.addEventListener('pageshow', refreshStateFromLifecycle);
-  window.addEventListener('focus', refreshStateFromLifecycle);
-  statePollLifecycleBound = true;
-}
-
-function stopStatePolling() {
-  if (statePollTimer) { clearInterval(statePollTimer); statePollTimer = null; }
-  if (statePollLifecycleBound) {
-    document.removeEventListener('visibilitychange', refreshStateFromLifecycle);
-    window.removeEventListener('pageshow', refreshStateFromLifecycle);
-    window.removeEventListener('focus', refreshStateFromLifecycle);
-    statePollLifecycleBound = false;
+  document.addEventListener('visibilitychange', syncStatePolling);
+  window.addEventListener('pageshow', syncStatePolling);
+  window.addEventListener('focus', syncStatePolling);
+  if (!document.hidden && !statePollTimer) {
+    statePollTimer = setInterval(() => loadStateAndApply(), STATE_POLL_MS);
   }
 }
 
+// An empty modeId clears the remembered mode for that character.
 async function persistCharMode(charId, modeId) {
-  if (!charId || !modeId) return;
+  if (!charId) return false;
   try {
-    await fetch('/state/mode-memory', {
+    const resp = await fetch('/state/mode-memory', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ character: charId, mode: modeId }),
+      body: JSON.stringify({ character: charId, mode: modeId || '' }),
     });
-  } catch { /* best-effort */ }
+    return resp.ok;
+  } catch { return false; }
+}
+
+async function forgetCharMode() {
+  const charId = stState && stState.characterId;
+  if (!charId) return;
+  if (!(await persistCharMode(charId, ''))) { showToast('Could not forget mode'); return; }
+  _lastAdoptedMode = '';
+  await loadStateAndApply();
+  showToast('Remembered mode cleared');
 }
 
 function toggleResultRow(id) {
@@ -3894,11 +4198,6 @@ async function fetchAudit(all) {
     return await r.json();
   } catch (_e) { return null; }
 }
-function _esc(s) {
-  return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
-    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-  });
-}
 function _renderAuditRows(entries) {
   if (!entries || !entries.length) {
     return '<div style="color:var(--text-dim);font-size:11.5px;padding:6px 0">No outbound calls in window.</div>';
@@ -3914,9 +4213,9 @@ function _renderAuditRows(entries) {
     const lat = (e.latency_ms != null) ? Math.round(e.latency_ms) + 'ms' : '';
     return '<div class="audit-row">' +
       '<span class="a-ts">' + hh + ':' + mm + ':' + ss + '</span>' +
-      '<span class="a-method">' + _esc(e.method || 'GET') + '</span>' +
-      '<span class="a-host ' + cls + '">' + _esc(host) + ' ' + _esc(path) + '</span>' +
-      '<span class="a-lat">' + _esc(lat) + '</span>' +
+      '<span class="a-method">' + escapeHtml(e.method || 'GET') + '</span>' +
+      '<span class="a-host ' + cls + '">' + escapeHtml(host) + ' ' + escapeHtml(path) + '</span>' +
+      '<span class="a-lat">' + escapeHtml(lat) + '</span>' +
       '</div>';
   }).join('');
   return rows;
@@ -3989,14 +4288,25 @@ function explainPrivacy() {
 }
 
 // Background poll: keeps the badge color honest even when modal is closed.
+// Paused while the page is hidden; resumes with an immediate refresh.
+let privacyPollTimer = null;
 async function _pollPrivacyBadge() {
   const data = await fetchAudit(false);
   const badge = document.getElementById('privacyBadge');
   if (!data || !badge) return;
   badge.classList.toggle('alert', !!data.warning);
 }
-setInterval(_pollPrivacyBadge, 30000);
-setTimeout(_pollPrivacyBadge, 1500);
+function syncPrivacyPolling() {
+  if (document.hidden) {
+    if (privacyPollTimer) { clearInterval(privacyPollTimer); privacyPollTimer = null; }
+    return;
+  }
+  if (privacyPollTimer) return;
+  privacyPollTimer = setInterval(_pollPrivacyBadge, 30000);
+  _pollPrivacyBadge();
+}
+document.addEventListener('visibilitychange', syncPrivacyPolling);
+setTimeout(syncPrivacyPolling, 1500);
 
 // POL-15 — voice-command cheatsheet modal. Reuses MVP-23 modal infra.
 function openCheatsheetModal() {
@@ -4050,8 +4360,10 @@ PWA_MANIFEST = json.dumps({
 
 
 # Served on `/` to non-loopback clients that present no valid credential. Two jobs:
-#  1. Recover paired-session reloads by fetching the full UI with the bearer in
-#     an Authorization header. The durable token never re-enters the URL.
+#  1. Recover paired-session reloads: probe /state with the bearer in an
+#     Authorization header, then fetch the full UI the same way. The durable
+#     token never re-enters the URL and is forgotten only on a real 401;
+#     transport/5xx failures keep it and offer Retry.
 #  2. Otherwise, tell the user how to pair. No server details are disclosed.
 PAIRING_BOOTSTRAP_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -4069,33 +4381,68 @@ PAIRING_BOOTSTRAP_HTML = """<!DOCTYPE html>
 </style>
 <script>
 (function () {
-  try {
-    var stored = '';
-    try { stored = sessionStorage.getItem('dictationToken') || ''; } catch (e) {}
-    if (!stored) return;
-    fetch(location.pathname + location.search + location.hash, {
-      headers: { 'Authorization': 'Bearer ' + stored },
-      cache: 'no-store'
+  var stored = '';
+  try { stored = sessionStorage.getItem('dictationToken') || ''; } catch (e) {}
+  if (!stored) return;
+  var auth = { 'Authorization': 'Bearer ' + stored };
+  // Only a genuine 401 from an authenticated probe forgets the token; transport
+  // failures and 5xx keep the pairing so a brief outage never unpairs a phone.
+  function show(state, text) {
+    function apply() {
+      var unpaired = document.getElementById('unpaired');
+      var reconnect = document.getElementById('reconnect');
+      var status = document.getElementById('bootStatus');
+      var retry = document.getElementById('bootRetry');
+      if (unpaired) unpaired.hidden = state !== 'unpaired';
+      if (reconnect) reconnect.hidden = state === 'unpaired';
+      if (status) status.textContent = text || '';
+      if (retry) {
+        retry.hidden = state !== 'unreachable';
+        retry.onclick = attempt;
+      }
+    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', apply);
+    else apply();
+  }
+  function attempt() {
+    show('connecting', 'Reconnecting to Calliope…');
+    fetch('/state', { headers: auth, cache: 'no-store' }).then(function (probe) {
+      if (probe.status === 401) {
+        try { sessionStorage.removeItem('dictationToken'); } catch (e) {}
+        show('unpaired', '');
+        return null;
+      }
+      if (!probe.ok) throw new Error('server ' + probe.status);
+      return fetch(location.pathname + location.search, { headers: auth, cache: 'no-store' });
     }).then(function (resp) {
-      if (!resp.ok) throw new Error('unauthorized');
+      if (!resp) return null;
+      if (!resp.ok) throw new Error('server ' + resp.status);
       return resp.text();
     }).then(function (html) {
+      if (html == null) return;
+      if (html.indexOf('id="recordBtn"') === -1) throw new Error('unexpected page');
       document.open();
       document.write(html);
       document.close();
     }).catch(function () {
-      try { sessionStorage.removeItem('dictationToken'); } catch (e) {}
+      show('unreachable', "Can't reach Calliope right now. This device is still paired.");
     });
-  } catch (e) { /* fall through to the static message */ }
+  }
+  attempt();
 })();
 </script>
 </head>
 <body>
-<div class="card">
+<div class="card" id="unpaired">
   <h1>Calliope — pairing required</h1>
   <p>This device isn't paired. Open the dictation page from the SillyTavern
   Dictation Bridge extension (<em>Pair phone</em> &rarr; scan the QR code or
   copy the pairing URL), or browse from the server machine itself.</p>
+</div>
+<div class="card" id="reconnect" hidden>
+  <h1>Calliope</h1>
+  <p id="bootStatus" role="status" aria-live="polite"></p>
+  <button type="button" id="bootRetry" hidden>Retry</button>
 </div>
 </body>
 </html>

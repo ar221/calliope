@@ -29,7 +29,9 @@ def _run(last_was_ooc: bool) -> dict:
       const setIcon = () => {}; const showError = (m) => { throw new Error(m); };
       const showToast = () => {}; const flashRawBadge = () => {}; const updateLogDisplay = () => {};
       const getContext = () => ''; const resolveRegenMode = () => 'rp_enhance';
-      const currentFormatterModel = ''; const chatSource = 'manual';
+      const currentFormatterModel = ''; const regenChatSource = () => '';
+      let captureState = 'idle'; const setCaptureState = (s) => { captureState = s; };
+      let lastEntryId = '';
       const selectedPersona = 'none', selectedCharacter = 'none', useRules = false, proseFormat = false;
       let lastUsedMode = 'grammar_clean';
       let lastRawText = 'brb two minutes';
