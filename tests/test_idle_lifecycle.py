@@ -34,6 +34,9 @@ class FakeClock:
     def monotonic(self) -> float:
         return self.now
 
+    def time(self) -> float:
+        return 1_700_000_000.0 + self.now
+
     def sleep(self, seconds: float) -> None:
         self.now += seconds
 
@@ -60,6 +63,7 @@ class FakeSystemctl:
 @pytest.fixture
 def pkg(tmp_path, monkeypatch):
     monkeypatch.setenv("CALLIOPE_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "runtime"))
     if str(SERVER_DIR) not in sys.path:
         monkeypatch.syspath_prepend(str(SERVER_DIR))
     transcribe = importlib.import_module("calliope_server.transcribe")
@@ -74,6 +78,11 @@ def pkg(tmp_path, monkeypatch):
     monkeypatch.setattr(transcribe, "_transcribe_in_flight", 0)
     monkeypatch.setattr(transcribe, "_whisper_lifecycle_lock", threading.Lock())
     monkeypatch.setattr(transcribe, "_fallback_slot", threading.BoundedSemaphore(1))
+    monkeypatch.setattr(transcribe, "_whisper_alive_until", 0.0)
+    monkeypatch.setattr(transcribe, "_stop_retry_at", 0.0)
+    monkeypatch.setattr(transcribe, "_stop_backoff", 0.0)
+    monkeypatch.setattr(tts, "_stop_retry_at", 0.0)
+    monkeypatch.setattr(tts, "_stop_backoff", 0.0)
     monkeypatch.setattr(transcribe.config, "IDLE_SHUTDOWN_SECONDS", 300)
     monkeypatch.setattr(tts, "_last_tts_ts", 0.0)
     monkeypatch.setattr(tts, "_tts_in_flight", 0)
@@ -93,7 +102,7 @@ def pkg(tmp_path, monkeypatch):
 def test_whisper_idle_tick_skips_stop_while_request_in_flight(pkg, monkeypatch):
     tr = pkg.transcribe
     monkeypatch.setattr(tr, "_whisper_server_probe", lambda timeout=1.0: True)
-    monkeypatch.setattr(tr, "_ensure_whisper_server_alive", lambda: True)
+    monkeypatch.setattr(tr, "_ensure_whisper_server_alive", lambda **_: True)
     stopped_mid_request: list[bool] = []
 
     def slow_inference(audio_path, *, prompt="", language="en"):
@@ -113,7 +122,7 @@ def test_whisper_idle_tick_skips_stop_while_request_in_flight(pkg, monkeypatch):
 def test_whisper_idle_tick_stops_after_window_with_none_in_flight(pkg, monkeypatch):
     tr = pkg.transcribe
     monkeypatch.setattr(tr, "_whisper_server_probe", lambda timeout=1.0: True)
-    monkeypatch.setattr(tr, "_ensure_whisper_server_alive", lambda: True)
+    monkeypatch.setattr(tr, "_ensure_whisper_server_alive", lambda **_: True)
     monkeypatch.setattr(
         tr, "_transcribe_whisper_server",
         lambda audio_path, *, prompt="", language="en": ("hi", {"text": "hi"}),

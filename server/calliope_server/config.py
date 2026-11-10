@@ -202,7 +202,9 @@ OMNIROUTE_SELECTABLE_MODELS = _parse_model_chain(
     ],
 )
 
-DEFAULT_MODEL = "large-v3-turbo"
+# Same variable the whisper-server unit uses to pick its --model file, so the
+# warm daemon and the whisper-cli fallback load one model.
+DEFAULT_MODEL = os.environ.get("DICTATION_WHISPER_MODEL", "").strip() or "large-v3-turbo"
 TRANSCRIPT_CONTEXT_LIMIT = 3000  # max chars of transcript to include in RP+ prompt
 # Max chars of client-supplied "last AI message" context per request. Clients
 # send it in the `X-Dictation-Context` header (percent-encoded), never in the
@@ -245,6 +247,14 @@ MAX_AUDIO_BODY_BYTES = int(os.environ.get(
 # handshake, request parsing and each body/response chunk so one stalled
 # client cannot pin a thread (or, before per-connection TLS, the accept loop).
 CONNECTION_TIMEOUT_SECONDS = float(os.environ.get("DICTATION_CONNECTION_TIMEOUT", "60"))
+# Decoded-audio bound, distinct from the compressed upload cap: ffmpeg stops
+# decoding after this many seconds, and a 16 kHz mono s16 WAV larger than
+# the matching PCM size is rejected before it reaches whisper.
+MAX_AUDIO_SECONDS = int(os.environ.get("DICTATION_MAX_AUDIO_SECONDS", "600"))
+# Admission control: concurrent request-handler threads (SSE streams excluded)
+# and concurrent SSE subscribers. Over either cap the server answers 503.
+MAX_HANDLER_THREADS = int(os.environ.get("DICTATION_MAX_CONNECTIONS", "64"))
+MAX_SSE_SUBSCRIBERS = int(os.environ.get("DICTATION_MAX_SSE_SUBSCRIBERS", "16"))
 
 
 def _env_flag(name: str) -> bool:
@@ -292,23 +302,6 @@ FORMATTER_CHAIN_BUDGET_SECONDS = float(
     os.environ.get("DICTATION_FORMATTER_CHAIN_BUDGET", "40")
 )
 
-# Formatter liveness probe. OmniRoute's only OpenAI-shape health endpoint is
-# /v1/models, which rebuilds a ~2300-entry catalog: measured >3s cold, ~5ms
-# warm. The old hard-coded 2s probe therefore declared a healthy proxy
-# "offline" on the first request after an idle period, and the formatter
-# returned raw unformatted text without trying a single model. Cache the
-# verdict so one cold catalog build cannot poison a dictation session.
-FORMATTER_PROBE_TIMEOUT_SECONDS = float(
-    os.environ.get("DICTATION_FORMATTER_PROBE_TIMEOUT", "6")
-)
-FORMATTER_PROBE_TTL_SECONDS = float(
-    os.environ.get("DICTATION_FORMATTER_PROBE_TTL", "30")
-)
-# Re-probe quickly after a failure so recovery is not gated by the success TTL.
-FORMATTER_PROBE_FAIL_TTL_SECONDS = float(
-    os.environ.get("DICTATION_FORMATTER_PROBE_FAIL_TTL", "3")
-)
-
 # Phase 2 — persistent whisper-server (ADR-1).
 # A user systemd unit `whisper-server.service` runs the long-lived
 # whisper.cpp HTTP server. The dictation-server posts WAV uploads at
@@ -323,6 +316,11 @@ WHISPER_SERVER_REQUEST_TIMEOUT = 120.0  # match old whisper-cli timeout
 IDLE_SHUTDOWN_SECONDS = int(os.environ.get("WHISPER_IDLE_SHUTDOWN_SECONDS", "300"))
 IDLE_SHUTDOWN_DISABLED = _env_flag("WHISPER_IDLE_SHUTDOWN_DISABLED")
 IDLE_SHUTDOWN_CHECK_INTERVAL = 60.0  # seconds between idle checks
+# After a successful inference/boot, skip the liveness GET for this long;
+# an inference failure inside the lease drops it and re-probes.
+WHISPER_ALIVE_LEASE_SECONDS = 30.0
+# Backoff after a failed `systemctl stop` of an idle model unit.
+IDLE_STOP_RETRY_MAX_SECONDS = 600.0
 
 # ─── TTS — Kokoro-82M proxy (read-back UX) ───────────────
 # Lifecycle mirrors whisper-server: a sibling user unit (`kokoro-server.service`)
@@ -377,3 +375,49 @@ def _safe_child(base_dir: Path, name: str, suffix: str = "") -> Path | None:
     except (OSError, ValueError):
         return None
     return candidate
+
+
+# ─── Cross-process model-unit activity ────────────────────
+def unit_activity_file(unit: str) -> Path:
+    """Per-unit activity stamp shared by every dictation-server process.
+
+    Each process touches it on request begin/end; idle shutdown uses the
+    newest of its own activity and this file's mtime, so an idle second
+    instance (e.g. a smoke test on another port) cannot stop a model unit
+    the primary is using. Read at call time so tests can relocate it.
+    """
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    root = Path(runtime) / "calliope" if runtime else DATA_DIR / "activity"
+    return root / f"{unit}.activity"
+
+
+def touch_unit_activity(unit: str, wall_ts: float) -> None:
+    """Set the unit's shared activity stamp to `wall_ts` (best-effort)."""
+    path = unit_activity_file(unit)
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.touch(mode=0o600, exist_ok=True)
+        os.utime(path, (wall_ts, wall_ts))
+    except OSError:
+        pass
+
+
+def unit_activity_mtime(unit: str) -> float:
+    """Wall-clock time of the newest activity by any process, or 0.0."""
+    try:
+        return unit_activity_file(unit).stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+# Completion-first formatter availability: a refused/unresolvable OmniRoute
+# connection marks the gateway offline for this many seconds so every tier
+# (and the next request) does not re-pay a connection attempt.
+FORMATTER_OFFLINE_TTL_SECONDS = float(
+    os.environ.get("DICTATION_FORMATTER_OFFLINE_TTL", "3")
+)
+# Shared deadline across the whole disfluency-cleanup chain (each tier still
+# gets at most DISFLUENCY_CLEAN_TIMEOUT).
+DISFLUENCY_CLEAN_CHAIN_BUDGET_SECONDS = float(
+    os.environ.get("DICTATION_DISFLUENCY_CLEAN_BUDGET", "4.5")
+)

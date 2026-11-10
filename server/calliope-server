@@ -11,6 +11,8 @@ Usage:
 
 import argparse
 import collections
+import gzip
+import hashlib
 import http.server
 import ipaddress
 import json
@@ -72,6 +74,60 @@ if _PKG_DIR is None:
         sys.exit(1)
 for _stale in [m for m in list(sys.modules) if m.split(".", 1)[0] == "calliope_server"]:
     del sys.modules[_stale]
+
+
+def _verify_install_manifest(data_dir: Path, wrapper: Path) -> str:
+    """Check an installed copy against scripts/install-server's manifest.
+
+    Returns the installed revision. Wrapper and package are deployed together;
+    a hand-copied wrapper or a half-synced package is a mixed-revision install,
+    which is worse than a hard stop.
+    """
+    import hashlib
+
+    manifest = data_dir / "INSTALL_MANIFEST"
+    problems: list[str] = []
+    revision = ""
+    listed: set[str] = set()
+    try:
+        lines = manifest.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+        problems.append(f"{manifest} is missing")
+    for line in lines:
+        if line.startswith("revision "):
+            revision = line.split(" ", 1)[1].strip()
+            continue
+        digest, _, name = line.partition("  ")
+        if not name:
+            continue
+        listed.add(name)
+        target = wrapper if name == "wrapper" else data_dir / name
+        try:
+            actual = hashlib.sha256(target.read_bytes()).hexdigest()
+        except OSError:
+            problems.append(f"{name} is missing")
+            continue
+        if actual != digest:
+            problems.append(f"{name} differs from the installed revision")
+    if lines:
+        if "wrapper" not in listed:
+            problems.append("manifest does not cover the executable")
+        for extra in sorted((data_dir / "calliope_server").glob("*.py")):
+            if f"calliope_server/{extra.name}" not in listed:
+                problems.append(f"calliope_server/{extra.name} is not part of the installed revision")
+    if problems:
+        sys.stderr.write(
+            "error: mixed or unverified calliope install:\n"
+            + "".join(f"  {p}\n" for p in problems)
+            + "Re-run scripts/install-server from the calliope checkout.\n"
+        )
+        sys.exit(1)
+    return revision
+
+
+# "" when running from a checkout/wheel, where package and wrapper are one tree.
+INSTALL_REVISION = ""
 if _PKG_DIR is not None:
     if _PKG_DIR.parent == _PKG_PARENT:
         # Repo/wheel layout: package sits next to this file (code-controlled
@@ -79,6 +135,7 @@ if _PKG_DIR is not None:
         if str(_PKG_PARENT) not in sys.path:
             sys.path.insert(0, str(_PKG_PARENT))
     else:
+        INSTALL_REVISION = _verify_install_manifest(_DATA_PARENT, Path(__file__).resolve())
         # Installed layout: load via explicit spec instead of putting the
         # user-writable data dir on sys.path, where a stray *.py would
         # shadow stdlib/site-packages for the whole process.
@@ -95,19 +152,6 @@ if _PKG_DIR is not None:
         _spec.loader.exec_module(_pkg_mod)
 
 from calliope_server import config  # noqa: E402, F401
-from calliope_server import __version__ as _pkg_version  # noqa: E402
-
-# Wrapper and package ship together; a mismatch means a stale install
-# (e.g. raw `install -m 755` of the wrapper without re-running
-# scripts/install-server). Mixed-revision code is worse than a hard stop.
-_EXPECTED_PKG_VERSION = "0.1.0"
-if _pkg_version != _EXPECTED_PKG_VERSION:
-    sys.stderr.write(
-        f"error: calliope_server package version {_pkg_version} does not match "
-        f"this executable (expects {_EXPECTED_PKG_VERSION}).\n"
-        "Re-run scripts/install-server from the calliope checkout.\n"
-    )
-    sys.exit(1)
 # Back-compat re-exports: tests (and code below) reference these as
 # module-level globals on this file. Code that still lives in this file
 # reads THIS module's globals, so monkeypatching them here keeps working.
@@ -225,6 +269,12 @@ from calliope_server.transcribe import (  # noqa: E402
     _start_idle_shutdown_thread,
     transcribe,  # noqa: F401 — re-export for tests/back-compat
     transcribe_with_confidence,
+    prewarm_whisper,
+    audio_container,
+    normalize_audio,
+    AudioConversionError,
+    AudioTooLongError,
+    FfmpegMissingError,
 )
 # TTS layer — Kokoro proxy, audiobook assembly, voice casting. The module
 # itself is also exposed (`mod.tts`) so tests can patch internals the
@@ -298,15 +348,11 @@ from calliope_server.formatter import (  # noqa: E402
     record_model_attribution,  # noqa: F401 — re-export for tests/back-compat
     get_model_attribution,
     formatter_base_url,  # noqa: F401 — re-export for tests/back-compat
-    formatter_health_url,  # noqa: F401 — re-export for tests/back-compat
     formatter_request_url,  # noqa: F401 — re-export for tests/back-compat
     formatter_model_chain,  # noqa: F401 — re-export for tests/back-compat
     formatter_payload,  # noqa: F401 — re-export for tests/back-compat
     formatter_response_text,  # noqa: F401 — re-export for tests/back-compat
     formatter_error_text,  # noqa: F401 — re-export for tests/back-compat
-    _CHAIN_SKIP_MARKERS,  # noqa: F401 — re-export for tests/back-compat
-    _is_chain_skippable_error,  # noqa: F401 — re-export for tests/back-compat
-    probe_formatter,  # noqa: F401 — re-export for tests/back-compat
     disfluency_clean,  # noqa: F401 — re-export for tests/back-compat
     _char_modes_cache,  # noqa: F401 — re-export for tests/back-compat
     char_modes_lock,  # noqa: F401 — re-export for tests/back-compat
@@ -529,9 +575,14 @@ def _generate_self_signed_cert(sans: list[str] | None = None):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     log.info("Generating self-signed SSL certificate...")
 
+    # Mint into staging files next to the live pair, then install both with
+    # rollback: a failure mid-generation never leaves a mismatched live pair.
+    suffix = f".new.{os.getpid()}.{secrets.token_hex(4)}"
+    tmp_crt = CERT_FILE.with_suffix(CERT_FILE.suffix + suffix)
+    tmp_key = KEY_FILE.with_suffix(KEY_FILE.suffix + suffix)
     cmd = [
         "openssl", "req", "-x509", "-newkey", "rsa:2048",
-        "-keyout", str(KEY_FILE), "-out", str(CERT_FILE),
+        "-keyout", str(tmp_key), "-out", str(tmp_crt),
         "-days", str(CERT_VALIDITY_DAYS), "-nodes",
         "-subj", "/CN=dictation-server",
     ]
@@ -550,13 +601,20 @@ def _generate_self_signed_cert(sans: list[str] | None = None):
         if san_parts:
             cmd.extend(["-addext", "subjectAltName=" + ",".join(san_parts)])
 
-    subprocess.run(cmd, check=True, capture_output=True)
-    # Enforce file modes per ADR-14 §7: cert 0644, key 0600.
     try:
-        os.chmod(CERT_FILE, 0o644)
-        os.chmod(KEY_FILE, 0o600)
-    except OSError as e:
-        log.warning(f"Could not enforce cert/key file modes: {e}")
+        # Owner-only from creation; openssl truncates and keeps the mode.
+        os.close(os.open(tmp_key, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+        subprocess.run(cmd, check=True, capture_output=True)
+        if not (tmp_crt.is_file() and tmp_key.is_file()
+                and tmp_crt.stat().st_size and tmp_key.stat().st_size):
+            raise RuntimeError("openssl produced no certificate/key")
+        # Enforce file modes per ADR-14 §7: cert 0644, key 0600.
+        os.chmod(tmp_crt, 0o644)
+        os.chmod(tmp_key, 0o600)
+        _install_cert_pair_with_rollback(tmp_crt, tmp_key, backup_tag="pre-renew")
+    finally:
+        for p in (tmp_crt, tmp_key):
+            p.unlink(missing_ok=True)
     log.info(f"Certificate saved to {CERT_FILE} (valid {CERT_VALIDITY_DAYS} days)")
 
 
@@ -579,21 +637,57 @@ def cert_fingerprint_sha256() -> str | None:
         return None
 
 
+def _persist_cert_fingerprint() -> str | None:
+    """Write the live cert's fingerprint to CERT_FINGERPRINT_FILE (0644)."""
+    fp = cert_fingerprint_sha256()
+    if fp:
+        try:
+            CERT_FINGERPRINT_FILE.write_text(fp + "\n", encoding="utf-8")
+            os.chmod(CERT_FINGERPRINT_FILE, 0o644)
+        except Exception as e:
+            log.warning(f"Could not persist cert fingerprint: {e}")
+    return fp
+
+
+# O-08: parsed notAfter keyed by the cert file's (mtime_ns, size, inode), so
+# privileged /health polls do not spawn openssl until the cert is replaced.
+_cert_expiry_cache: dict = {"key": None, "end": None}
+_cert_expiry_lock = threading.Lock()
+
+
+def _cert_not_after():
+    from datetime import datetime, timezone
+    try:
+        st = CERT_FILE.stat()
+    except OSError:
+        return None
+    key = (st.st_mtime_ns, st.st_size, st.st_ino)
+    with _cert_expiry_lock:
+        if _cert_expiry_cache["key"] == key:
+            return _cert_expiry_cache["end"]
+    result = subprocess.run(
+        ["openssl", "x509", "-enddate", "-noout", "-in", str(CERT_FILE)],
+        capture_output=True, text=True, timeout=5, check=True,
+    )
+    # Output: "notAfter=May  1 12:00:00 2035 GMT"
+    end_str = result.stdout.strip().split("=", 1)[1]
+    end_dt = datetime.strptime(end_str, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
+    with _cert_expiry_lock:
+        _cert_expiry_cache["key"] = key
+        _cert_expiry_cache["end"] = end_dt
+    return end_dt
+
+
 def cert_days_remaining() -> int | None:
     """Return days until cert expires, or None if cert is missing/unreadable."""
+    from datetime import timezone
     if not CERT_FILE.exists():
         return None
     try:
-        result = subprocess.run(
-            ["openssl", "x509", "-enddate", "-noout", "-in", str(CERT_FILE)],
-            capture_output=True, text=True, timeout=5, check=True,
-        )
-        # Output: "notAfter=May  1 12:00:00 2035 GMT"
-        end_str = result.stdout.strip().split("=", 1)[1]
-        from datetime import datetime, timezone
-        end_dt = datetime.strptime(end_str, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
-        delta = end_dt - datetime.now(timezone.utc)
-        return delta.days
+        end_dt = _cert_not_after()
+        if end_dt is None:
+            return None
+        return (end_dt - datetime.now(timezone.utc)).days
     except Exception as e:
         log.warning(f"Failed to read cert expiry: {e}")
         return None
@@ -725,7 +819,9 @@ def _check_and_renew_cert() -> bool:
     if not renewed:
         log.warning("In-run cert check: near-expiry cert is externally managed — renewal skipped")
         return False
-    if not _reload_ssl_context_cert():
+    if _reload_ssl_context_cert():
+        _persist_cert_fingerprint()
+    else:
         log.warning("Regenerated cert on disk but could not hot-reload it — "
                     "restart the dictation-server to serve the new cert")
     return True
@@ -791,8 +887,13 @@ def _write_token_file(tok: str) -> None:
     os.chmod(TOKEN_FILE, 0o600)
 
 
-def ensure_token(*, log_new_token: bool = True) -> str:
-    """Mint or load the bearer token. First-run: optionally log a redacted hint."""
+def ensure_token(*, log_new_token: bool = True, require_persist: bool = False) -> str:
+    """Mint or load the bearer token. First-run: optionally log a redacted hint.
+
+    When the new token cannot be written: raise OSError if `require_persist`
+    (CLI rotation must not report success), otherwise serve with a RAM-only
+    token and say so.
+    """
     with _token_lock:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         if TOKEN_FILE.exists():
@@ -807,15 +908,21 @@ def ensure_token(*, log_new_token: bool = True) -> str:
         tok = secrets.token_urlsafe(32)
         try:
             _write_token_file(tok)
+            persisted = True
         except Exception as e:
-            log.error(f"Failed to persist bearer token: {e}")
+            if require_persist:
+                raise OSError(f"could not write {TOKEN_FILE}: {e}") from e
+            log.error(f"Failed to persist bearer token: {e} — serving with an in-memory "
+                      "token that changes on restart; fix the data dir permissions")
+            persisted = False
         if log_new_token:
             # Never log the full secret (journald persists it otherwise).
             log.info(
                 f"Bearer token minted: {tok[:8]}… (redacted; run "
                 f"`dictation-server --show-token` or read {TOKEN_FILE} for the full value)"
             )
-        log.info(f"Token saved to {TOKEN_FILE} (mode 0600)")
+        if persisted:
+            log.info(f"Token saved to {TOKEN_FILE} (mode 0600)")
         _token_cache["value"] = tok
         _token_cache["loaded"] = True
         return tok
@@ -874,6 +981,51 @@ def consume_pairing_code(code: str, *, now: float | None = None) -> tuple[str, s
     return str(entry["token"]), "ok"
 
 
+def _source_is_state_chat(chat_source: str, state_chat_id: str, *, state_usable: bool) -> bool:
+    """True when the effective chat source is the chat a fresh ST state names.
+
+    No source and `auto` follow the ST tab; `type:<id>` only when `<id>` is
+    the state's chatId; `manual` and any other chat never are.
+    """
+    if not state_usable:
+        return False
+    if chat_source in ("", "auto"):
+        return True
+    _ctype, sep, name = chat_source.partition(":")
+    return bool(sep and state_chat_id and name == state_chat_id)
+
+
+def _chat_id_for_source(chat_source: str, state_chat_id: str) -> str:
+    """Transcript chat tag for a take: the state's chat id when the source is
+    that chat (no source, `auto`, or `type:<chatId>`), else ""."""
+    if not state_chat_id:
+        return ""
+    _ctype, sep, name = chat_source.partition(":")
+    if sep:
+        return state_chat_id if name == state_chat_id else ""
+    return state_chat_id if chat_source in ("", "auto") else ""
+
+
+_CLIENT_REQUEST_ID_RE = re.compile(r"[A-Za-z0-9_-]{16,32}")
+
+
+def _request_id_from(client_value: str) -> str:
+    """Client-chosen request id when well-formed, else a fresh server id."""
+    if _CLIENT_REQUEST_ID_RE.fullmatch(client_value or ""):
+        return client_value
+    return secrets.token_urlsafe(8)
+
+
+def _json_str(data: dict, key: str) -> str:
+    """String field of a JSON body: missing/null → "", non-string → ValueError (400)."""
+    value = data.get(key)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"'{key}' must be a string")
+    return value
+
+
 def _coerce_int(value, default: int, *, lo: int, hi: int) -> int:
     """Client-supplied integer, clamped to [lo, hi]; junk → default."""
     try:
@@ -891,22 +1043,31 @@ def clamp_request_context(text: str) -> str:
     return text
 
 
+_SENSITIVE_QUERY_NAMES = frozenset({
+    "token", "pair", "access_token", "auth", "authorization", "context",
+})
+_QUERY_PARAM_RE = re.compile(r"([?&])([^=&\s#]*)=([^\s&#]*)")
+
+
 def _redact_sensitive_url_params(text: str) -> str:
     """Redact secret- or chat-bearing query parameters before request lines reach the journal."""
     # BaseHTTPRequestHandler log lines include the raw request target, so
     # EventSource/pairing URLs such as /events?token=... otherwise persist the
     # bearer token in journalctl. `context` is covered too: current clients
     # send chat context in a header, but an older client putting it in the
-    # URL must not land private chat text in the journal.
-    return re.sub(
-        r"([?&](?:token|pair|access_token|auth|authorization|context)=)([^\s&]+)",
-        r"\1[REDACTED]",
-        text,
-        flags=re.IGNORECASE,
-    )
+    # URL must not land private chat text in the journal. Names are matched
+    # after percent/plus decoding, exactly as parse_qs sees them, so
+    # `?%74oken=` cannot slip past.
+    def _sub(m: "re.Match[str]") -> str:
+        name = urllib.parse.unquote_plus(m.group(2)).strip().lower()
+        if name in _SENSITIVE_QUERY_NAMES:
+            return f"{m.group(1)}{m.group(2)}=[REDACTED]"
+        return m.group(0)
+
+    return _QUERY_PARAM_RE.sub(_sub, text)
 
 
-def regenerate_token(*, log_new_token: bool = True) -> str:
+def regenerate_token(*, log_new_token: bool = True, require_persist: bool = False) -> str:
     """Rotate the bearer token unconditionally (wizard --force / rotation)."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with _token_lock:
@@ -916,7 +1077,7 @@ def regenerate_token(*, log_new_token: bool = True) -> str:
             log.warning(f"Could not remove existing token file: {e}")
         _token_cache["value"] = ""
         _token_cache["loaded"] = False
-    return ensure_token(log_new_token=log_new_token)
+    return ensure_token(log_new_token=log_new_token, require_persist=require_persist)
 
 
 def _is_loopback_address(addr: str) -> bool:
@@ -952,7 +1113,48 @@ def _origin_allowed(origin: str) -> bool:
     return needle in CORS_ALLOWLIST
 
 
+def _allowed_origin_list() -> list[str]:
+    """CORS allowlist as `scheme://host` strings (port-insensitive), or ["*"]."""
+    if CORS_ALLOW_WILDCARD:
+        return ["*"]
+    return [f"{scheme}://[{host}]" if ":" in host else f"{scheme}://{host}"
+            for scheme, host in CORS_ALLOWLIST]
 
+
+def _frame_ancestors_csp() -> str:
+    """`frame-ancestors` limited to self plus the CORS allowlist (any port)."""
+    if CORS_ALLOW_WILDCARD:
+        return "frame-ancestors *"
+    sources = ["'self'"] + [f"{o}:*" for o in _allowed_origin_list()]
+    return "frame-ancestors " + " ".join(sources)
+
+
+# Static phone-shell variants, computed once per process per distinct HTML
+# string: (raw bytes, gzip bytes, strong ETag).
+_static_html_cache: dict[str, tuple[bytes, bytes, str]] = {}
+_static_html_lock = threading.Lock()
+
+
+def _static_html_variant(html: str) -> tuple[bytes, bytes, str]:
+    with _static_html_lock:
+        hit = _static_html_cache.get(html)
+    if hit is not None:
+        return hit
+    raw = html.encode()
+    variant = (raw, gzip.compress(raw, mtime=0),
+               '"' + hashlib.sha256(raw).hexdigest()[:32] + '"')
+    with _static_html_lock:
+        _static_html_cache[html] = variant
+    return variant
+
+
+def _accepts_gzip(header: str) -> bool:
+    for part in (header or "").split(","):
+        coding, _, params = part.strip().partition(";")
+        if coding.strip().lower() in ("gzip", "*"):
+            q = params.strip().lower()
+            return not (q.startswith("q=") and q[2:].strip() in ("0", "0.0", "0.00", "0.000"))
+    return False
 
 
 # ─── HTTP Handler ─────────────────────────────────────────
@@ -984,9 +1186,21 @@ class _TLSThreadingHTTPServer(http.server.ThreadingHTTPServer):
     every other connection. Here the accepted socket is wrapped with
     `do_handshake_on_connect=False`; the handler finishes the handshake in
     its own thread under a socket timeout (`DictationHandler.setup`).
+
+    Admission (SEC-03): at most `config.MAX_HANDLER_THREADS` handler threads
+    run at once. An SSE stream hands its slot back once subscribed (SSE has
+    its own cap, `config.MAX_SSE_SUBSCRIBERS`). Over the cap the connection
+    is refused on the accept thread without spawning a handler: plain HTTP
+    gets a best-effort 503, TLS is closed (no handshake is spent on it).
     """
     ssl_context: "ssl.SSLContext | None" = None
     daemon_threads = True
+
+    def __init__(self, *args, **kwargs):
+        self._slots = threading.BoundedSemaphore(max(1, config.MAX_HANDLER_THREADS))
+        self._held: set[int] = set()
+        self._held_lock = threading.Lock()
+        super().__init__(*args, **kwargs)
 
     def get_request(self):
         sock, addr = self.socket.accept()
@@ -995,6 +1209,42 @@ class _TLSThreadingHTTPServer(http.server.ThreadingHTTPServer):
                 sock, server_side=True, do_handshake_on_connect=False,
             )
         return sock, addr
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            log.warning("Connection cap (%d) reached; refusing %s",
+                        config.MAX_HANDLER_THREADS, client_address[0])
+            if not isinstance(request, ssl.SSLSocket):
+                try:
+                    request.settimeout(0)
+                    request.send(b"HTTP/1.1 503 Service Unavailable\r\n"
+                                 b"Content-Length: 0\r\nConnection: close\r\n"
+                                 b"Retry-After: 1\r\n\r\n")
+                except OSError:
+                    pass
+            self.shutdown_request(request)
+            return
+        with self._held_lock:
+            self._held.add(id(request))
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.release_slot(request)
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.release_slot(request)
+
+    def release_slot(self, request) -> None:
+        """Return `request`'s handler slot (idempotent)."""
+        with self._held_lock:
+            if id(request) not in self._held:
+                return
+            self._held.discard(id(request))
+        self._slots.release()
 
 
 class DictationHandler(http.server.BaseHTTPRequestHandler):
@@ -1146,24 +1396,15 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         # OPTIONS preflight handled separately (no auth needed for CORS probes)
         if self.command == "OPTIONS":
             return True
-        # SSE (/events) and legacy cert pairing (/pair) accept ?token=<token>
-        # because browser EventSource cannot set headers. Phone bootstrap URLs
-        # use a separate short-lived code and never carry this durable bearer.
-        # TODO: revisit query-param auth once we support a secure cookie flow.
-        if path in ("/events", "/pair"):
+        # SSE (/events) accepts ?token=<token> because browser EventSource
+        # cannot set headers. Phone bootstrap URLs use a separate short-lived
+        # code and never carry this durable bearer.
+        if path == "/events":
             qs = urllib.parse.parse_qs(parsed.query)
             qtok = qs.get("token", [""])[0]
             if _token_matches(qtok, get_token()):
                 return True
-            # Header-bearer fall-through is allowed for /pair (phone may
-            # send Authorization: Bearer instead of ?token=).
-            if path == "/pair":
-                auth = self.headers.get("Authorization", "")
-                if auth.startswith("Bearer "):
-                    presented = auth[len("Bearer "):].strip()
-                    if _token_matches(presented, get_token()):
-                        return True
-            self._send_unauthorized("token required (query param or Bearer header)")
+            self._send_unauthorized("token required (query param)")
             return False
         # Bearer header
         auth = self.headers.get("Authorization", "")
@@ -1187,11 +1428,37 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         except Exception:
             pass
 
+    def send_response(self, code, message=None):
+        self._response_started = True
+        super().send_response(code, message)
+
+    def _guarded(self, dispatch) -> None:
+        """Run a route dispatcher; an unexpected exception becomes a JSON 500.
+
+        If the failure happens after the response began, the connection is
+        closed instead of appending a second response.
+        """
+        self._response_started = False
+        try:
+            dispatch()
+        except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
+            raise
+        except Exception as e:
+            log.exception("Unhandled error on %s %s", self.command,
+                          urllib.parse.urlparse(self.path).path)
+            if getattr(self, "_response_started", False):
+                self.close_connection = True
+                return
+            self.send_error_json(f"Server error: {e.__class__.__name__}",
+                                 code="server_error", status=500, retry_ok=True)
+
     def send_json(self, data: dict, status: int = 200):
         body = json.dumps(data).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        # API payloads (tokens, pairing codes, transcripts) are never cacheable.
+        self.send_header("Cache-Control", "no-store")
         self._set_cors_origin()
         self.end_headers()
         self.wfile.write(body)
@@ -1236,51 +1503,99 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         except Exception:
             pass
 
-    def send_html(self, html: str):
-        body = html.encode()
+    def _send_ui_security_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", _frame_ancestors_csp())
+
+    def send_html(self, html: str, *, static: bool = False):
+        """Serve an HTML document with the UI security headers.
+
+        `static=True` marks the unmodified phone shell: it is revalidated by
+        ETag (304 on match) and gzipped when accepted, both precomputed once
+        per process. Everything else (pairing/bootstrap, per-request embed
+        config) is `no-store` and sent uncompressed.
+        """
+        if not static:
+            body = html.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self._send_ui_security_headers()
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        raw, gz, etag = _static_html_variant(html)
+        inm = self.headers.get("If-None-Match", "") or ""
+        if etag in [t.strip().removeprefix("W/") for t in inm.split(",")]:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "private, no-cache")
+            self.send_header("Vary", "Accept-Encoding")
+            self.end_headers()
+            return
+        use_gzip = _accepts_gzip(self.headers.get("Accept-Encoding", ""))
+        body = gz if use_gzip else raw
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        if use_gzip:
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "private, no-cache")
+        self.send_header("Vary", "Accept-Encoding")
+        self._send_ui_security_headers()
         self.end_headers()
         self.wfile.write(body)
+
+    # Seconds between `event: ping` frames on an SSE stream (contract: 15 s).
+    sse_ping_interval = 15.0
 
     def _handle_sse_stream(self):
         """Phase 2 — SSE stream at GET /events.
 
         Writes event-stream headers, then blocks reading from our dedicated
-        subscriber queue. 15s comment heartbeats keep intermediaries from
-        timing out the connection. Exits cleanly on any socket error.
+        subscriber queue. Every `sse_ping_interval` seconds a comment
+        heartbeat plus a named `event: ping` ({"ts": epoch}) frame is sent so
+        clients can detect a dead stream. Exits cleanly on any socket error.
+        Over the subscriber cap the request gets a 503 JSON error.
         """
-        # Headers
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache, no-transform")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("X-Accel-Buffering", "no")  # hint for any reverse proxy
-        self._set_cors_origin()
-        self.end_headers()
-
         sub = subscribe_events()
-        # Opening event so clients can confirm the pipe is live.
+        if sub is None:
+            self.send_error_json("Too many event-stream subscribers",
+                                 code="sse_capacity", status=503, retry_ok=True)
+            return
+        # SSE is long-lived and counted by its own cap; hand the handler slot back.
+        release = getattr(self.server, "release_slot", None)
+        if release is not None:
+            release(self.request)
         try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")  # hint for any reverse proxy
+            self._set_cors_origin()
+            self.end_headers()
+            # Opening event so clients can confirm the pipe is live.
             self.wfile.write(b"event: ready\ndata: {}\n\n")
             self.wfile.flush()
-        except Exception:
-            unsubscribe_events(sub)
-            return
 
-        heartbeat_interval = 15.0
-        try:
+            next_ping = time.monotonic() + self.sse_ping_interval
             while True:
-                try:
-                    evt = sub.get(timeout=heartbeat_interval)
-                except queue.Empty:
-                    # Heartbeat — SSE comment lines start with ':'
+                wait = next_ping - time.monotonic()
+                evt = None
+                if wait > 0:
                     try:
-                        self.wfile.write(b": heartbeat\n\n")
-                        self.wfile.flush()
-                    except Exception:
-                        break
+                        evt = sub.get(timeout=wait)
+                    except queue.Empty:
+                        pass
+                if evt is None:
+                    ping = json.dumps({"ts": time.time()})
+                    self.wfile.write(f": heartbeat\n\nevent: ping\ndata: {ping}\n\n".encode())
+                    self.wfile.flush()
+                    next_ping = time.monotonic() + self.sse_ping_interval
                     continue
 
                 event_type, payload = evt
@@ -1289,13 +1604,10 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 except Exception as e:
                     log.warning("SSE payload not JSON-serializable: %s", e)
                     continue
-                frame = f"event: {event_type}\ndata: {data}\n\n".encode("utf-8")
-                try:
-                    self.wfile.write(frame)
-                    self.wfile.flush()
-                except Exception:
-                    # Client disconnected.
-                    break
+                self.wfile.write(f"event: {event_type}\ndata: {data}\n\n".encode("utf-8"))
+                self.wfile.flush()
+        except OSError:
+            pass  # client disconnected
         finally:
             unsubscribe_events(sub)
 
@@ -1494,6 +1806,9 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             "mode": mode or None,
             "formatter_model": formatter_model or None,
             "language": language,
+            # Parent frames the embedded page may exchange messages with:
+            # `scheme://host` (any port), or ["*"] under wildcard CORS.
+            "allowedOrigins": _allowed_origin_list(),
         }
         # Values are user-supplied query params: escape "<" so a crafted
         # ?chat=</script><script>… link can't break out of the script tag.
@@ -1513,7 +1828,10 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         """
         pairing_code = query.get("pair", [""])[0]
         if self._request_is_privileged() or pairing_code_is_valid(pairing_code):
-            self.send_html(self._render_html_with_embed(query))
+            html = self._render_html_with_embed(query)
+            # Only the unmodified shell at a bare `/` is cacheable; any query
+            # (pairing code, legacy token, embed config) stays no-store.
+            self.send_html(html, static=(html is WEB_UI and not query))
         else:
             self.send_html(PAIRING_BOOTSTRAP_HTML)
 
@@ -1529,14 +1847,70 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             "formatter_provider": "omniroute",
             "formatter_models": selectable_models(),
             "mode_count": len(load_modes()),
+            "revision": INSTALL_REVISION or "checkout",
         }
         if days is not None:
             payload["cert_expires_days"] = days
         return payload
 
+    @staticmethod
+    def _state_chat(state_snap: dict, last_n: int) -> "tuple[list[dict], bool] | None":
+        """Exact chat named by a FRESH ST state snapshot, else None (F5)."""
+        if not state_snap.get("fresh") or not state_snap.get("chatId"):
+            return None
+        return ChatReader.read_state_chat(state_snap, last_n)
+
+    def _read_chat_source(self, chat_type: str, chat_name: str,
+                          last_n: int) -> tuple[list[dict], bool]:
+        """Messages for a `type:name` chat source.
+
+        When the source is the chat a fresh ST state names (`chatId`), the
+        exact file is resolved from that state; otherwise — or when it cannot
+        be resolved — the name-based lookup is used.
+        """
+        chat_type = chat_type if chat_type in ("solo", "individual", "group") else "individual"
+        snap = snapshot_state()
+        if chat_name and str(snap.get("chatId") or "") == chat_name:
+            state_type = str(snap.get("chatType") or "individual")
+            if (state_type == "group") == (chat_type == "group"):
+                resolved = self._state_chat(snap, last_n)
+                if resolved is not None:
+                    return resolved
+        legacy_type = "group" if chat_type == "group" else "individual"
+        return ChatReader.read_chat_messages(chat_name, legacy_type, last_n=last_n), legacy_type == "group"
+
+    def _send_active_chat(self, name: str, chat_type: str, messages: list[dict],
+                          group_id: str = "") -> None:
+        is_group = chat_type == "group"
+        context_text = ContextBuilder.format_messages(messages, is_group=is_group)
+        # POL-6 — chatType normalised to solo/group + optional group payload
+        # (members + last speaker). `type` stays `individual`/`group` for
+        # legacy consumers; the normalised value lives on `chatType`.
+        payload: dict = {
+            "name": name,
+            "type": chat_type,
+            "chatType": "group" if is_group else "solo",
+            "messages": messages,
+            "context_text": context_text,
+        }
+        if is_group:
+            if not group_id:
+                for g in ChatReader._load_group_defs():
+                    if g.get("name", "") == name:
+                        group_id = str(g.get("id", "") or "")
+                        break
+            if group_id:
+                payload["groupId"] = group_id
+                payload["groupMembers"] = ChatReader.group_member_objects(group_id)
+                payload["lastSpeaker"] = ChatReader.get_group_last_speaker(group_id)
+        self.send_json(payload)
+
     def do_GET(self):
         if not self.require_auth():
             return
+        self._guarded(self._dispatch_get)
+
+    def _dispatch_get(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
@@ -1601,6 +1975,21 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             ]
             self.send_json({"chats": safe_chats})
         elif path == "/active-chat":
+            # `?use_state=1`: the chat the fresh ST state names, not the
+            # newest-mtime guess (same resolution as /transcribe use_state=1).
+            if query.get("use_state", ["0"])[0] == "1":
+                snap = snapshot_state()
+                resolved = self._state_chat(snap, CHAT_CONTEXT_WINDOW)
+                if resolved is not None:
+                    messages, is_group = resolved
+                    group_id = str(snap.get("groupId") or "") if is_group else ""
+                    name = str(snap.get("characterName") or snap.get("chatId") or "")
+                    if is_group:
+                        name = next((str(g.get("name", "")) for g in ChatReader._load_group_defs()
+                                     if str(g.get("id", "")) == group_id), "") or name
+                    self._send_active_chat(name, "group" if is_group else "individual",
+                                           messages, group_id)
+                    return
             active = ChatReader.get_active_chat()
             if not active:
                 self.send_json({"error": "No active chats found"})
@@ -1608,31 +1997,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 messages = ChatReader.read_chat_messages(
                     active["name"], active["type"], last_n=CHAT_CONTEXT_WINDOW
                 )
-                is_group = active["type"] == "group"
-                context_text = ContextBuilder.format_messages(messages, is_group=is_group)
-                # POL-6 — chatType normalised to solo/group + optional
-                # group payload (members + last speaker). `type` is
-                # preserved as-is (`individual`/`group`) for legacy
-                # consumers; normalised value lives on `chatType`.
-                payload: dict = {
-                    "name": active["name"],
-                    "type": active["type"],
-                    "chatType": "group" if is_group else "solo",
-                    "messages": messages,
-                    "context_text": context_text,
-                }
-                if is_group:
-                    # Resolve group_id from the active chat's name.
-                    group_id = ""
-                    for g in ChatReader._load_group_defs():
-                        if g.get("name", "") == active["name"]:
-                            group_id = str(g.get("id", "") or "")
-                            break
-                    if group_id:
-                        payload["groupId"] = group_id
-                        payload["groupMembers"] = ChatReader.group_member_objects(group_id)
-                        payload["lastSpeaker"] = ChatReader.get_group_last_speaker(group_id)
-                self.send_json(payload)
+                self._send_active_chat(active["name"], active["type"], messages)
         elif path == "/chat-context":
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             chat_name = qs.get("name", [""])[0]
@@ -1648,8 +2013,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             if not chat_name:
                 self.send_error_json("Missing 'name' parameter", code="missing_param", status=400)
             else:
-                messages = ChatReader.read_chat_messages(chat_name, chat_type, last_n=last_n)
-                is_group = chat_type == "group"
+                messages, is_group = self._read_chat_source(chat_type, chat_name, last_n)
                 context_text = ContextBuilder.format_messages(messages, is_group=is_group)
                 self.send_json({
                     "name": chat_name,
@@ -1704,6 +2068,9 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
     def do_DELETE(self):
         if not self.require_auth():
             return
+        self._guarded(self._dispatch_delete)
+
+    def _dispatch_delete(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
@@ -1723,7 +2090,8 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                             if e.get("chat_id", "") != chat_filter or e.get("starred")
                         ]
                     cleared = before - len(keep)
-                    kept = len([e for e in session_transcript
+                    # Starred entries of this chat that survived the clear.
+                    kept = len([e for e in keep
                                 if e.get("chat_id", "") == chat_filter and e.get("starred")])
                     session_transcript[:] = keep
                 elif wipe_all:
@@ -1791,6 +2159,9 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.require_auth():
             return
+        self._guarded(self._dispatch_post)
+
+    def _dispatch_post(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         params = urllib.parse.parse_qs(parsed.query)
@@ -1801,7 +2172,12 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         if self._reject_oversized_body(body_limit):
             return
 
-        if path == "/pair/bootstrap":
+        if path == "/warm":
+            # Fire-and-forget from clients the moment capture starts: boot
+            # whisper-server in the background so it is warm by upload time.
+            status = prewarm_whisper()
+            self.send_json({"status": status}, status=200 if status == "ready" else 202)
+        elif path == "/pair/bootstrap":
             # Loopback normally bypasses auth, but minting a transferable phone
             # credential always requires the valid durable bearer in the header.
             token = self._request_bearer_token()
@@ -1858,7 +2234,7 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             try:
                 alts = word_alternatives(word, context=ctx, character_id=char)
             except Exception as e:
-                log.exception("word_alternatives failed for %r", word)
+                log.exception("word_alternatives failed (word_len=%d)", len(word))
                 self.send_error_json(f"Server error: {e}",
                                      code="server_error", status=500)
                 return
@@ -1963,44 +2339,6 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 self.send_error_json(str(e), code="bad_mode_formatter", status=400)
                 return
             self.send_json({"mode": updated})
-        elif path == "/pair":
-            # MVP-19 Stage 6 — phone pairing handshake. Phone scans the QR
-            # rendered by the wizard, posts back token+fingerprint to confirm
-            # both that it could reach the server AND that it pinned the
-            # right cert. A `pair-success` SSE event signals the wizard.
-            #
-            # Auth: require_auth() above already gated bearer token (header
-            # or `?token=` query param via the /pair exemption in
-            # _AUTH_QUERY_TOKEN_PATHS). Here we additionally verify the
-            # `fingerprint` query param matches our live cert — protects
-            # against a token-leaked-over-screenshot replay against a
-            # different (compromised) box.
-            qs_fp = (params.get("fingerprint") or [""])[0].strip()
-            server_fp = cert_fingerprint_sha256() or ""
-            # Normalize: strip colons + uppercase for compare; the QR
-            # encodes whichever form, the server is canonical.
-            def _norm_fp(s: str) -> str:
-                return re.sub(r"[^0-9A-Fa-f]", "", s).upper()
-            if not server_fp:
-                self.send_error_json(
-                    "Server has no cert to pair against",
-                    code="no_cert", status=503, retry_ok=False,
-                )
-                return
-            if _norm_fp(qs_fp) != _norm_fp(server_fp):
-                self.send_error_json(
-                    "Cert fingerprint mismatch — phone pinned the wrong cert",
-                    code="fingerprint_mismatch", status=400, retry_ok=False,
-                )
-                return
-            payload = {
-                "ts": time.time(),
-                "client": self._client_addr(),
-                "ua": str(self.headers.get("User-Agent", ""))[:200],
-            }
-            broadcast_event("pair-success", payload)
-            log.info(f"Phone paired: {payload['client']} ({payload['ua'][:60]})")
-            self.send_json({"status": "paired", **payload})
         elif path.startswith("/transcript/") and path.endswith("/star"):
             # POST /transcript/<entry_id>/star — toggle starred on one entry
             mid = path[len("/transcript/"):-len("/star")]
@@ -2103,9 +2441,10 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
     def _handle_tts_audiobook(self) -> None:
         """POST /tts/audiobook — synthesize a chat transcript into one WAV.
 
-        Body: {title?, narratorVoice?, voiceMap?, messages:[{name?, text, voice?, is_user?}]}.
-        Each message is synthesized independently, then PCM-compatible WAV
-        segments are joined with short silence between turns.
+        Body: {title?, narratorVoice?, voiceMap?, messages:[{name?, text, voice?}]}.
+        Each message is synthesized independently (messages over the per-call
+        cap become several segments), then PCM-compatible WAV segments are
+        joined with short silence between them.
         """
         try:
             body = self.read_json_body()
@@ -2258,25 +2597,32 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         self.send_json({"vocab": vocab, "added": norm})
 
     def _build_chat_context(self, chat_source: str) -> str:
-        """Build context string from ST chat history."""
+        """Build context string from ST chat history.
+
+        `auto` uses the exact chat a fresh ST state names and falls back to
+        the newest-mtime chat; `type:name` sources go through
+        `_read_chat_source` (state-exact when `name` is the state's chat).
+        """
         if chat_source == "auto":
-            active = ChatReader.get_active_chat()
-            if not active:
-                return ""
-            messages = ChatReader.read_chat_messages(
-                active["name"], active["type"], last_n=CHAT_CONTEXT_WINDOW
-            )
-            is_group = active["type"] == "group"
+            resolved = self._state_chat(snapshot_state(), CHAT_CONTEXT_WINDOW)
+            if resolved is not None:
+                messages, is_group = resolved
+            else:
+                active = ChatReader.get_active_chat()
+                if not active:
+                    return ""
+                messages = ChatReader.read_chat_messages(
+                    active["name"], active["type"], last_n=CHAT_CONTEXT_WINDOW
+                )
+                is_group = active["type"] == "group"
         else:
             # Format: "type:name"
             parts = chat_source.split(":", 1)
             if len(parts) != 2:
                 return ""
             chat_type, chat_name = parts
-            messages = ChatReader.read_chat_messages(
-                chat_name, chat_type, last_n=CHAT_CONTEXT_WINDOW
-            )
-            is_group = chat_type == "group"
+            messages, is_group = self._read_chat_source(
+                chat_type, chat_name, CHAT_CONTEXT_WINDOW)
 
         if not messages:
             return ""
@@ -2286,6 +2632,8 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         """Re-run pipeline on previously transcribed text.
 
         Supports both legacy `rp=0|1|2` and new `mode=<id>`. `mode` wins.
+        Runs the pipeline with `reformat=True` (no hallucination filter or
+        voice-command dispatch) scoped to the request's chat.
         """
         params = params or {}
         try:
@@ -2294,14 +2642,21 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             self.send_error_json("Invalid JSON", code="bad_json", status=400)
             return
 
-        text = data.get("text", "")
-        if not isinstance(text, str):
-            text = str(text or "")
+        try:
+            text = _json_str(data, "text")
+            mode_id = (_json_str(data, "mode") or params.get("mode", [""])[0] or "").strip()
+            formatter_model = _json_str(data, "formatter_model").strip()
+            context = clamp_request_context(_json_str(data, "context"))
+            chat_source = _json_str(data, "chat_source").strip()
+            persona_id = _json_str(data, "persona").strip()
+            character_id = canonical_character_key(_json_str(data, "character"))
+            scene_continuity = _json_str(data, "sceneContinuity")[:2000]
+            entry_id = _json_str(data, "entry_id").strip() or None
+            request_chat_id = _json_str(data, "chat_id").strip()
+        except ValueError as e:
+            self.send_error_json(str(e), code="bad_input", status=400)
+            return
         persist_transcript = data.get("persist_transcript", True) is not False
-        # Mode resolution: body wins over query; then legacy rp.
-        mode_id = (data.get("mode")
-                   or params.get("mode", [""])[0]
-                   or "").strip()
         rp_raw = data.get("rp")
         if rp_raw is None:
             rp_raw = params.get("rp", [None])[0]
@@ -2312,26 +2667,28 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
         mode = resolve_mode(rp=rp_int, mode_id=mode_id)
         # Clients may still send a legacy `provider` field; OmniRoute is the
         # only formatter route, so it is ignored.
-        formatter_model = str(data.get("formatter_model") or "").strip()
         if formatter_model and formatter_model not in selectable_models():
             self.send_error_json(
                 f"Model '{formatter_model}' is not selectable on OmniRoute",
                 code="bad_formatter_model", status=400,
             )
             return
-
-        context = clamp_request_context(data.get("context", ""))
-        chat_source = data.get("chat_source", "")
-        persona_id = data.get("persona", "")
-        character_id = canonical_character_key(data.get("character", ""))
-        scene_continuity = str(data.get("sceneContinuity") or "")[:2000]
         use_rules = bool(data.get("rules", False))
         prose_format = bool(data.get("prose", False))
 
-        if not scene_continuity:
-            state_snap = snapshot_state()
-            if state_snap.get("fresh"):
-                scene_continuity = str(state_snap.get("sceneContinuity") or "")[:2000]
+        # One snapshot for the whole request (never read under transcript_lock).
+        # Its scene continuity and chat id apply only when this reformat is
+        # for the state's chat; an explicit other chat is never mixed in.
+        state_snap = snapshot_state()
+        state_fresh = bool(state_snap.get("fresh"))
+        state_chat_id = str(state_snap.get("chatId") or "") if state_fresh else ""
+        on_state_chat = (
+            _source_is_state_chat(chat_source, state_chat_id, state_usable=state_fresh)
+            and request_chat_id in ("", state_chat_id)
+        )
+        if not scene_continuity and on_state_chat:
+            scene_continuity = str(state_snap.get("sceneContinuity") or "")[:2000]
+        chat_id = request_chat_id or (state_chat_id if on_state_chat else "")
 
         # Build chat context if source is not manual
         chat_context = ""
@@ -2364,14 +2721,15 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             })
             return
 
-        # Walk backwards and replace the most recent user entry (leave context entries intact).
-        # Phase 3: optional targeted replacement by entry_id.
-        entry_id = data.get("entry_id")
-        if isinstance(entry_id, str):
-            entry_id = entry_id.strip() or None
-        else:
-            entry_id = None
+        pipeline_steps = mode.get("pipeline", [])
+        is_enhancement = any(s in pipeline_steps for s in ("rp_enhance", "persona_pov"))
+        will_persist = persist_transcript and is_enhancement
 
+        # Resolve the target entry BEFORE the LLM call (SC-04). A targeted
+        # request must name an existing user entry; a legacy no-ID
+        # regeneration targets the newest user entry *now*, so a take that
+        # lands while the formatter runs is never the one replaced.
+        append_new = False
         if persist_transcript and entry_id is not None:
             with transcript_lock:
                 target_ok = any(
@@ -2384,6 +2742,12 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                     code="entry_not_found", status=404, retry_ok=False,
                 )
                 return
+        elif will_persist:
+            with transcript_lock:
+                newest = next((e for e in reversed(session_transcript)
+                               if e.get("role") == "user"), None)
+                entry_id = newest.get("id") if newest is not None else None
+            append_new = entry_id is None
 
         # Run pipeline (I/O; don't hold the lock).
         formatted, formatting_skipped, formatting_reason, cleaned_text = run_pipeline(
@@ -2396,15 +2760,15 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             use_rules=use_rules,
             prose_format=prose_format,
             formatter_model=formatter_model,
+            chat_id=chat_id,
+            reformat=True,
         )
 
         # Only append / replace in transcript for enhancement-style modes that succeeded.
-        pipeline_steps = mode.get("pipeline", [])
-        is_enhancement = any(s in pipeline_steps for s in ("rp_enhance", "persona_pov"))
         result_entry_id: str | None = None
         chat_id_tag = ""
         with transcript_lock:
-            if persist_transcript and is_enhancement and not formatting_skipped:
+            if will_persist and not formatting_skipped:
                 # Re-resolve by id: the lock was released for the LLM call and
                 # a concurrent delete/append may have shifted indices since.
                 existing = None
@@ -2415,40 +2779,28 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                         None,
                     )
                 if existing is not None:
-                    # In-place replacement: keep id + starred, update text + timestamp.
+                    # In-place replacement keeps id, starred and chat tag.
                     existing["text"] = formatted
                     existing["timestamp"] = datetime.now().isoformat()
-                    # starred is preserved implicitly (dict mutation)
                     result_entry_id = existing.get("id")
-                elif entry_id is not None:
-                    # The requested entry was deleted while the formatter ran.
-                    # Persist nothing: popping "the newest user entry" here
-                    # would delete an unrelated message. The caller still gets
-                    # the formatted text in the response.
-                    log.info("reformat: entry %s vanished during formatting; not persisted", entry_id)
-                else:
-                    # Legacy regeneration without an entry id replaces the most
-                    # recent user entry only after formatting succeeds. The old
-                    # flow popped it before the network call, losing the message
-                    # whenever every formatter model failed or timed out.
-                    for i in range(len(session_transcript) - 1, -1, -1):
-                        if session_transcript[i]["role"] == "user":
-                            session_transcript.pop(i)
-                            break
-                    # If the user has a fresh ST state, tag new reformat entries with
-                    # that chat id so per-chat filtering works.
-                    _st_snap = snapshot_state()
-                    chat_id_tag = _st_snap.get("chatId", "") if _st_snap.get("fresh") else ""
+                    chat_id_tag = str(existing.get("chat_id", "") or "")
+                elif append_new:
                     new_entry = {
                         "id": _new_entry_id(),
                         "role": "user",
                         "text": formatted,
                         "timestamp": datetime.now().isoformat(),
                         "starred": False,
-                        "chat_id": chat_id_tag,
+                        "chat_id": chat_id,
                     }
                     session_transcript.append(new_entry)
                     result_entry_id = new_entry["id"]
+                    chat_id_tag = chat_id
+                else:
+                    # The target was deleted while the formatter ran. Persist
+                    # nothing rather than overwrite an unrelated entry; the
+                    # caller still gets the formatted text.
+                    log.info("reformat: entry %s vanished during formatting; not persisted", entry_id)
             transcript_count = len(session_transcript)
 
         repair_trace = build_repair_trace(text, cleaned_text, formatted)
@@ -2523,28 +2875,36 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
 
         # Phase 3: fill in blanks from state when `use_state=1` and state is fresh.
         # Explicit params always take precedence over state (manual override wins).
+        # Cast (persona/character, and mode above) may come from state for any
+        # source; the chat's own data (last AI message, scene continuity, chat
+        # tag) only when the effective source IS the state's chat — otherwise
+        # an explicit other chat would be mixed with the ST tab's chat.
+        state_chat_id = str(state_snap.get("chatId") or "") if (use_state and state_fresh) else ""
         if use_state and state_fresh:
             if not persona_id:
                 persona_id = state_snap.get("personaId", "")
             if not character_id:
                 character_id = state_snap.get("characterId", "")
+            if not chat_source and state_chat_id:
+                ctype = state_snap.get("chatType", "individual") or "individual"
+                chat_source = f"{ctype}:{state_chat_id}"
+        character_id = canonical_character_key(character_id)
+        on_state_chat = _source_is_state_chat(chat_source, state_chat_id,
+                                              state_usable=use_state and state_fresh)
+        if on_state_chat:
             if not context and state_snap.get("lastAiMessage"):
                 context = state_snap["lastAiMessage"]
-            if not chat_source and state_snap.get("chatId"):
-                ctype = state_snap.get("chatType", "individual") or "individual"
-                chat_source = f"{ctype}:{state_snap['chatId']}"
             scene_continuity = str(state_snap.get("sceneContinuity") or "")[:2000]
-        character_id = canonical_character_key(character_id)
 
-        # chat_id tag for per-chat transcript filtering (Phase 3)
-        chat_id_for_entry = ""
-        if state_fresh and state_snap.get("chatId"):
-            chat_id_for_entry = state_snap["chatId"]
+        # chat_id tag for per-chat transcript filtering (Phase 3): the chat
+        # this take belongs to, never the state's chat for an explicit other one.
+        chat_id_for_entry = _chat_id_for_source(chat_source, state_chat_id)
 
         # Build chat context if source is not manual
         chat_context = ""
         if chat_source and chat_source != "manual":
             chat_context = self._build_chat_context(chat_source)
+        timing["context"] = time.monotonic()
 
         # Read audio body (do_POST has already 400/413'd malformed or
         # oversized Content-Length; re-check defensively).
@@ -2561,44 +2921,41 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 code="payload_too_large", status=413,
             )
             return
+        content_type = self.headers.get("Content-Type", "")
+        container = audio_container(content_type)
+        if container is None:
+            # The body stays unread: drop the connection after replying.
+            self.close_connection = True
+            self.send_error_json(
+                "Unsupported audio type (send audio/webm, audio/mp4, audio/ogg or audio/wav)",
+                code="unsupported_media_type", status=415,
+            )
+            return
 
         audio_data = self.rfile.read(content_length)
-        content_type = self.headers.get("Content-Type", "")
+        timing["upload"] = time.monotonic()
 
         tmp_input = None
         tmp_wav = None
+        audio_s = 0.0
         try:
-            # Save the uploaded audio
-            suffix = ".webm" if "webm" in content_type else ".wav"
+            # Every accepted container (WAV included) is normalized by ffmpeg
+            # to 16 kHz mono PCM; the upload file is removed right after.
             tmp_input = tempfile.NamedTemporaryFile(
-                prefix="dictation-", suffix=suffix, dir="/tmp", delete=False
+                prefix="dictation-", suffix=f".{container}", dir="/tmp", delete=False
             )
             tmp_input.write(audio_data)
             tmp_input.close()
-
-            # Convert to WAV (16kHz mono) if not already WAV
-            wav_path = tmp_input.name
-            if suffix != ".wav":
-                tmp_wav = tempfile.NamedTemporaryFile(
-                    prefix="dictation-", suffix=".wav", dir="/tmp", delete=False
-                )
-                tmp_wav.close()
-                wav_path = tmp_wav.name
-
-                ffmpeg_cmd = [
-                    "ffmpeg", "-y", "-i", tmp_input.name,
-                    "-ar", "16000", "-ac", "1", "-f", "wav",
-                    wav_path,
-                ]
-                result = subprocess.run(
-                    ffmpeg_cmd, capture_output=True, text=True, timeout=30
-                )
-                if result.returncode != 0:
-                    self.send_error_json(
-                        f"Audio conversion failed: {result.stderr[:200]}",
-                        code="ffmpeg_failed", status=500,
-                    )
-                    return
+            del audio_data
+            tmp_wav = tempfile.NamedTemporaryFile(
+                prefix="dictation-", suffix=".wav", dir="/tmp", delete=False
+            )
+            tmp_wav.close()
+            wav_path = Path(tmp_wav.name)
+            try:
+                audio_s = normalize_audio(Path(tmp_input.name), wav_path, container)
+            finally:
+                Path(tmp_input.name).unlink(missing_ok=True)
 
             timing["ffmpeg"] = time.monotonic()
 
@@ -2613,18 +2970,25 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             # streamed deltas to the canonical final text.
             # MVP-16 also keys `dictation-state` events on this id so the
             # extension's state-machine bar can track which request is active.
-            request_id = secrets.token_urlsafe(8)
+            # A well-formed `client_request_id` lets the client own the id
+            # before the response arrives (cross-tab streaming ownership).
+            request_id = _request_id_from(params.get("client_request_id", [""])[0])
 
             # MVP-16 — handed off to whisper. Phone-side owns `listening`; we
             # never forge it from the server.
             self._emit_dictation_state(request_id, "transcribing")
 
-            # Transcribe (MVP-9: capture per-word confidences from whisper-server
-            # JSON for downstream "did you mean?" UI; empty list on subprocess fallback.
-            # MVP-10: language flows from ?language= query param; default 'en'.)
-            raw_text, word_confidences = transcribe_with_confidence(
-                Path(wav_path), model=model, prompt=whisper_prompt, language=language,
-            )
+            # Transcribe (MVP-9: per-word confidences from whisper-server
+            # verbose JSON; empty list on subprocess fallback. MVP-10:
+            # language flows from ?language=; default 'en'.) A boot of
+            # whisper-server stamps `whisper_boot` into `timing`.
+            try:
+                raw_text, word_confidences = transcribe_with_confidence(
+                    wav_path, model=model, prompt=whisper_prompt, language=language,
+                    timing=timing,
+                )
+            finally:
+                wav_path.unlink(missing_ok=True)
 
             timing["whisper"] = time.monotonic()
 
@@ -2691,13 +3055,16 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 formatter_model=formatter_model,
                 request_id=request_id,
                 timing=timing,
+                chat_id=chat_id_for_entry,
             )
 
             # Log to session transcript only for enhancement modes with success
+            entry_id = ""
             if is_enhancement and not formatting_skipped:
+                entry_id = _new_entry_id()
                 with transcript_lock:
                     session_transcript.append({
-                        "id": _new_entry_id(),
+                        "id": entry_id,
                         "role": "user",
                         "text": output_text,
                         "timestamp": datetime.now().isoformat(),
@@ -2733,28 +3100,6 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                     "ts": time.time(),
                 })
 
-            timing["respond"] = time.monotonic()
-
-            # POL-16 — single-line JSON timing trace; cumulative ms from `recv`.
-            try:
-                stages_ms = {
-                    k: round((v - timing["recv"]) * 1000)
-                    for k, v in timing.items() if k != "recv"
-                }
-                log.info("timing %s", json.dumps({
-                    "req": request_id,
-                    "mode": mode.get("id", ""),
-                    "stages_ms": stages_ms,
-                }))
-            except Exception as _e:
-                log.debug("timing log emit failed: %s", _e)
-
-            # MVP-16 — pipeline finished. Tells the state-machine bar to
-            # collapse; ST extension can now overwrite #send_textarea with
-            # the canonical text from the JSON response below (or from the
-            # `dictation-result` SSE event).
-            self._emit_dictation_state(request_id, "done")
-
             # POL-3 — low-confidence spans for the "did you mean?" overlay.
             # We anchor offsets into the post-pipeline `output_text` when one
             # exists (so the phone chips line up with what the user sees);
@@ -2772,6 +3117,32 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                     log.debug("compute_low_confidence_spans failed: %s", _e)
                     low_confidence_spans = []
 
+            timing["respond"] = time.monotonic()
+
+            # POL-16 — single-line JSON timing trace; cumulative ms from `recv`.
+            # `audio_s` is decoded duration (metadata only); `whisper_cold`
+            # marks a request that had to boot whisper-server.
+            try:
+                stages_ms = {
+                    k: round((v - timing["recv"]) * 1000)
+                    for k, v in timing.items() if k != "recv"
+                }
+                log.info("timing %s", json.dumps({
+                    "req": request_id,
+                    "mode": mode.get("id", ""),
+                    "audio_s": round(audio_s, 1),
+                    "whisper_cold": "whisper_boot" in timing,
+                    "stages_ms": stages_ms,
+                }))
+            except Exception as _e:
+                log.debug("timing log emit failed: %s", _e)
+
+            # MVP-16 — pipeline finished. Tells the state-machine bar to
+            # collapse; ST extension can now overwrite #send_textarea with
+            # the canonical text from the JSON response below (or from the
+            # `dictation-result` SSE event).
+            self._emit_dictation_state(request_id, "done")
+
             self.send_json({
                 "text": output_text,
                 "raw": raw_text,
@@ -2785,13 +3156,16 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 "model_fallback": attribution["fallback"],
                 "model_tier": attribution["tier"],
                 "chat_id": chat_id_for_entry or "",
+                # Transcript entry written for this take ("" when none);
+                # clients pass it back to /reformat to target this take.
+                "entry_id": entry_id,
                 # POL-1: tells the extension to re-prefix `OOC: ` so the aside
                 # is not pasted as an in-character line.
                 "is_ooc": is_ooc,
                 "mode_override": "ooc" if is_ooc else "",
                 # MVP-9: per-word confidences from whisper-server JSON output.
                 # Empty when subprocess fallback ran or response carried no
-                # token-level data. Phase 4 UI consumer not yet wired.
+                # token-level data.
                 "word_confidences": word_confidences,
                 # POL-3: words flagged as low-confidence + vocab alternatives.
                 # Empty list when whisper didn't emit token-level data, when
@@ -2802,6 +3176,13 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
                 "request_id": request_id,
             })
 
+        except FfmpegMissingError as e:
+            self.send_error_json(str(e), code="ffmpeg_missing", status=503, retry_ok=False)
+        except AudioTooLongError as e:
+            self.send_error_json(str(e), code="audio_too_long", status=413,
+                                 details={"max_seconds": config.MAX_AUDIO_SECONDS})
+        except AudioConversionError as e:
+            self.send_error_json(str(e), code="ffmpeg_failed", status=400)
         except FileNotFoundError as e:
             self._emit_dictation_state(locals().get("request_id", ""), "error",
                                        cls=e.__class__.__name__)
@@ -2811,11 +3192,18 @@ class DictationHandler(http.server.BaseHTTPRequestHandler):
             self._emit_dictation_state(locals().get("request_id", ""), "error",
                                        cls=e.__class__.__name__)
             self.send_error_json(str(e), code="whisper_failed", status=500, retry_ok=True)
+        except (BrokenPipeError, ConnectionResetError):
+            raise
         except Exception as e:
             self._emit_dictation_state(locals().get("request_id", ""), "error",
                                        cls=e.__class__.__name__)
             log.exception("Transcription error")
-            self.send_error_json(f"Server error: {e}", code="server_error", status=500)
+            if getattr(self, "_response_started", False):
+                # The response already began; a second one would corrupt it.
+                self.close_connection = True
+            else:
+                self.send_error_json(f"Server error: {e.__class__.__name__}",
+                                     code="server_error", status=500)
         finally:
             if tmp_input:
                 Path(tmp_input.name).unlink(missing_ok=True)
@@ -2911,13 +3299,14 @@ def _validate_cert_pair_for_hostname(cert: Path, key: Path, hostname: str) -> tu
     return True, ""
 
 
-def _install_cert_pair_with_rollback(tmp_crt: Path, tmp_key: Path) -> None:
+def _install_cert_pair_with_rollback(tmp_crt: Path, tmp_key: Path, *,
+                                     backup_tag: str = "pre-tailscale") -> None:
     """Replace the live cert pair, restoring the prior pair on partial failure."""
     destinations = ((tmp_crt, CERT_FILE), (tmp_key, KEY_FILE))
     backups: dict[Path, Path | None] = {}
     for _src, dst in destinations:
         if dst.exists():
-            bak = dst.with_suffix(dst.suffix + ".pre-tailscale.bak")
+            bak = dst.with_suffix(dst.suffix + f".{backup_tag}.bak")
             shutil.copy2(dst, bak)
             backups[dst] = bak
         else:
@@ -3058,13 +3447,7 @@ def run_tailscale_cert(args) -> int:
             print(f"! could not enforce file modes: {e}")
 
         # Refresh the persisted fingerprint to match the new cert.
-        fp = cert_fingerprint_sha256() or ""
-        if fp:
-            try:
-                CERT_FINGERPRINT_FILE.write_text(fp + "\n", encoding="utf-8")
-                os.chmod(CERT_FINGERPRINT_FILE, 0o644)
-            except Exception as e:
-                log.warning(f"fingerprint persist failed: {e}")
+        fp = _persist_cert_fingerprint() or ""
 
         print("  ✓ Got Let's Encrypt cert from Tailscale.")
         print(f"    Server reachable at https://{hostname}:{DEFAULT_PORT}")
@@ -3142,7 +3525,11 @@ def main():
               "Start the server or run --setup first.", file=sys.stderr)
         return 1
     if args.rotate_token:
-        regenerate_token(log_new_token=False)
+        try:
+            regenerate_token(log_new_token=False, require_persist=True)
+        except OSError as e:
+            print(f"Token rotation failed: {e}", file=sys.stderr)
+            return 1
         print("Bearer token rotated.")
         print(f"Token file: {TOKEN_FILE} (mode 0600)")
         print("Token value was not printed; treat the file contents as a password.")
@@ -3185,13 +3572,11 @@ def main():
     # Mint or load the bearer token before binding the socket.
     ensure_token()
 
-    # Phase 2 (ADR-1) — start idle-shutdown daemon. It only acts after the
-    # first successful transcribe (driven by _mark_transcribe_activity), so
-    # boot before any clients connect is safe even when whisper-server isn't
-    # running yet.
+    # Phase 2 (ADR-1) — idle-shutdown daemons for whisper-server and Kokoro.
+    # Each arms its timer on activity, and at start when its unit is already
+    # active (left running by a previous process or started at login), so a
+    # running model is always eventually stopped.
     _start_idle_shutdown_thread()
-    # TTS idle-shutdown daemon — only acts after first /tts call (driven by
-    # _mark_tts_activity). Safe to start before kokoro-server is running.
     _start_kokoro_idle_shutdown_thread()
 
     server = _TLSThreadingHTTPServer((args.host, args.port), DictationHandler)
@@ -3201,14 +3586,9 @@ def main():
         # Print + persist SHA-256 fingerprint so users can verify the cert
         # they're trusting on the phone matches the one this server is
         # serving. ADR-7. Persisted file mode 0644.
-        fp = cert_fingerprint_sha256()
+        fp = _persist_cert_fingerprint()
         if fp:
             log.info(f"Cert fingerprint (SHA-256): {fp}")
-            try:
-                CERT_FINGERPRINT_FILE.write_text(fp + "\n", encoding="utf-8")
-                os.chmod(CERT_FINGERPRINT_FILE, 0o644)
-            except Exception as e:
-                log.warning(f"Could not persist cert fingerprint: {e}")
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(str(CERT_FILE), str(KEY_FILE))
         server.ssl_context = ctx

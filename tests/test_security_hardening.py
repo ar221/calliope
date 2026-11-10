@@ -10,7 +10,6 @@ Covers:
 """
 from __future__ import annotations
 
-import importlib.util
 import io
 import json
 import logging
@@ -18,12 +17,10 @@ import os
 import pathlib
 import subprocess
 import sys
-import uuid
-from importlib.machinery import SourceFileLoader
 
 import pytest
 
-SRC = pathlib.Path(__file__).resolve().parents[1] / "server" / "calliope-server"
+from conftest import WRAPPER as SRC, load_wrapper
 
 
 def _load(env: dict[str, str] | None = None):
@@ -34,13 +31,7 @@ def _load(env: dict[str, str] | None = None):
         saved[k] = os.environ.get(k)
         os.environ[k] = v
     try:
-        name = f"calliope_server_sec_{uuid.uuid4().hex}"
-        loader = SourceFileLoader(name, str(SRC))
-        spec = importlib.util.spec_from_loader(name, loader)
-        assert spec is not None
-        module = importlib.util.module_from_spec(spec)
-        loader.exec_module(module)
-        return module
+        return load_wrapper("calliope_server_sec")
     finally:
         for k, old in saved.items():
             if old is None:
@@ -97,7 +88,7 @@ class FakeHandler:
     def send_json(self, payload, status=200):
         self.sent.append(("json", status, payload))
 
-    def send_html(self, html):
+    def send_html(self, html, **_kwargs):
         self.html_sent.append(html)
 
 

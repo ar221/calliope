@@ -29,8 +29,10 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
 # /tmp is already private (PrivateTmp=yes); whisper models are read-only.
+# `-` marks operator-specific inputs optional: a missing SillyTavern/persona/
+# rules directory must not fail namespace setup on a fresh install.
 ReadWritePaths=%h/.local/share/dictation-server
-ReadOnlyPaths=%h/.local/share/whisper /mnt/hdd/AI/SillyTavern/data %h/STWork/personas %h/STWork/rules
+ReadOnlyPaths=%h/.local/share/whisper -/mnt/hdd/AI/SillyTavern/data -%h/STWork/personas -%h/STWork/rules
 PrivateTmp=yes
 PrivateDevices=no
 DeviceAllow=/dev/kfd rw

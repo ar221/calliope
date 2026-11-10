@@ -36,6 +36,10 @@ _last_tts_lock = threading.Lock()
 # Serialises "is Kokoro up / start it" against the idle loop's "stop it".
 _kokoro_lifecycle_lock = threading.Lock()
 _kokoro_idle_thread: threading.Thread | None = None
+# S5: a failed idle stop keeps `_last_tts_ts` armed and is retried no earlier
+# than `_stop_retry_at`, backing off up to config.IDLE_STOP_RETRY_MAX_SECONDS.
+_stop_retry_at: float = 0.0
+_stop_backoff: float = 0.0
 
 # TTS — in-memory voices cache. Refreshed on TTL miss; protects the model
 # server from a stampede of /tts/voices polls from the phone UI. Only one
@@ -101,11 +105,19 @@ def _ensure_kokoro_alive(boot_timeout: float = config.KOKORO_BOOT_TIMEOUT, *,
         return False
 
 
-def _mark_tts_activity() -> None:
-    """Update the TTS idle-shutdown timer's last-active timestamp."""
+_UNIT = "kokoro-server"
+
+
+def _mark_tts_activity(*, shared: bool = True) -> None:
+    """Update the TTS idle-shutdown timer's last-active timestamp.
+
+    `shared=False` only arms this process's timer (start-up arming).
+    """
     global _last_tts_ts
     with _last_tts_lock:
         _last_tts_ts = time.monotonic()
+    if shared:
+        config.touch_unit_activity(_UNIT, time.time())
 
 
 def _begin_tts_synthesis() -> None:
@@ -114,6 +126,7 @@ def _begin_tts_synthesis() -> None:
     with _last_tts_lock:
         _tts_in_flight += 1
         _last_tts_ts = time.monotonic()
+    config.touch_unit_activity(_UNIT, time.time())
 
 
 def _end_tts_synthesis() -> None:
@@ -122,19 +135,25 @@ def _end_tts_synthesis() -> None:
     with _last_tts_lock:
         _tts_in_flight = max(0, _tts_in_flight - 1)
         _last_tts_ts = time.monotonic()
+    config.touch_unit_activity(_UNIT, time.time())
 
 
 def _kokoro_idle_tick() -> bool:
     """One idle-loop decision. Returns True when kokoro-server was stopped."""
-    global _last_tts_ts
+    global _last_tts_ts, _stop_retry_at, _stop_backoff
     with _kokoro_lifecycle_lock:
         with _last_tts_lock:
             last = _last_tts_ts
             in_flight = _tts_in_flight
         if in_flight > 0 or last <= 0:
             return False
-        idle_for = time.monotonic() - last
-        if idle_for < config.KOKORO_IDLE_SHUTDOWN_SECONDS:
+        now = time.monotonic()
+        idle_for = now - last
+        shared_ts = config.unit_activity_mtime(_UNIT)
+        if shared_ts > 0:
+            # Another process's synthesis counts too (see config.unit_activity_file).
+            idle_for = min(idle_for, time.time() - shared_ts)
+        if idle_for < config.KOKORO_IDLE_SHUTDOWN_SECONDS or now < _stop_retry_at:
             return False
         if not _kokoro_probe(timeout=config.KOKORO_PROBE_TIMEOUT):
             with _last_tts_lock:
@@ -142,15 +161,40 @@ def _kokoro_idle_tick() -> bool:
             return False
         log.info("kokoro-server idle for %.0fs — stopping to release memory", idle_for)
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ["systemctl", "--user", "stop", "kokoro-server"],
                 check=False, capture_output=True, timeout=10,
             )
+            stopped = result.returncode == 0
+            failure = f"exit {result.returncode}"
         except Exception as e:
-            log.warning(f"systemctl stop kokoro-server failed: {e}")
+            stopped = False
+            failure = e.__class__.__name__
+        if not stopped:
+            _stop_backoff = min(
+                max(_stop_backoff * 2, config.IDLE_SHUTDOWN_CHECK_INTERVAL),
+                config.IDLE_STOP_RETRY_MAX_SECONDS,
+            )
+            _stop_retry_at = time.monotonic() + _stop_backoff
+            log.warning("systemctl stop kokoro-server failed (%s); retrying in %.0fs",
+                        failure, _stop_backoff)
+            return False
+        _stop_backoff = 0.0
+        _stop_retry_at = 0.0
         with _last_tts_lock:
             _last_tts_ts = 0.0
         return True
+
+
+def _kokoro_unit_is_active() -> bool:
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet", "kokoro-server"],
+            check=False, capture_output=True, timeout=10,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0
 
 
 def _kokoro_idle_shutdown_loop() -> None:
@@ -166,6 +210,10 @@ def _kokoro_idle_shutdown_loop() -> None:
         "Kokoro idle-shutdown thread started; will stop kokoro-server after %ds idle",
         config.KOKORO_IDLE_SHUTDOWN_SECONDS,
     )
+    # A unit already running at server start (login autostart, previous server
+    # process) would otherwise never be stopped: arm the timer for it.
+    if _kokoro_unit_is_active():
+        _mark_tts_activity(shared=False)
     while True:
         time.sleep(config.IDLE_SHUTDOWN_CHECK_INTERVAL)
         _kokoro_idle_tick()
@@ -274,11 +322,42 @@ def _normalize_voice_key(name: object) -> str:
     return str(name or "").strip().lower()
 
 
+_SEGMENT_BREAK_RE = re.compile(r"[.!?…][\"'”’)\]]*\s+|[。！？][」』”’)\]]*\s*|\n")
+
+
+def _split_audiobook_text(text: str, limit: int) -> list[str]:
+    """Split `text` into pieces of at most `limit` chars without dropping any.
+
+    Prefers the last sentence end, then the last whitespace, inside each
+    window; an unbroken run is hard-split.
+    """
+    pieces: list[str] = []
+    rest = text
+    while len(rest) > limit:
+        window = rest[:limit]
+        cut = 0
+        for m in _SEGMENT_BREAK_RE.finditer(window):
+            cut = m.end()
+        if cut <= 0:
+            cut = window.rfind(" ") + 1
+        if cut <= 0:
+            cut = limit
+        head = rest[:cut].strip()
+        if head:
+            pieces.append(head)
+        rest = rest[cut:].lstrip()
+    if rest.strip():
+        pieces.append(rest.strip())
+    return pieces
+
+
 def _validate_audiobook_request(body: object) -> tuple[list[dict], str, dict, str, dict | None]:
     """Validate /tts/audiobook input.
 
     Returns (messages, narrator_voice, voice_map, title, error_or_None).
-    messages are normalized to {name, text, is_user, voice?}.
+    messages are normalized to {name, text, voice}; a message longer than
+    TTS_MAX_TEXT_CHARS becomes several consecutive segments with the same
+    name/voice.
     """
     if not isinstance(body, dict):
         return [], "", {}, "", {
@@ -315,12 +394,10 @@ def _validate_audiobook_request(body: object) -> tuple[list[dict], str, dict, st
                 "code": "text_too_long",
                 "status": 400,
             }
-        messages.append({
-            "name": str(item.get("name", "") or "").strip(),
-            "text": text[:config.TTS_MAX_TEXT_CHARS],
-            "is_user": bool(item.get("is_user", False)),
-            "voice": str(item.get("voice", "") or "").strip(),
-        })
+        name = str(item.get("name", "") or "").strip()
+        voice = str(item.get("voice", "") or "").strip()
+        for piece in _split_audiobook_text(text, config.TTS_MAX_TEXT_CHARS):
+            messages.append({"name": name, "text": piece, "voice": voice})
     if not messages:
         return [], "", {}, "", {
             "error": "No readable message text",

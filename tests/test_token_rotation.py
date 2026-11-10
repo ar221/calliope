@@ -2,16 +2,12 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import os
-import pathlib
 import stat
 import subprocess
 import sys
-import uuid
-from importlib.machinery import SourceFileLoader
 
-SRC = pathlib.Path(__file__).resolve().parents[1] / "server" / "calliope-server"
+from conftest import WRAPPER as SRC, load_wrapper
 
 
 def _digest(value: str) -> str:
@@ -24,13 +20,7 @@ def _contains_token(output: str, token: str) -> bool:
 
 def _load_server(tmp_path, monkeypatch):
     monkeypatch.setenv("CALLIOPE_DATA_DIR", str(tmp_path))
-    name = f"calliope_server_token_rotation_{uuid.uuid4().hex}"
-    loader = SourceFileLoader(name, str(SRC))
-    spec = importlib.util.spec_from_loader(name, loader)
-    assert spec is not None
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
+    return load_wrapper("calliope_server_token_rotation")
 
 
 def test_regenerate_token_writes_0600_and_changes_value(tmp_path, monkeypatch):

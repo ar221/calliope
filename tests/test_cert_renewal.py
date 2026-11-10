@@ -6,26 +6,17 @@ cert is near expiry, and never touches real cert files (regen is mocked).
 
 from __future__ import annotations
 
-import importlib.util
 import pathlib
 import subprocess
-import uuid
-from importlib.machinery import SourceFileLoader
 
 import pytest
 
-SRC = pathlib.Path(__file__).resolve().parents[1] / "server" / "calliope-server"
+from conftest import load_wrapper
 
 
 def _load_server(tmp_path, monkeypatch):
     monkeypatch.setenv("CALLIOPE_DATA_DIR", str(tmp_path))
-    name = f"calliope_server_cert_{uuid.uuid4().hex}"
-    loader = SourceFileLoader(name, str(SRC))
-    spec = importlib.util.spec_from_loader(name, loader)
-    assert spec is not None
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
+    return load_wrapper("calliope_server_cert")
 
 
 def test_check_renews_when_below_threshold(tmp_path, monkeypatch):

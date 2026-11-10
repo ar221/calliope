@@ -173,12 +173,19 @@ def _audio_to_wav_bytes(samples: np.ndarray, sample_rate: int) -> bytes:
 
 
 _RE = __import__('re')
-_SENT_SPLIT_RE = _RE.compile(r'(?<=[.!?…])\s+|(?<=\n)')
-_SOFT_SPLIT_RE = _RE.compile(r'(?<=[,;:])\s+')
+_SENT_SPLIT_RE = _RE.compile(r'(?<=[.!?…])\s+|(?<=[。！？])\s*|(?<=\n)')
+_SOFT_SPLIT_RE = _RE.compile(r'(?<=[,;:])\s+|(?<=[，、；：])\s*')
+
+
+def _hard_split(text: str, max_chars: int) -> list[str]:
+    return [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
 
 
 def _split_long_fragment(fragment: str, max_chars: int) -> list[str]:
-    """Split a single long sentence below Kokoro's internal splitter threshold."""
+    """Split a single long sentence below Kokoro's internal splitter threshold.
+
+    Lossless: unspaced runs (CJK, long tokens) are hard-split, never dropped.
+    """
     fragment = fragment.strip()
     if len(fragment) <= max_chars:
         return [fragment] if fragment else []
@@ -188,12 +195,17 @@ def _split_long_fragment(fragment: str, max_chars: int) -> list[str]:
         if len(soft) <= max_chars:
             pieces.append(soft)
             continue
-        words = soft.split()
         cur = ''
-        for word in words:
-            if cur and len(cur) + 1 + len(word) > max_chars:
+        for word in soft.split():
+            if len(word) > max_chars:
+                if cur:
+                    pieces.append(cur)
+                slices = _hard_split(word, max_chars)
+                pieces.extend(slices[:-1])
+                cur = slices[-1]
+            elif cur and len(cur) + 1 + len(word) > max_chars:
                 pieces.append(cur)
-                cur = word[:max_chars]
+                cur = word
             else:
                 cur = word if not cur else cur + ' ' + word
         if cur:
@@ -231,7 +243,7 @@ def _split_for_synth(text: str, max_chars: int = 100) -> list[str]:
         else:
             if cur:
                 chunks.append(cur)
-            cur = p[:max_chars]  # hard-truncate any one absurdly long sentence
+            cur = p
     if cur:
         chunks.append(cur)
     return chunks
@@ -291,7 +303,8 @@ def _synth_recover(k, chunk: str, voice: str, speed: float):
         if sub_arr.size:
             pieces.append(sub_arr)
     if not pieces:
-        log.warning("kokoro empty audio, unrecoverable for chunk: %r", chunk[:60])
+        log.warning("kokoro empty audio, unrecoverable chunk (len=%d voice=%s lang=%s)",
+                    len(chunk), voice, _lang_for_voice(voice))
     return pieces, sr
 
 
@@ -424,8 +437,10 @@ class KokoroHandler(BaseHTTPRequestHandler):
         try:
             wav_bytes, _sr = _synthesize(text, voice, speed)
         except Exception as e:
-            log.exception("synthesis failed")
-            self._err(f"Synthesis failed: {e}", status=500, code="synth_failed")
+            # Exception text from the phonemizer/model can quote the input.
+            log.warning("synthesis failed: %s (text_len=%d voice=%s)",
+                        e.__class__.__name__, len(text), voice)
+            self._err(f"Synthesis failed ({e.__class__.__name__})", status=500, code="synth_failed")
             return
         self.send_response(200)
         self.send_header("Content-Type", "audio/wav")

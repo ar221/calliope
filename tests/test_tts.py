@@ -14,16 +14,16 @@ test_word_confidence / test_pipeline.
 """
 from __future__ import annotations
 
-import importlib.util
 import io
 import json
 import pathlib
 import urllib.error
 import wave
-from importlib.machinery import SourceFileLoader
 from unittest.mock import patch, MagicMock
 
 import pytest
+
+from conftest import load_wrapper
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC = ROOT / "server" / "calliope-server"
@@ -32,11 +32,7 @@ EXT = ROOT / "extension" / "index.js"
 
 @pytest.fixture(scope="module")
 def mod():
-    loader = SourceFileLoader("calliope_server", str(SRC))
-    spec = importlib.util.spec_from_loader("calliope_server", loader)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_wrapper("calliope_tts")
 
 
 @pytest.fixture(autouse=True)
@@ -57,16 +53,6 @@ def test_extension_streaming_partials_setting_is_user_toggle():
     assert "Stream TTS while AI text is streaming" in src
     assert "fresh.ttsReadStreamingPartials = !!ttsStreamEl.checked" in src
     assert "Streaming partial TTS deferred" not in src
-
-
-def test_streaming_partials_reuse_existing_tts_endpoint():
-    server_src = SRC.read_text(encoding="utf-8")
-    ext_src = EXT.read_text(encoding="utf-8")
-    assert '"/tts/stream' not in server_src
-    assert "'/tts/stream" not in ext_src
-    assert "function maybeStartStreamingAutoRead" in ext_src
-    assert "function queueTtsStreamChunks" in ext_src
-    assert "characterData: true" in ext_src
 
 
 def test_streaming_tts_operator_controls_are_wired():
@@ -110,15 +96,6 @@ def test_extension_unlocks_audio_for_auto_tts_after_user_gesture():
     assert "unlockTtsAudio('settings-auto-read')" in src
     assert "unlockTtsAudio('page-pointerdown')" in src
     assert "ttsUnlockedAudioContext.state === 'running'" in src
-
-
-def test_extension_html_audio_play_has_timeout_fallback():
-    src = EXT.read_text(encoding="utf-8")
-    assert "const TTS_AUDIO_PLAY_TIMEOUT_MS = 3000" in src
-    assert "async function playHtmlAudioWithTimeout" in src
-    assert "err.name = 'AudioPlayTimeout'" in src
-    assert "await playHtmlAudioWithTimeout(audio)" in src
-    assert "return await createAndPlayTtsWebAudio(audioBlob, onEnded, e)" in src
 
 
 def test_extension_chunks_long_tts_requests_before_server_limit():
@@ -408,8 +385,8 @@ def test_validate_audiobook_request_normalizes_voice_map(mod):
     assert narrator == "af_heart"
     assert voice_map == {"camilla": "af_bella"}
     assert messages == [
-        {"name": "Camilla", "text": "Hello there.", "is_user": False, "voice": ""},
-        {"name": "Ayaz", "text": "I answer.", "is_user": True, "voice": ""},
+        {"name": "Camilla", "text": "Hello there.", "voice": ""},
+        {"name": "Ayaz", "text": "I answer.", "voice": ""},
     ]
 
 

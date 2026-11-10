@@ -12,10 +12,13 @@ Type=simple
 # unit on demand via `systemctl --user {start,stop} whisper-server` when N
 # minutes of inactivity pass. Do not wire idle logic here. No [Install]
 # section on purpose: enabling it would start whisper at login and hold VRAM.
+# The setup wizard overrides the model with a drop-in setting the same
+# variable for this unit and dictation-server.
+Environment=DICTATION_WHISPER_MODEL=large-v3-turbo
 ExecStart=%h/.local/bin/whisper-server \
     --host 127.0.0.1 \
     --port 9001 \
-    --model %h/.local/share/whisper/ggml-large-v3-turbo.bin \
+    --model %h/.local/share/whisper/ggml-${DICTATION_WHISPER_MODEL}.bin \
     --threads 8 \
     --processors 1 \
     --no-timestamps \

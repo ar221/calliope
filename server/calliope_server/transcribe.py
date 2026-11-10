@@ -18,6 +18,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import wave
 from pathlib import Path
 
 from . import config
@@ -38,6 +39,16 @@ _last_transcribe_lock = threading.Lock()
 # server to a stop that was already decided.
 _whisper_lifecycle_lock = threading.Lock()
 _idle_shutdown_thread: threading.Thread | None = None
+# O-02: monotonic deadline until which whisper-server is trusted alive without
+# a liveness GET (renewed by successful inference/boot, dropped on failure or
+# idle stop). S5: a failed idle stop keeps the activity marker and is retried
+# no earlier than `_stop_retry_at`, backing off up to IDLE_STOP_RETRY_MAX_SECONDS.
+_whisper_alive_until: float = 0.0
+_stop_retry_at: float = 0.0
+_stop_backoff: float = 0.0
+# Single-flight background prewarm for POST /warm.
+_prewarm_thread: threading.Thread | None = None
+_prewarm_lock = threading.Lock()
 
 # Per-request whisper-cli fallback loads a second copy of the model into VRAM,
 # so at most one runs at a time. Later callers wait for the slot (up to the
@@ -76,19 +87,39 @@ def _whisper_server_probe(timeout: float = 1.0) -> bool:
         return False
 
 
-def _ensure_whisper_server_alive(boot_timeout: float | None = None) -> bool:
+def _whisper_lease_valid() -> bool:
+    with _last_transcribe_lock:
+        return time.monotonic() < _whisper_alive_until
+
+
+def _renew_whisper_lease() -> None:
+    global _whisper_alive_until
+    with _last_transcribe_lock:
+        _whisper_alive_until = time.monotonic() + config.WHISPER_ALIVE_LEASE_SECONDS
+
+
+def _drop_whisper_lease() -> None:
+    global _whisper_alive_until
+    with _last_transcribe_lock:
+        _whisper_alive_until = 0.0
+
+
+def _ensure_whisper_server_alive(boot_timeout: float | None = None, *,
+                                 timing: dict | None = None) -> bool:
     """Probe whisper-server; if dead, try `systemctl --user start whisper-server`
     and poll up to `boot_timeout` seconds for liveness. Returns True on alive.
 
     Runs under `_whisper_lifecycle_lock`, so it waits out an idle stop that is
     already under way and then boots the server again instead of reporting a
-    server that is about to disappear.
+    server that is about to disappear. A boot stamps `timing["whisper_boot"]`.
     """
     if boot_timeout is None:
         boot_timeout = config.WHISPER_SERVER_HEALTH_TIMEOUT
     with _whisper_lifecycle_lock:
         if _whisper_server_probe(timeout=1.0):
+            _renew_whisper_lease()
             return True
+        _drop_whisper_lease()
         log.info("whisper-server not responding — attempting `systemctl --user start whisper-server`")
         try:
             subprocess.run(
@@ -106,10 +137,123 @@ def _ensure_whisper_server_alive(boot_timeout: float | None = None) -> bool:
         while time.monotonic() < deadline:
             if _whisper_server_probe(timeout=1.0):
                 log.info("whisper-server up")
+                _renew_whisper_lease()
+                if timing is not None:
+                    timing["whisper_boot"] = time.monotonic()
                 return True
             time.sleep(0.25)
         log.warning("whisper-server did not become healthy within %.1fs", boot_timeout)
         return False
+
+
+def prewarm_whisper() -> str:
+    """POST /warm: refresh the idle timer and boot whisper-server off-thread.
+
+    Never blocks on the boot. Returns "ready" when a live lease is held,
+    otherwise "warming" (a single background ensure is running or started).
+    """
+    global _prewarm_thread
+    _mark_transcribe_activity()
+    if _whisper_lease_valid():
+        return "ready"
+    with _prewarm_lock:
+        if _prewarm_thread is None or not _prewarm_thread.is_alive():
+            t = threading.Thread(target=_prewarm_run, name="whisper-prewarm", daemon=True)
+            t.start()
+            _prewarm_thread = t
+    return "warming"
+
+
+def _prewarm_run() -> None:
+    try:
+        _ensure_whisper_server_alive()
+    except Exception as e:  # pragma: no cover — defensive, background thread
+        log.warning("whisper prewarm failed: %s", e.__class__.__name__)
+
+
+# ─── Upload normalization (contract: every accepted container → ffmpeg) ──
+# Content-Type base → ffmpeg demuxer forced with `-f`, so ffmpeg never
+# autoprobes (no playlist/concat/network demuxers) whatever the bytes claim.
+AUDIO_CONTAINERS = {
+    "audio/webm": "webm",
+    "audio/mp4": "mp4",
+    "audio/ogg": "ogg",
+    "audio/wav": "wav",
+}
+FFMPEG_TIMEOUT_SECONDS = 30
+_WAV_HEADER_SLACK = 4096
+
+
+class AudioConversionError(Exception):
+    """ffmpeg rejected or failed to decode the upload."""
+
+
+class FfmpegMissingError(Exception):
+    """The ffmpeg executable is not installed / not on PATH."""
+
+
+class AudioTooLongError(Exception):
+    """Decoded audio exceeds the decoded-size bound."""
+
+
+def audio_container(content_type: str) -> str | None:
+    """ffmpeg input format for an upload Content-Type (codec params allowed)."""
+    base = (content_type or "").split(";", 1)[0].strip().lower()
+    return AUDIO_CONTAINERS.get(base)
+
+
+# Decode this much past MAX_AUDIO_SECONDS so an over-limit take is detected
+# (its decode reaches the sentinel) instead of being silently truncated.
+_DURATION_SENTINEL_SECONDS = 1
+# Resampler/container padding can push an in-limit clip a hair over MAX.
+_DURATION_TOLERANCE_SECONDS = 0.25
+
+
+def max_decoded_wav_bytes() -> int:
+    """Largest 16 kHz mono s16 WAV ffmpeg can produce under the decode cap."""
+    return ((config.MAX_AUDIO_SECONDS + _DURATION_SENTINEL_SECONDS) * 16000 * 2
+            + _WAV_HEADER_SLACK)
+
+
+def normalize_audio(src: Path, dst: Path, container: str) -> float:
+    """Decode `src` (forced `container` demuxer) to a 16 kHz mono PCM WAV at `dst`.
+
+    Local files only (`-protocol_whitelist file,pipe`), no stdin. Decoding is
+    capped one second past MAX_AUDIO_SECONDS; a take whose decoded duration
+    exceeds the limit raises AudioTooLongError (never a truncated prefix).
+    Returns the decoded duration in seconds.
+    """
+    cmd = [
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-protocol_whitelist", "file,pipe",
+        "-f", container, "-i", str(src),
+        "-t", str(config.MAX_AUDIO_SECONDS + _DURATION_SENTINEL_SECONDS),
+        "-vn", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+        "-f", "wav", "-y", str(dst),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=FFMPEG_TIMEOUT_SECONDS)
+    except FileNotFoundError as e:
+        raise FfmpegMissingError("ffmpeg not found — install it for audio conversion") from e
+    except subprocess.TimeoutExpired as e:
+        raise AudioConversionError(
+            f"Audio conversion timed out after {FFMPEG_TIMEOUT_SECONDS}s") from e
+    if result.returncode != 0:
+        detail = (result.stderr or b"").decode("utf-8", errors="replace").strip()[-200:]
+        raise AudioConversionError(f"Audio conversion failed: {detail}")
+    size = dst.stat().st_size
+    too_long = AudioTooLongError(f"Decoded audio exceeds {config.MAX_AUDIO_SECONDS}s")
+    if size > max_decoded_wav_bytes():
+        raise too_long
+    try:
+        with wave.open(str(dst), "rb") as w:
+            duration = w.getnframes() / float(w.getframerate() or 16000)
+    except (wave.Error, EOFError, OSError):
+        duration = max(0, size - 44) / 32000.0
+    if duration > config.MAX_AUDIO_SECONDS + _DURATION_TOLERANCE_SECONDS:
+        raise too_long
+    return duration
+
 
 
 def _build_multipart_body(fields: dict[str, str], file_field: str,
@@ -326,11 +470,20 @@ def _transcribe_subprocess_fallback(audio_path: Path, model: str = config.DEFAUL
     return text
 
 
-def _mark_transcribe_activity() -> None:
-    """Update the idle-shutdown timer's last-active timestamp."""
+_UNIT = "whisper-server"
+
+
+def _mark_transcribe_activity(*, shared: bool = True) -> None:
+    """Update the idle-shutdown timer's last-active timestamp.
+
+    `shared=False` only arms this process's timer (start-up arming) without
+    claiming activity for other processes.
+    """
     global _last_transcribe_ts
     with _last_transcribe_lock:
         _last_transcribe_ts = time.monotonic()
+    if shared:
+        config.touch_unit_activity(_UNIT, time.time())
 
 
 def _begin_transcribe_request() -> None:
@@ -339,6 +492,7 @@ def _begin_transcribe_request() -> None:
     with _last_transcribe_lock:
         _transcribe_in_flight += 1
         _last_transcribe_ts = time.monotonic()
+    config.touch_unit_activity(_UNIT, time.time())
 
 
 def _end_transcribe_request() -> None:
@@ -347,6 +501,7 @@ def _end_transcribe_request() -> None:
     with _last_transcribe_lock:
         _transcribe_in_flight = max(0, _transcribe_in_flight - 1)
         _last_transcribe_ts = time.monotonic()
+    config.touch_unit_activity(_UNIT, time.time())
 
 
 def _idle_shutdown_tick() -> bool:
@@ -356,34 +511,69 @@ def _idle_shutdown_tick() -> bool:
     concurrent `_ensure_whisper_server_alive` either runs before (and its
     request is counted in flight) or after (and boots the server again).
     """
-    global _last_transcribe_ts
+    global _last_transcribe_ts, _stop_retry_at, _stop_backoff
     with _whisper_lifecycle_lock:
         with _last_transcribe_lock:
             last = _last_transcribe_ts
             in_flight = _transcribe_in_flight
         if in_flight > 0 or last <= 0:
             return False  # busy, or never used in this process
-        idle_for = time.monotonic() - last
-        if idle_for < config.IDLE_SHUTDOWN_SECONDS:
+        now = time.monotonic()
+        idle_for = now - last
+        shared_ts = config.unit_activity_mtime(_UNIT)
+        if shared_ts > 0:
+            # Another process's request counts too: never stop a unit whose
+            # shared stamp is younger than the idle window.
+            idle_for = min(idle_for, time.time() - shared_ts)
+        if idle_for < config.IDLE_SHUTDOWN_SECONDS or now < _stop_retry_at:
             return False
         if not _whisper_server_probe(timeout=1.0):
             # Already down — clear marker so we don't keep spamming systemctl.
             with _last_transcribe_lock:
                 _last_transcribe_ts = 0.0
+            _drop_whisper_lease()
             return False
         log.info(
             "whisper-server idle for %.0fs — stopping to release VRAM", idle_for,
         )
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ["systemctl", "--user", "stop", "whisper-server"],
                 check=False, capture_output=True, timeout=10,
             )
+            stopped = result.returncode == 0
+            failure = f"exit {result.returncode}"
         except Exception as e:
-            log.warning(f"systemctl stop whisper-server failed: {e}")
+            stopped = False
+            failure = e.__class__.__name__
+        if not stopped:
+            # Keep the marker so a later tick retries; back off between tries.
+            _stop_backoff = min(
+                max(_stop_backoff * 2, config.IDLE_SHUTDOWN_CHECK_INTERVAL),
+                config.IDLE_STOP_RETRY_MAX_SECONDS,
+            )
+            _stop_retry_at = time.monotonic() + _stop_backoff
+            log.warning("systemctl stop whisper-server failed (%s); retrying in %.0fs",
+                        failure, _stop_backoff)
+            return False
+        _stop_backoff = 0.0
+        _stop_retry_at = 0.0
+        _drop_whisper_lease()
         with _last_transcribe_lock:
             _last_transcribe_ts = 0.0
         return True
+
+
+def _unit_is_active(unit: str) -> bool:
+    """True when `systemctl --user is-active <unit>` reports active."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet", unit],
+            check=False, capture_output=True, timeout=10,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0
 
 
 def _idle_shutdown_loop() -> None:
@@ -400,6 +590,10 @@ def _idle_shutdown_loop() -> None:
         "Idle-shutdown thread started; will stop whisper-server after %ds idle",
         config.IDLE_SHUTDOWN_SECONDS,
     )
+    # A unit left running by a previous server process (or started outside
+    # Calliope) would otherwise never be stopped: arm the timer for it.
+    if _unit_is_active(_UNIT):
+        _mark_transcribe_activity(shared=False)
     while True:
         time.sleep(config.IDLE_SHUTDOWN_CHECK_INTERVAL)
         _idle_shutdown_tick()
@@ -439,7 +633,7 @@ def transcribe(audio_path: Path, model: str = config.DEFAULT_MODEL, use_gpu: boo
 
 def transcribe_with_confidence(
     audio_path: Path, model: str = config.DEFAULT_MODEL, use_gpu: bool = True,
-    prompt: str = "", language: str = "en",
+    prompt: str = "", language: str = "en", timing: dict | None = None,
 ) -> tuple[str, list[dict]]:
     """Same as transcribe() but also returns per-word/-token confidence list.
 
@@ -447,22 +641,29 @@ def transcribe_with_confidence(
     - whisper-server returned text only (no segments / tokens), or
     - the subprocess fallback path ran (whisper-cli stdout has no logprob).
 
-    MVP-9 (ADR-2): exposes the JSON-mode confidence stream the persistent
-    server can produce, so downstream UI ('did you mean?', risk gating) can
-    consume it without re-running inference. No consumer wired yet —
-    pass-through only.
+    O-02: inside a live lease the liveness probe is skipped; if inference
+    then fails, the lease is dropped and the server is re-ensured (probe or
+    boot) and retried once before the whisper-cli fallback. `timing` receives
+    `whisper_boot` when this call booted whisper-server.
     """
     _begin_transcribe_request()
     try:
-        if _ensure_whisper_server_alive():
-            try:
-                text, raw = _transcribe_whisper_server(
-                    audio_path, prompt=prompt, language=language,
-                )
-                return text, extract_word_confidences(raw)
-            except RuntimeError as e:
-                log.warning("whisper-server transcription failed: %s — falling back to subprocess", e)
-                # Fall through to subprocess fallback.
+        leased = _whisper_lease_valid()
+        if leased or _ensure_whisper_server_alive(timing=timing):
+            attempts = 2 if leased else 1
+            for attempt in range(attempts):
+                try:
+                    text, raw = _transcribe_whisper_server(
+                        audio_path, prompt=prompt, language=language,
+                    )
+                    _renew_whisper_lease()
+                    return text, extract_word_confidences(raw)
+                except RuntimeError as e:
+                    _drop_whisper_lease()
+                    if attempt + 1 < attempts and _ensure_whisper_server_alive(timing=timing):
+                        continue
+                    log.warning("whisper-server transcription failed: %s — falling back to subprocess", e)
+                    break
 
         log.info("Using whisper-cli subprocess fallback")
         text = _transcribe_subprocess_fallback(
