@@ -219,6 +219,22 @@ def test_tailscale_cert_validation_checks_hostname_and_key(tmp_path, monkeypatch
     assert error
 
 
+def test_hostname_mismatch_is_rejected_when_openssl_exits_zero(tmp_path, monkeypatch):
+    """OpenSSL 3.0/3.1 print the mismatch but exit 0."""
+    mod = _load_server(tmp_path, monkeypatch)
+
+    def fake_run(cmd, **_kw):
+        assert "-checkhost" in cmd
+        return mod.subprocess.CompletedProcess(
+            cmd, 0, "Hostname wrong.example.ts.net does NOT match certificate\n", "")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    ok, error = mod._validate_cert_pair_for_hostname(
+        tmp_path / "c.crt", tmp_path / "c.key", "wrong.example.ts.net")
+    assert ok is False
+    assert "NOT match" in error
+
+
 def test_tailscale_cert_validation_rejects_mismatched_key(tmp_path, monkeypatch):
     mod = _load_server(tmp_path, monkeypatch)
     cert = tmp_path / "issued.crt"

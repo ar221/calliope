@@ -3280,7 +3280,9 @@ def _validate_cert_pair_for_hostname(cert: Path, key: Path, hostname: str) -> tu
             ["openssl", "x509", "-checkhost", hostname, "-noout", "-in", str(cert)],
             capture_output=True, text=True, timeout=5, check=False,
         )
-        if host_check.returncode != 0:
+        # OpenSSL 3.0/3.1 report a mismatch on stdout but still exit 0.
+        host_out = f"{host_check.stdout}\n{host_check.stderr}"
+        if host_check.returncode != 0 or "does NOT match" in host_out:
             detail = (host_check.stderr or host_check.stdout or "hostname mismatch").strip()
             return False, detail
 

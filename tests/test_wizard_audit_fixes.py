@@ -172,7 +172,8 @@ def _stub_systemctl(monkeypatch, active: dict[str, float] | None = None):
             unit = cmd[3]
             if unit not in active:
                 return subprocess.CompletedProcess(cmd, 0, "ActiveState=inactive\n", "")
-            mono_us = int((time.clock_gettime(time.CLOCK_MONOTONIC) + active[unit]) * 1e6)
+            # Clamp: on a freshly booted CI runner "an hour ago" predates boot.
+            mono_us = max(1, int((time.clock_gettime(time.CLOCK_MONOTONIC) + active[unit]) * 1e6))
             out = f"ActiveState=active\nActiveEnterTimestampMonotonic={mono_us}\n"
             return subprocess.CompletedProcess(cmd, 0, out, "")
         return subprocess.CompletedProcess(cmd, 0, "", "")
