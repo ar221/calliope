@@ -4,15 +4,26 @@
 # Copies, package first so the wrapper never runs against an older package:
 #   server/calliope_server/       -> $DATADIR/calliope_server/       (synced)
 #   server/voice_catalog.json     -> $DATADIR/voice_catalog.json
-#   systemd/*.service             -> $DATADIR/units/                 (synced)
+#   systemd/*.service, *.timer    -> $DATADIR/units/                 (synced)
 #   server/calliope-server        -> $BINDIR/dictation-server        (mode 755)
+#   sha256 of everything above    -> $DATADIR/INSTALL_MANIFEST
+#
+# This is the only deploy path. If $BINDIR/dictation-server is a symlink (a
+# mirror-managed bin dir, e.g. a dotfiles checkout), the link is kept and its
+# target is overwritten, so the mirror records exactly what is deployed.
 #
 # The wrapper finds the package via its bootstrap search order:
 # alongside itself first, then $DATADIR (CALLIOPE_DATA_DIR /
 # XDG_DATA_HOME aware). tts.py resolves voice_catalog.json one level
 # above the package dir, which is $DATADIR here. $DATADIR/units/ is not a
 # systemd load path; `dictation-server --setup` copies those units into
-# ~/.config/systemd/user/.
+# ~/.config/systemd/user/. At startup the installed wrapper verifies itself
+# and the package against INSTALL_MANIFEST and refuses to run a mixed install.
+#
+# Usage:
+#   scripts/install-server           install (does not restart any service)
+#   scripts/install-server --check   report drift between this checkout and
+#                                    the installed copy; exit 1 on any DIFF
 #
 # Overrides (mainly for tests): BINDIR, DATADIR.
 # Idempotent: safe to re-run; only the calliope_server/ and units/ subtrees
@@ -33,6 +44,51 @@ DATADIR="${DATADIR:-${CALLIOPE_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/di
     exit 1
 }
 
+dest_wrapper="$BINDIR/dictation-server"
+if [[ -L "$dest_wrapper" ]]; then
+    dest_wrapper="$(readlink -f "$dest_wrapper")"
+fi
+manifest="$DATADIR/INSTALL_MANIFEST"
+
+if [[ "${1:-}" == "--check" ]]; then
+    drift=0
+    report() {  # report <source> <installed> <label>
+        if cmp -s "$1" "$2"; then
+            echo "SAME  $3"
+        else
+            echo "DIFF  $3"
+            drift=1
+        fi
+    }
+    report "$src_wrapper" "$dest_wrapper" "dictation-server"
+    report "$src_catalog" "$DATADIR/voice_catalog.json" "voice_catalog.json"
+    for f in "$src_pkg"/*.py; do
+        report "$f" "$DATADIR/calliope_server/$(basename "$f")" "calliope_server/$(basename "$f")"
+    done
+    for f in "$DATADIR"/calliope_server/*.py; do
+        [[ -e "$f" && ! -e "$src_pkg/$(basename "$f")" ]] && { echo "EXTRA calliope_server/$(basename "$f")"; drift=1; }
+    done
+    for f in "$repo_root"/systemd/*.service "$repo_root"/systemd/*.timer; do
+        report "$f" "$DATADIR/units/$(basename "$f")" "units/$(basename "$f")"
+    done
+    # Same rules the wrapper applies at startup: manifest present, covering
+    # the executable, with every checksum matching what is on disk.
+    if [[ ! -f "$manifest" ]]; then
+        echo "DIFF  INSTALL_MANIFEST (missing)"
+        drift=1
+    elif [[ "$(sed -n 's/^\([0-9a-f]\{64\}\)  wrapper$/\1/p' "$manifest")" != "$(sha256sum < "$dest_wrapper" 2>/dev/null | cut -d' ' -f1)" ]] \
+        || ! (cd "$DATADIR" && grep -v -e '^revision ' -e '  wrapper$' INSTALL_MANIFEST | sha256sum -c --quiet >/dev/null 2>&1); then
+        echo "DIFF  INSTALL_MANIFEST (does not match the installed files)"
+        drift=1
+    else
+        echo "SAME  INSTALL_MANIFEST"
+    fi
+    installed_rev="$(sed -n 's/^revision //p' "$manifest" 2>/dev/null || true)"
+    echo "installed revision: ${installed_rev:-unknown (no manifest)}"
+    echo "checkout revision:  $(git -C "$repo_root" describe --always --dirty --abbrev=12 2>/dev/null || echo unknown)"
+    exit "$drift"
+fi
+
 mkdir -p "$BINDIR" "$DATADIR"
 
 if command -v rsync >/dev/null 2>&1; then
@@ -49,11 +105,23 @@ install -m 644 "$src_catalog" "$DATADIR/voice_catalog.json"
 echo "installed $DATADIR/voice_catalog.json"
 
 mkdir -p "$DATADIR/units"
-find "$DATADIR/units" -maxdepth 1 -name '*.service' -delete
-install -m 644 "$repo_root"/systemd/*.service "$DATADIR/units/"
+find "$DATADIR/units" -maxdepth 1 \( -name '*.service' -o -name '*.timer' \) -delete
+install -m 644 "$repo_root"/systemd/*.service "$repo_root"/systemd/*.timer "$DATADIR/units/"
 echo "staged    $DATADIR/units/ (installed by dictation-server --setup)"
 
-install -m 755 "$src_wrapper" "$BINDIR/dictation-server"
-echo "installed $BINDIR/dictation-server"
+install -m 755 "$src_wrapper" "$dest_wrapper"
+echo "installed $dest_wrapper"
+
+# Written last and atomically: a wrapper that starts mid-install sees the old
+# manifest, fails verification and is restarted by systemd after the sync.
+tmp_manifest="$(mktemp "$DATADIR/INSTALL_MANIFEST.XXXXXX")"
+{
+    echo "revision $(git -C "$repo_root" describe --always --dirty --abbrev=12 2>/dev/null || echo unknown)"
+    echo "$(sha256sum < "$dest_wrapper" | cut -d' ' -f1)  wrapper"
+    (cd "$DATADIR" && sha256sum voice_catalog.json calliope_server/*.py)
+} > "$tmp_manifest"
+chmod 644 "$tmp_manifest"
+mv -f "$tmp_manifest" "$manifest"
+echo "wrote     $manifest"
 
 echo "done. Next: dictation-server --setup (first install) or restart the service."
