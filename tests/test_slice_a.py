@@ -1,26 +1,18 @@
 from __future__ import annotations
 
-import importlib.util
 import pathlib
-import uuid
-from importlib.machinery import SourceFileLoader
+
+from conftest import load_wrapper
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-SRC = ROOT / "server" / "calliope-server"
 WEB_UI_SRC = ROOT / "server" / "calliope_server" / "web_ui.py"
 EXTENSION_SRC = ROOT / "extension" / "index.js"
 
 
 def _load_server(tmp_path, monkeypatch):
     monkeypatch.setenv("CALLIOPE_DATA_DIR", str(tmp_path))
-    name = f"calliope_server_slice_a_{uuid.uuid4().hex}"
-    loader = SourceFileLoader(name, str(SRC))
-    spec = importlib.util.spec_from_loader(name, loader)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_wrapper("calliope_server_slice_a")
 
 
 def test_save_char_mode_empty_mode_deletes_persisted_key(tmp_path, monkeypatch):
@@ -58,7 +50,7 @@ def test_mode_memory_endpoint_returns_persisted_clear(tmp_path, monkeypatch):
         def send_error_json(self, message, **kwargs):
             raise AssertionError((message, kwargs))
 
-    mod.DictationHandler.do_POST(DummyHandler())
+    mod.DictationHandler._dispatch_post(DummyHandler())
 
     assert sent["status"] == 200
     assert sent["data"]["mode"] == ""

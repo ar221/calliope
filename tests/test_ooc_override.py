@@ -6,24 +6,13 @@ the result carries `is_ooc` so clients re-prefix it.
 """
 from __future__ import annotations
 
-import importlib.util
-import pathlib
-import uuid
-from importlib.machinery import SourceFileLoader
-
-SRC = pathlib.Path(__file__).resolve().parents[1] / "server" / "calliope-server"
+from conftest import load_wrapper
 
 
 def _load_server(tmp_path, monkeypatch):
     monkeypatch.setenv("CALLIOPE_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("OMNIROUTE_API_KEY", "test-key")
-    name = f"calliope_ooc_{uuid.uuid4().hex}"
-    loader = SourceFileLoader(name, str(SRC))
-    spec = importlib.util.spec_from_loader(name, loader)
-    assert spec is not None
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
+    return load_wrapper("calliope_ooc")
 
 
 def test_ooc_in_formatter_mode_reroutes_to_grammar_clean(tmp_path, monkeypatch):

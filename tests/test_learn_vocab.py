@@ -14,25 +14,19 @@ Pinned behaviours:
 """
 from __future__ import annotations
 
-import importlib.util
 import json
 import pathlib
-from importlib.machinery import SourceFileLoader
 
 import pytest
 
-# Script lives at scripts/learn-vocab — no .py extension. Mirror the
-# pattern in tests/test_vocab.py (lines 24-29).
-SRC = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "learn-vocab"
+from conftest import ROOT, load_script
+
+SRC = ROOT / "scripts" / "learn-vocab"
 
 
 @pytest.fixture(scope="module")
 def mod():
-    loader = SourceFileLoader("learn_vocab", str(SRC))
-    spec = importlib.util.spec_from_loader("learn_vocab", loader)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_script(SRC, "learn_vocab")
 
 
 # ─── Synthetic chat fixture helpers ──────────────────────────────────

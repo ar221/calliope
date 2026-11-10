@@ -7,23 +7,16 @@ list and returns spans suitable for the "did you mean?" overlay.
 """
 from __future__ import annotations
 
-import importlib.util
 import math
-import pathlib
-from importlib.machinery import SourceFileLoader
 
 import pytest
 
-SRC = pathlib.Path(__file__).resolve().parents[1] / "server" / "calliope-server"
+from conftest import load_wrapper
 
 
 @pytest.fixture(scope="module")
 def mod():
-    loader = SourceFileLoader("calliope_server", str(SRC))
-    spec = importlib.util.spec_from_loader("calliope_server", loader)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_wrapper("calliope_word_confidence")
 
 
 def _wc(word: str, prob: float) -> dict:

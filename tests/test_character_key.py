@@ -8,32 +8,20 @@ on-disk PNG regardless of which form arrives.
 from __future__ import annotations
 
 import base64
-import importlib.util
 import json
 import pathlib
-import uuid
-from importlib.machinery import SourceFileLoader
 
 import pytest
 
+from conftest import load_script, load_wrapper
+
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-SRC = ROOT / "server" / "calliope-server"
 LEARN_VOCAB_SRC = ROOT / "scripts" / "learn-vocab"
-
-
-def _load(path: pathlib.Path, prefix: str):
-    name = f"{prefix}_{uuid.uuid4().hex}"
-    loader = SourceFileLoader(name, str(path))
-    spec = importlib.util.spec_from_loader(name, loader)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 @pytest.fixture
 def mod(tmp_path, monkeypatch):
-    module = _load(SRC, "calliope_server_charkey")
+    module = load_wrapper("calliope_server_charkey")
     monkeypatch.setattr(module.config, "CHAR_MODES_FILE", tmp_path / "char-modes.yaml")
     monkeypatch.setattr(module.formatter, "_char_modes_cache", {"data": {}, "mtime": 0.0})
     return module
@@ -41,7 +29,7 @@ def mod(tmp_path, monkeypatch):
 
 @pytest.fixture(scope="module")
 def learn_vocab():
-    return _load(LEARN_VOCAB_SRC, "learn_vocab_charkey")
+    return load_script(LEARN_VOCAB_SRC, "learn_vocab_charkey")
 
 
 def _write_card(chars_dir: pathlib.Path, stem: str, name: str) -> pathlib.Path:
@@ -187,13 +175,13 @@ def test_mode_memory_endpoints_canonicalise_character(mod):
         def send_error_json(self, message, **kwargs):
             raise AssertionError((message, kwargs))
 
-    mod.DictationHandler.do_POST(
+    mod.DictationHandler._dispatch_post(
         Handler("/state/mode-memory", {"character": "Elara.png", "mode": "rp_enhance"}),
     )
     assert sent["data"]["character"] == "elara"
     assert sent["data"]["mode"] == "rp_enhance"
 
-    mod.DictationHandler.do_GET(Handler("/state/mode-memory?character=elara"))
+    mod.DictationHandler._dispatch_get(Handler("/state/mode-memory?character=elara"))
     assert sent["data"] == {"character": "elara", "mode": "rp_enhance"}
 
 

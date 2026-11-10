@@ -11,13 +11,13 @@ failure modes (Agent 3 §4 / ADR-12):
 """
 from __future__ import annotations
 
-import importlib.util
 import io
 import json
 import pathlib
-from importlib.machinery import SourceFileLoader
 
 import pytest
+
+from conftest import load_wrapper
 
 SRC = pathlib.Path(__file__).resolve().parents[1] / "server" / "calliope-server"
 WEB_UI_SRC = SRC.parent / "calliope_server" / "web_ui.py"
@@ -25,11 +25,7 @@ WEB_UI_SRC = SRC.parent / "calliope_server" / "web_ui.py"
 
 @pytest.fixture(scope="module")
 def mod():
-    loader = SourceFileLoader("calliope_server", str(SRC))
-    spec = importlib.util.spec_from_loader("calliope_server", loader)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_wrapper("calliope_pipeline")
 
 
 # ─── Stock-phrase drops ──────────────────────────────────────────────
@@ -155,7 +151,7 @@ def test_narrator_present_mode_registered(mod):
 
 
 def test_persona_pov_prompt_includes_few_shot_tuning(mod):
-    system, _ = mod._build_persona_pov_prompt(
+    system = mod._build_persona_pov_prompt(
         {"name": "Ayaz", "description": "Direct, intense."},
         {"name": "Camilla", "card": "A careful listener."},
         "",
@@ -167,7 +163,7 @@ def test_persona_pov_prompt_includes_few_shot_tuning(mod):
 
 
 def test_persona_pov_prompt_includes_scene_continuity(mod):
-    system, _ = mod._build_persona_pov_prompt(
+    system = mod._build_persona_pov_prompt(
         {"name": "Ayaz", "description": "Direct."},
         {"name": "Camilla", "card": "A careful listener."},
         "",
@@ -256,6 +252,8 @@ def test_reformat_endpoint_returns_repair_trace_without_storing_trace(monkeypatc
     try:
         mod.session_transcript[:] = []
         mod.DictationHandler._handle_reformat(DummyHandler(), {})
+        transcript_after = list(mod.session_transcript)
+        vocab_cache_after = dict(mod._vocab_cache)
     finally:
         mod.session_transcript[:] = original_transcript
         mod._vocab_cache.clear()
@@ -273,9 +271,9 @@ def test_reformat_endpoint_returns_repair_trace_without_storing_trace(monkeypatc
         "has_changes": True,
         "persistence": "in_ram_only",
     }
-    assert mod.session_transcript == []
-    assert "repair_trace" not in json.dumps(mod.session_transcript)
-    assert mod._vocab_cache == original_vocab_cache
+    assert "repair_trace" not in json.dumps(transcript_after)
+    assert transcript_after == []
+    assert vocab_cache_after == original_vocab_cache
 
 
 def test_repair_trace_ui_escapes_html_and_does_not_post_full_trace():
@@ -363,6 +361,12 @@ def test_transcribe_endpoint_keeps_repair_trace_out_of_sse_and_persistence(monke
         events.append((event, payload))
         return 1
 
+    def fake_normalize(src, dst, container):
+        assert container == "wav"
+        pathlib.Path(dst).write_bytes(b"RIFF")
+        return 1.0
+
+    monkeypatch.setattr(mod, "normalize_audio", fake_normalize)
     monkeypatch.setattr(mod, "transcribe_with_confidence", fake_transcribe)
     monkeypatch.setattr(mod, "run_pipeline", fake_run_pipeline)
     monkeypatch.setattr(mod, "broadcast_event", fake_broadcast)
@@ -476,7 +480,6 @@ def test_rp_enhance_payload_includes_scene_continuity(monkeypatch, mod):
         captured["payload"] = json.loads(req.data.decode())
         return FakeResponse()
 
-    monkeypatch.setattr(mod.formatter, "probe_formatter", lambda *a, **k: (True, ""))
     monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
     out, skipped, reason = mod.format_rp(
         "I step closer.", mode=2,
@@ -538,7 +541,6 @@ def test_rp_enhance_payload_uses_scene_contract(monkeypatch, mod):
         "chatType": "group",
         "lastSpeaker": "Mira",
     })
-    monkeypatch.setattr(mod.formatter, "probe_formatter", lambda *a, **k: (True, ""))
     monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
 
     out, skipped, reason = mod.format_rp(
@@ -561,7 +563,7 @@ def test_persona_pov_prompt_accepts_scene_contract(mod):
         "characterName": "Elara",
         "chatType": "individual",
     })
-    system, _ = mod._build_persona_pov_prompt(
+    system = mod._build_persona_pov_prompt(
         {"name": "Ayaz", "description": "Direct."},
         {"name": "Elara", "card": "A careful listener."},
         "",
@@ -595,14 +597,8 @@ def test_strip_formatter_preamble_keeps_legitimate_plain_output(mod):
 
 def _load_isolated_server(tmp_path, monkeypatch):
     """Load a fresh server module bound to an isolated CALLIOPE_DATA_DIR."""
-    import uuid
     monkeypatch.setenv("CALLIOPE_DATA_DIR", str(tmp_path))
-    name = f"calliope_server_modes_{uuid.uuid4().hex}"
-    loader = SourceFileLoader(name, str(SRC))
-    spec = importlib.util.spec_from_loader(name, loader)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_wrapper("calliope_server_modes")
 
 
 def test_load_modes_merges_new_builtin_into_legacy_file(tmp_path, monkeypatch):

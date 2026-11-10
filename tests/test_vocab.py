@@ -9,25 +9,14 @@ four gates fails CI loudly instead of silently corrupting dictation.
 """
 from __future__ import annotations
 
-import importlib.util
-import pathlib
-from importlib.machinery import SourceFileLoader
-
 import pytest
 
-# The server script lives at `server/calliope-server` — no `.py`
-# extension, so the default extension-based loader probe fails.
-# Pass an explicit SourceFileLoader.
-SRC = pathlib.Path(__file__).resolve().parents[1] / "server" / "calliope-server"
+from conftest import load_wrapper
 
 
 @pytest.fixture(scope="module")
 def mod():
-    loader = SourceFileLoader("calliope_server", str(SRC))
-    spec = importlib.util.spec_from_loader("calliope_server", loader)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_wrapper("calliope_vocab")
 
 
 def _inject_vocab(monkeypatch, mod, entries):
@@ -40,46 +29,58 @@ def _inject_vocab(monkeypatch, mod, entries):
     monkeypatch.setattr(mod.formatter, "load_vocab", lambda: normalized)
 
 
+def _names(monkeypatch, mod, *names):
+    _inject_vocab(monkeypatch, mod, [{"correct": n, "aliases": []} for n in names])
+
+
 # ─── Empirical regression corpus (Agent 3 §6) ────────────────────────
+# Each case loads the colliding name, proves the fuzzy pass is live with a
+# positive control in the same utterance, and proves the named gate is what
+# protects the trap token by loosening that gate alone.
 
 
-def test_yaz_not_rewritten_to_ayaz(mod):
-    """'yaz' is short and a real-ish token; must not silently become 'Ayaz'.
+def test_yaz_not_rewritten_to_ayaz(mod, monkeypatch):
+    """'yaz' vs 'Ayaz' ratio 0.857 clears the cutoff; only the length gate saves it."""
+    _names(monkeypatch, mod, "Ayaz")
+    assert mod.vocab_correct("she said yaz to Ayazz", character_id="") == \
+        "she said yaz to Ayaz"
 
-    Pre-fix difflib ratio: 0.857 ≥ 0.75 cutoff → silent rewrite.
-    Post-fix gates: token len 3 < VOCAB_FUZZY_MIN_LEN (4) → skipped.
-    """
-    result = mod.vocab_correct("she said yaz to me", character_id="")
-    assert "Ayaz" not in result
-    assert "yaz" in result.lower()
-
-
-def test_yari_not_rewritten_to_yuri(mod):
-    """'Yari' must not collapse to 'Yuri' via fuzzy.
-
-    Pre-fix difflib ratio: 0.750 = 0.75 cutoff → silent rewrite.
-    Post-fix: 0.750 < VOCAB_FUZZY_CUTOFF (0.84) → skipped.
-    """
-    result = mod.vocab_correct("Yari ran across the field", character_id="")
-    assert "Yuri" not in result
-    assert "Yari" in result
+    monkeypatch.setattr(mod.formatter.config, "VOCAB_FUZZY_MIN_LEN", 3)
+    assert mod.vocab_correct("she said yaz", character_id="") == "she said Ayaz"
 
 
-def test_hane_not_rewritten_to_hana(mod):
+def test_yari_not_rewritten_to_yuri(mod, monkeypatch):
+    """'Yari' vs 'Yuri' ratio 0.750 sits below the 0.84 cutoff (was 0.75)."""
+    _names(monkeypatch, mod, "Yuri")
+    assert mod.vocab_correct("Yari ran to Yurii", character_id="") == "Yari ran to Yuri"
+
+    monkeypatch.setattr(mod.formatter.config, "VOCAB_FUZZY_CUTOFF", 0.75)
+    assert mod.vocab_correct("Yari ran", character_id="") == "Yuri ran"
+
+
+def test_hane_not_rewritten_to_hana(mod, monkeypatch):
     """'Hane' must not collapse to 'Hana'. Same ratio = 0.750 trap as above."""
-    result = mod.vocab_correct("she called him Hane", character_id="")
-    assert "Hana" not in result
-    assert "Hane" in result
+    _names(monkeypatch, mod, "Hana")
+    assert mod.vocab_correct("she called Hane and Hanaa", character_id="") == \
+        "she called Hane and Hana"
+
+    monkeypatch.setattr(mod.formatter.config, "VOCAB_FUZZY_CUTOFF", 0.75)
+    assert mod.vocab_correct("she called Hane", character_id="") == "she called Hana"
 
 
 # ─── Common-word frequency gate (Agent 3 §6 third gate) ──────────────
 
 
-@pytest.mark.parametrize("word", ["wear", "near", "shore", "here", "your"])
-def test_common_word_gate_skips_top_5k(mod, word):
-    """Top-5k English words must never fuzzy-match against names."""
-    result = mod.vocab_correct(f"the {word} is broken", character_id="")
-    assert word in result.lower(), f"common word {word!r} got rewritten: {result!r}"
+@pytest.mark.parametrize("word", ["Wear", "Near", "House", "Here", "Your"])
+def test_common_word_gate_skips_top_5k(mod, monkeypatch, word):
+    """A name one letter off a common word (ratio ≥ 0.88) must not eat the word."""
+    name = word + "a"
+    _names(monkeypatch, mod, name)
+    assert word.lower() in mod.formatter.config.COMMON_EN_WORDS
+    assert mod.vocab_correct(f"{word} and {name}h", character_id="") == f"{word} and {name}"
+
+    monkeypatch.setattr(mod.formatter.config, "COMMON_EN_WORDS", frozenset())
+    assert mod.vocab_correct(f"{word} broke", character_id="") == f"{name} broke"
 
 
 # ─── Pass 1 — exact-alias replacement still works ────────────────────
@@ -96,10 +97,7 @@ def test_alias_replacement_works(mod, monkeypatch):
         {"correct": "Ayaz", "aliases": ["ayaz", "ayaaz"]},
     ])
     result = mod.vocab_correct("hello ayaz how are you", character_id="")
-    assert "Ayaz" in result, f"alias substitution failed: {result!r}"
-    # The lowercase alias should have been replaced — no surviving 'ayaz'
-    # token in the original casing.
-    assert " ayaz " not in f" {result} ", f"alias not substituted: {result!r}"
+    assert result == "hello Ayaz how are you"
 
 
 def test_alias_case_insensitive(mod, monkeypatch):
@@ -107,31 +105,24 @@ def test_alias_case_insensitive(mod, monkeypatch):
     _inject_vocab(monkeypatch, mod, [
         {"correct": "Ayaz", "aliases": ["AYAZ"]},
     ])
-    result = mod.vocab_correct("said Ayaz again", character_id="")
-    assert "Ayaz" in result
+    assert mod.vocab_correct("said ayaz again", character_id="") == "said Ayaz again"
 
 
 # ─── Fuzzy hit cap (Agent 3 §6 fourth gate) ──────────────────────────
 
 
 def test_fuzzy_hits_capped_per_utterance(mod, monkeypatch):
-    """At most VOCAB_FUZZY_MAX_HITS_PER_UTT fuzzy substitutions per call.
+    """Exactly VOCAB_FUZZY_MAX_HITS_PER_UTT (2) earliest near-misses are rewritten.
 
-    Even when many 4+ char near-matches are present, only the cap-many
-    earliest ones should be rewritten. Prevents a single noisy utterance
-    from being mass-rewritten into a name list.
+    Every token below clears the cutoff on its own (ratio 0.933); the third
+    survives only because of the cap.
     """
-    _inject_vocab(monkeypatch, mod, [
-        {"correct": "Calliope", "aliases": []},
-    ])
-    # Three near-misses for 'Calliope' (ratio borderline; we just need each
-    # to be a 4+ char token outside common words).
-    text = "Caliope Caliopa Caliopy walked together"
-    result = mod.vocab_correct(text, character_id="")
-    hits = result.count("Calliope")
-    assert hits <= mod.VOCAB_FUZZY_MAX_HITS_PER_UTT, (
-        f"fuzzy hit cap exceeded: got {hits} hits in {result!r}"
-    )
+    _names(monkeypatch, mod, "Calliope")
+    assert mod.formatter.config.VOCAB_FUZZY_MAX_HITS_PER_UTT == 2
+    result = mod.vocab_correct("Caliope Caliope Caliope walked", character_id="")
+    assert result == "Calliope Calliope Caliope walked"
+
+    assert mod.vocab_correct("Caliope walked", character_id="") == "Calliope walked"
 
 
 # ─── Empty / no-op paths ─────────────────────────────────────────────

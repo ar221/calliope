@@ -5,13 +5,9 @@ Shares the scripted-urlopen fake from the omniroute suite's style.
 """
 from __future__ import annotations
 
-import importlib.util
 import json
-import pathlib
-import uuid
-from importlib.machinery import SourceFileLoader
 
-SRC = pathlib.Path(__file__).resolve().parents[1] / "server" / "calliope-server"
+from conftest import load_wrapper
 
 
 def _load_server(tmp_path, monkeypatch):
@@ -21,13 +17,7 @@ def _load_server(tmp_path, monkeypatch):
         "DICTATION_OMNIROUTE_RP_CHAIN",
         "claude/claude-opus-4-8, codex/gpt-5.5, claude/claude-sonnet-4-6",
     )
-    name = f"calliope_attr_{uuid.uuid4().hex}"
-    loader = SourceFileLoader(name, str(SRC))
-    spec = importlib.util.spec_from_loader(name, loader)
-    assert spec is not None
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
+    return load_wrapper("calliope_attr")
 
 
 class _FakeResp:
